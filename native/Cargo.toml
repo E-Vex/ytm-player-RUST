@@ -1,11 +1,11 @@
 [package]
-name = "formatting_native"
+name = "ytm_player_native"
 version = "2.1.0"
 edition = "2021"
-description = "Native (Rust/PyO3) formatting utilities for ytm-player"
+description = "Native (Rust/PyO3) performance utilities for ytm-player"
 
 [lib]
-name = "formatting_native"
+name = "ytm_player_native"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -16,3 +16,11 @@ once_cell = "1.20"
 version = "1.10"
 default-features = false
 features = ["std", "unicode-perl"]
+
+[dependencies.unicode-bidi]
+version = "0.3"
+default-features = false
+features = ["std", "hardcoded-data"]
+
+[dependencies.any_ascii]
+version = "0.3"

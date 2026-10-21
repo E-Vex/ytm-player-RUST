@@ -7,5 +7,5 @@ cd "$(dirname "$0")"
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 cargo build --release --locked
 
-cp target/release/libformatting_native.so ../src/ytm_player/utils/_formatting_native.abi3.so
-echo "Native extension built at src/ytm_player/utils/_formatting_native.abi3.so"
+cp target/release/libytm_player_native.so ../src/ytm_player/utils/_ytm_player_native.abi3.so
+echo "Native extension built at src/ytm_player/utils/_ytm_player_native.abi3.so"

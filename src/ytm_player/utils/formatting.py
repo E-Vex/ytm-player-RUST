@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # extension is unavailable (e.g. during development without a Rust toolchain),
 # fall back to the pure-Python implementations defined below.
 try:
-    from ._formatting_native import (  # type: ignore[import-not-found]
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
         format_duration as _native_format_duration,
         truncate as _native_truncate,
         format_count as _native_format_count,

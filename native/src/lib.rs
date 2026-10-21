@@ -3,6 +3,7 @@ use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use unicode_bidi::bidi_class;
 
 /// Regex for validating YouTube video IDs.
 static VALID_VIDEO_ID_RE: LazyLock<Regex> =
@@ -47,7 +48,7 @@ static COLLAPSE_WS_RE: LazyLock<Regex> =
 // ---------------------------------------------------------------------------
 
 #[pymodule]
-fn _formatting_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(pyo3::wrap_pyfunction!(format_duration, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(truncate, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(format_count, module)?)?;
@@ -61,6 +62,15 @@ fn _formatting_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(build_playlist_subtitle, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(sanitize_title_for_lyric_lookup, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(format_ago, module)?)?;
+
+    // BiDi text utilities (ytm_player.utils.bidi equivalents).
+    module.add_function(pyo3::wrap_pyfunction!(has_rtl, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(isolate_bidi, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(reorder_line, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(wrap_line, module)?)?;
+
+    // Transliteration (ytm_player.utils.transliteration equivalent).
+    module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
     Ok(())
 }
 
@@ -70,7 +80,7 @@ fn _formatting_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
 /// Get an optional string value from a dict.
 fn get_optional_string<'py>(
-    py: Python<'py>,
+    _py: Python<'py>,
     dict: &Bound<'py, PyDict>,
     key: &str,
 ) -> PyResult<Option<String>> {
@@ -511,7 +521,7 @@ fn normalize_tracks<'py>(
 }
 
 /// Strip common noise from a track title for better LRCLIB matching.
-#[pyfunction]
+#[pyfunction(signature = (title, artist=None))]
 fn sanitize_title_for_lyric_lookup(title: &str, artist: Option<&str>) -> String {
     if title.is_empty() {
         return title.to_string();
@@ -600,4 +610,202 @@ fn format_ago(timestamp_seconds: f64) -> String {
     } else {
         format!("{years} years ago")
     }
+}
+
+// ---------------------------------------------------------------------------
+// BiDi text utilities (mirrors ytm_player/utils/bidi.py)
+// ---------------------------------------------------------------------------
+
+/// Unicode directional isolate marks (UAX #9, since Unicode 6.3).
+const FSI: char = '\u{2068}'; // FIRST STRONG ISOLATE
+const PDI: char = '\u{2069}'; // POP DIRECTIONAL ISOLATE
+
+/// Matches any character from RTL scripts (Arabic, Hebrew, Thaana, Syriac,
+/// N'Ko).  Mirrors the `_RTL_RE` range set in `bidi.py` exactly.
+fn is_rtl_char(c: char) -> bool {
+    matches!(c,
+        '\u{0590}'..='\u{05FF}'     // Hebrew
+      | '\u{0600}'..='\u{06FF}'     // Arabic
+      | '\u{0700}'..='\u{074F}'     // Syriac
+      | '\u{0750}'..='\u{077F}'     // Arabic Supplement
+      | '\u{0780}'..='\u{07BF}'     // Thaana
+      | '\u{07C0}'..='\u{07FF}'     // N'Ko
+      | '\u{08A0}'..='\u{08FF}'     // Arabic Extended-A
+      | '\u{FB1D}'..='\u{FB4F}'     // Hebrew Presentation Forms
+      | '\u{FB50}'..='\u{FDFF}'     // Arabic Presentation Forms-A
+      | '\u{FE70}'..='\u{FEFF}'     // Arabic Presentation Forms-B
+    )
+}
+
+/// Return True if text contains any RTL script characters.
+#[pyfunction]
+fn has_rtl(text: &str) -> bool {
+    text.chars().any(is_rtl_char)
+}
+
+/// Wrap *text* in FSI...PDI so its directional context cannot leak.
+///
+/// Matches `bidi.isolate_bidi`: skips empty text, skips pure-LTR text when
+/// *only_if_rtl* is set, and never double-wraps.
+#[pyfunction(signature = (text, *, only_if_rtl = true))]
+fn isolate_bidi(text: &str, only_if_rtl: bool) -> String {
+    if text.is_empty() {
+        return text.to_string();
+    }
+    if only_if_rtl && !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    let mut chars = text.chars();
+    let first = chars.next();
+    let last = chars.last();
+    if first == Some(FSI) && last == Some(PDI) {
+        return text.to_string();
+    }
+    format!("{FSI}{text}{PDI}")
+}
+
+/// Simplified BiDi direction classes: L, R, or N (neutral).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    L,
+    R,
+    N,
+}
+
+fn char_direction(c: char) -> Direction {
+    match bidi_class(c) {
+        unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL | unicode_bidi::BidiClass::AN => {
+            Direction::R
+        }
+        unicode_bidi::BidiClass::L => Direction::L,
+        _ => Direction::N,
+    }
+}
+
+/// Direction from the first strong character in *word*.
+fn word_direction(word: &str) -> Direction {
+    word.chars()
+        .map(char_direction)
+        .find(|d| *d != Direction::N)
+        .unwrap_or(Direction::N)
+}
+
+/// UAX #9 rules P2/P3: base direction from first strong character.
+fn paragraph_base_direction(text: &str) -> Direction {
+    text.chars()
+        .map(char_direction)
+        .find(|d| *d != Direction::N)
+        .unwrap_or(Direction::L)
+}
+
+/// Perform UAX #9 word-level reordering (L2 reversal rule).
+fn do_reorder(text: &str) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return text.to_string();
+    }
+
+    let base_level: usize = usize::from(paragraph_base_direction(text) == Direction::R);
+
+    let levels: Vec<usize> = words
+        .iter()
+        .map(|word| match word_direction(word) {
+            Direction::R => 1,
+            Direction::L => if base_level == 1 { 2 } else { 0 },
+            Direction::N => base_level,
+        })
+        .collect();
+    if levels.is_empty() {
+        return text.to_string();
+    }
+
+    let mut indices: Vec<usize> = (0..words.len()).collect();
+    for level in (1..=*levels.iter().max().unwrap_or(&0)).rev() {
+        let mut i = 0;
+        while i < indices.len() {
+            if levels[indices[i]] >= level {
+                let mut j = i;
+                while j < indices.len() && levels[indices[j]] >= level {
+                    j += 1;
+                }
+                indices[i..j].reverse();
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    indices
+        .iter()
+        .map(|&idx| words[idx])
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// Raw UAX #9 line reorder — always applies (the `bidi_mode` gate lives in
+/// Python so it can consult user settings).
+#[pyfunction]
+fn reorder_line(text: &str) -> String {
+    do_reorder(text)
+}
+
+/// Pre-wrap RTL text for multi-line display with reordering applied.
+/// Raw version — the `bidi_mode` gate lives in Python.  Mirrors
+/// `bidi.wrap_rtl_line` *as if reordering were enabled*.
+#[pyfunction]
+fn wrap_line(text: &str, width: i64) -> String {
+    if text.is_empty() || !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+
+    let char_count = text.chars().count() as i64;
+    if char_count <= width || width <= 0 {
+        return do_reorder(text);
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return text.to_string();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_words: Vec<&str> = Vec::new();
+    let mut current_len: i64 = 0;
+
+    for word in words {
+        let word_len = word.chars().count() as i64;
+        let needed = if current_words.is_empty() {
+            word_len
+        } else {
+            current_len + 1 + word_len
+        };
+        if needed <= width {
+            current_words.push(word);
+            current_len = needed;
+        } else {
+            if !current_words.is_empty() {
+                lines.push(current_words.join(" "));
+            }
+            current_words = vec![word];
+            current_len = word_len;
+        }
+    }
+    if !current_words.is_empty() {
+        lines.push(current_words.join(" "));
+    }
+
+    lines.iter().map(|line| do_reorder(line)).collect::<Vec<String>>().join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Transliteration (mirrors ytm_player/utils/transliteration.py)
+// ---------------------------------------------------------------------------
+
+/// Transliterate non-ASCII text to ASCII via the anyascii Rust crate.
+/// Mirrors `transliteration.transliterate_line` (minus its Python-side
+/// ASCII fast path and lru_cache, which are kept in Python).
+#[pyfunction]
+fn transliterate(text: &str) -> String {
+    any_ascii::any_ascii(text)
 }

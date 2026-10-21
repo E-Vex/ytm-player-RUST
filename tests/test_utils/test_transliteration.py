@@ -2,7 +2,16 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from ytm_player.utils.transliteration import has_non_ascii, transliterate_line
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+
+    _HAVE_NATIVE = True
+except ImportError:
+    _HAVE_NATIVE = False
 
 # ── has_non_ascii ─────────────────────────────────────────────────────────────
 
@@ -121,6 +130,11 @@ def test_transliterate_ascii_returns_same_object():
 
 
 def test_transliterate_fallback_without_anyascii():
+    # When the native backend is installed it doesn't consult the
+    # ``anyascii`` Python package at all, so the import-failure fallback
+    # can only be exercised without it.
+    if _HAVE_NATIVE:
+        pytest.skip("native backend is installed; anyascii fallback unused")
     # Clear lru_cache so the patched import takes effect
     transliterate_line.cache_clear()
     with patch.dict("sys.modules", {"anyascii": None}):

@@ -250,3 +250,41 @@ def wrap_rtl_line(text: str, width: int) -> str:
         lines.append(" ".join(current_words))
 
     return "\n".join(_do_reorder(line) for line in lines)
+
+
+# ── Native (Rust/PyO3) implementation, if available ──────────────────────
+# The Rust extension implements the same functions; these bindings override
+# the pure-Python definitions above when the extension is importable.
+
+
+try:
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
+        has_rtl as _native_has_rtl,
+        isolate_bidi as _native_isolate_bidi,
+        reorder_line as _native_reorder_line,
+        wrap_line as _native_wrap_line,
+    )
+except ImportError:
+    pass
+else:
+
+    has_rtl = _native_has_rtl  # type: ignore[assignment]
+    isolate_bidi = _native_isolate_bidi  # type: ignore[assignment]
+    # Internal symbol is part of this module's test surface.
+    _do_reorder = _native_reorder_line  # type: ignore[assignment]
+
+    def reorder_rtl_line(text: str) -> str:  # noqa: F811
+        """Reorder words in a line for RTL display, if enabled (native)."""
+        if not text or not has_rtl(text):
+            return text
+        if not _get_reorder_enabled():
+            return text
+        return _native_reorder_line(text)
+
+    def wrap_rtl_line(text: str, width: int) -> str:  # noqa: F811
+        """Pre-wrap RTL text for multi-line display, with reordering (native)."""
+        if not text or not has_rtl(text):
+            return text
+        if not _get_reorder_enabled():
+            return text
+        return _native_wrap_line(text, width)

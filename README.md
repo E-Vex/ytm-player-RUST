@@ -63,7 +63,7 @@ For NixOS, Gentoo, Windows-specific mpv DLL setup, source builds, and optional e
 
 ## Native extension (Rust)
 
-The formatting utilities in `ytm_player/utils/formatting.py` are implemented in Rust via [PyO3](https://pyo3.rs/) for better performance. The pure-Python fallbacks are always used automatically when the compiled extension is unavailable, so nothing is required to run ytm-player — but building the native extension is recommended for source installs.
+The formatting utilities (`ytm_player/utils/formatting.py`), BiDi text utilities (`ytm_player/utils/bidi.py`), and transliteration (`ytm_player/utils/transliteration.py`) are implemented in Rust via [PyO3](https://pyo3.rs/) for better performance. The pure-Python fallbacks are always used automatically when the compiled extension is unavailable, so nothing is required to run ytm-player — but building the native extension is recommended for source installs.
 
 ### Prerequisites
 
@@ -77,7 +77,7 @@ cd native
 ./build.sh
 ```
 
-This compiles `native/src/lib.rs` into `_formatting_native.abi3.so` and copies it into `src/ytm_player/utils/`. Re-run `./build.sh` after any change to the Rust source.
+This compiles `native/src/lib.rs` into `_ytm_player_native.abi3.so` and copies it into `src/ytm_player/utils/`. Re-run `./build.sh` after any change to the Rust source.
 
 The extension is built with PyO3's stable ABI (`abi3`), so it remains loadable across Python minor versions within the same 3.x series.
 
