@@ -59,3 +59,7 @@ broad-except-audit.local.md
 
 # Local-only reasoning / working notes for coord issues (never committed)
 reasoning/
+
+# Rust build artifacts
+native/target/
+*.so

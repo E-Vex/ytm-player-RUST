@@ -103,6 +103,7 @@ ytm = "ytm_player.cli:main"
 [tool.hatch.build.targets.sdist]
 only-include = [
     "src/ytm_player",
+    "native",
     "tests",
     "docs",
     "scripts",

@@ -8,8 +8,60 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# Shared regex for validating YouTube video IDs.
-VALID_VIDEO_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementations defined below.
+try:
+    from ._formatting_native import (  # type: ignore[import-not-found]
+        format_duration as _native_format_duration,
+        truncate as _native_truncate,
+        format_count as _native_format_count,
+        format_size as _native_format_size,
+        get_video_id as _native_get_video_id,
+        is_valid_video_id as _native_is_valid_video_id,
+        extract_artist as _native_extract_artist,
+        extract_duration as _native_extract_duration,
+        normalize_tracks as _native_normalize_tracks,
+        strip_vl_prefix as _native_strip_vl_prefix,
+        build_playlist_subtitle as _native_build_playlist_subtitle,
+        sanitize_title_for_lyric_lookup as _native_sanitize_title_for_lyric_lookup,
+        format_ago as _native_format_ago,
+    )
+    _HAVE_NATIVE = True
+except ImportError:
+    _HAVE_NATIVE = False
+
+
+class _VideoIdPattern:
+    """Wrapper that mimics ``re.Pattern.match`` for the native validator.
+
+    ``is_valid_video_id`` returns a bool; all call sites only use the result
+    in a boolean context, so this thin adapter is sufficient.
+    """
+
+    def __init__(self, check_fn):
+        self._check = check_fn
+
+    def match(self, video_id: str) -> bool:
+        return bool(self._check(video_id))
+
+
+if _HAVE_NATIVE:
+    VALID_VIDEO_ID = _VideoIdPattern(_native_is_valid_video_id)
+    format_duration = _native_format_duration
+    truncate = _native_truncate
+    format_count = _native_format_count
+    format_size = _native_format_size
+    get_video_id = _native_get_video_id
+    extract_artist = _native_extract_artist
+    extract_duration = _native_extract_duration
+    normalize_tracks = _native_normalize_tracks
+    strip_vl_prefix = _native_strip_vl_prefix
+    build_playlist_subtitle = _native_build_playlist_subtitle
+    sanitize_title_for_lyric_lookup = _native_sanitize_title_for_lyric_lookup
+else:
+    # Shared regex for validating YouTube video IDs (pure-Python fallback).
+    VALID_VIDEO_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def format_duration(seconds: int) -> str:
@@ -216,9 +268,12 @@ def clean_shelf_title(raw: str) -> str:
 
 
 def format_ago(timestamp: datetime) -> str:
+    if _HAVE_NATIVE:
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return _native_format_ago(timestamp.timestamp())
+
     now = datetime.now(timezone.utc)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
 
     delta = now - timestamp
     total_seconds = int(delta.total_seconds())
