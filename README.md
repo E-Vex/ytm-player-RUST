@@ -9,6 +9,7 @@
 <p align="center">
   <a href="https://pypi.org/project/ytm-player/"><img src="https://img.shields.io/pypi/v/ytm-player?style=for-the-badge&logo=pypi&color=ff4e45&labelColor=0f0f0f&logoColor=ff4e45" alt="PyPI"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-ff4e45?style=for-the-badge&logo=python&labelColor=0f0f0f&logoColor=ff4e45" alt="Python 3.10+"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.98+-ff4e45?style=for-the-badge&logo=rust&labelColor=0f0f0f&logoColor=ff4e45" alt="Rust"></a>
   <a href="https://github.com/peternaame-boop/ytm-player/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/peternaame-boop/ytm-player/ci.yml?style=for-the-badge&logo=githubactions&labelColor=0f0f0f&logoColor=ff4e45" alt="CI"></a>
   <a href="https://github.com/peternaame-boop/ytm-player/blob/master/LICENSE"><img src="https://img.shields.io/github/license/peternaame-boop/ytm-player?style=for-the-badge&logo=opensourceinitiative&color=ff4e45&labelColor=0f0f0f&logoColor=ff4e45" alt="License"></a>
 </p>
@@ -45,6 +46,7 @@
 
 - **Python 3.10+**
 - **[mpv](https://mpv.io/)** (audio playback backend, must be installed system-wide)
+- **[Rust toolchain](https://rustup.rs/) (1.98+)** — optional; only needed to build the native Rust extension. The pure-Python fallback is used automatically when the extension is not compiled.
 - A YouTube Music account (free or Premium)
 
 ## Install
@@ -58,6 +60,26 @@ yay -S ytm-player-git
 ```
 
 For NixOS, Gentoo, Windows-specific mpv DLL setup, source builds, and optional extras (Discord, Last.fm, Spotify import, etc.), see [docs/installation.md](https://github.com/peternaame-boop/ytm-player/blob/master/docs/installation.md).
+
+## Native extension (Rust)
+
+The formatting utilities in `ytm_player/utils/formatting.py` are implemented in Rust via [PyO3](https://pyo3.rs/) for better performance. The pure-Python fallbacks are always used automatically when the compiled extension is unavailable, so nothing is required to run ytm-player — but building the native extension is recommended for source installs.
+
+### Prerequisites
+
+- [Rust toolchain](https://rustup.rs/) (1.98+)
+- Python 3.10+ dev headers (`python3-dev`)
+
+### Build
+
+```bash
+cd native
+./build.sh
+```
+
+This compiles `native/src/lib.rs` into `_formatting_native.abi3.so` and copies it into `src/ytm_player/utils/`. Re-run `./build.sh` after any change to the Rust source.
+
+The extension is built with PyO3's stable ABI (`abi3`), so it remains loadable across Python minor versions within the same 3.x series.
 
 ## Quickstart
 
