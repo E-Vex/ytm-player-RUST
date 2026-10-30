@@ -23,6 +23,18 @@ display name.
 
 from __future__ import annotations
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementation defined below.
+try:
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
+        normalise_region as _native_normalise_region,
+    )
+
+    _HAVE_NATIVE = True
+except ImportError:
+    _HAVE_NATIVE = False
+
 CHART_REGIONS: tuple[tuple[str, str], ...] = (
     ("ZZ", "Global"),
     ("AR", "Argentina"),
@@ -106,6 +118,8 @@ def normalise_region(value: str) -> str:
     """
     if not value:
         return value
+    if _HAVE_NATIVE:
+        return _native_normalise_region(value)
     head, separator, territory = value.strip().replace("_", "-").partition("-")
     if (
         separator

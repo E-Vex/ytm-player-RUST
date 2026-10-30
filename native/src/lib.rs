@@ -78,6 +78,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(sanitize_title_for_lyric_lookup, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(format_ago, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(clean_shelf_title, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(normalise_region, module)?)?;
 
     // BiDi text utilities (ytm_player.utils.bidi equivalents).
     module.add_function(pyo3::wrap_pyfunction!(has_rtl, module)?)?;
@@ -271,6 +272,42 @@ fn clean_shelf_title(
         .to_string();
 
     s
+}
+
+/// Normalise a YouTube chart region value to an ISO 3166-1 alpha-2 code.
+/// Mirrors `ytm_player.services.regions.normalise_region`.
+///
+/// Accepts a bare code ("ES", "es") or a language-territory locale
+/// ("en-GB", "es_ES", " EN-gb ") and returns the territory uppercased.
+/// Non-locale input is returned uppercased as-is; empty input stays empty.
+#[pyfunction]
+fn normalise_region(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let replaced = value.trim().replace('_', "-");
+
+    // Partition on the first '-', mirroring str.partition("-").
+    let (head, territory) = match replaced.split_once('-') {
+        Some((h, t)) => (h, Some(t)),
+        None => (replaced.as_str(), None),
+    };
+
+    if let Some(t) = territory {
+        if head.len() >= 2
+            && head.len() <= 3
+            && head.is_ascii()
+            && head.chars().all(char::is_alphabetic)
+            && t.len() == 2
+            && t.is_ascii()
+            && t.chars().all(char::is_alphabetic)
+        {
+            return t.to_uppercase();
+        }
+    }
+
+    head.trim().to_uppercase()
 }
 
 /// Build the metadata subtitle line for a playlist header.
