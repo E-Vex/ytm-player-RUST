@@ -26,6 +26,7 @@ try:
         build_playlist_subtitle as _native_build_playlist_subtitle,
         sanitize_title_for_lyric_lookup as _native_sanitize_title_for_lyric_lookup,
         format_ago as _native_format_ago,
+        clean_shelf_title as _native_clean_shelf_title,
     )
     _HAVE_NATIVE = True
 except ImportError:
@@ -249,6 +250,13 @@ def clean_shelf_title(raw: str) -> str:
     event pills need the prefix to stay visually distinguishable
     from country chart pills.
     """
+    if _HAVE_NATIVE:
+        from ytm_player.services.regions import CHART_REGIONS
+
+        return _native_clean_shelf_title(
+            raw, [name for _, name in CHART_REGIONS]
+        )
+
     from ytm_player.services.regions import CHART_REGIONS
 
     s = raw.strip()

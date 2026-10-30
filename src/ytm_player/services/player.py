@@ -51,11 +51,18 @@ if sys.platform == "win32":
 # is on PATH — `ytm doctor` says mpv exists while Player() fails
 # (#90, #101, #104). Locate the library in known brew prefixes and, if
 # found, point find_library at it for the duration of the mpv import.
+#
+# ~/.local/lib is included for the same reason on Linux: it is the
+# standard root-free user prefix, and it is NOT in ldconfig's cache, so
+# a libmpv dropped there (extracted .deb, local build, pip install) is
+# invisible to ctypes.util.find_library even though the loader can see
+# it via LD_LIBRARY_PATH.
 _BREW_LIB_DIRS = (
     Path("/opt/homebrew/lib"),  # macOS Apple Silicon
     Path("/usr/local/lib"),  # macOS Intel
     Path("/home/linuxbrew/.linuxbrew/lib"),  # Linuxbrew (Bazzite etc.)
     Path.home() / ".linuxbrew" / "lib",
+    Path.home() / ".local" / "lib",  # user-local prefix (no root needed)
 )
 
 

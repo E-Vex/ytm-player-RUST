@@ -85,8 +85,13 @@ def _zen_profile_roots() -> list[Path]:
     ]
 
 
-def _extract_browser_jar(browser: str):  # type: ignore[no-untyped-def]
-    """Extract cookies from a supported browser, including Zen profiles."""
+def _extract_browser_jar(browser: str, keyring: str | None = None):  # type: ignore[no-untyped-def]
+    """Extract cookies from a supported browser, including Zen profiles.
+
+    *keyring* forces a specific Linux keyring backend (see
+    ``_LINUX_KEYRING_BACKENDS``); when omitted, yt-dlp picks one from the
+    desktop environment.
+    """
     from yt_dlp.cookies import extract_cookies_from_browser
 
     if browser == "zen":
@@ -95,7 +100,50 @@ def _extract_browser_jar(browser: str):  # type: ignore[no-untyped-def]
                 return extract_cookies_from_browser("firefox", profile=str(root))
         raise FileNotFoundError("no Zen profile directory found")
 
-    return extract_cookies_from_browser(browser)
+    if keyring is None:
+        return extract_cookies_from_browser(browser)
+    return extract_cookies_from_browser(browser, keyring=keyring)
+
+
+# yt-dlp picks the Linux keyring backend from the desktop environment
+# (LXQt -> BASIC_TEXT, GNOME -> gnome-keyring, KDE -> kwallet), but modern
+# Chromium browsers always keep their cookie-encryption key in the Secret
+# Service portal, whatever the desktop is. When yt-dlp guesses BASIC_TEXT
+# the v11 cookies stay encrypted and extraction silently yields an empty
+# jar -- "No .youtube.com cookies found in <browser>" even though the
+# browser is signed in. Retry the other backends in that case.
+_LINUX_KEYRING_BACKENDS = ("GNOMEKEYRING", "KWALLET6", "KWALLET5", "KWALLET")
+
+
+def _youtube_cookies(jar: Iterable[Cookie]) -> list[Cookie]:
+    """Return the .youtube.com cookies in *jar* (empty list if there are none)."""
+    try:
+        return [c for c in jar if c.domain == ".youtube.com"]
+    except (AttributeError, TypeError):
+        return []
+
+
+def _extract_browser_jar_with_keyring_fallback(browser: str):  # type: ignore[no-untyped-def]
+    """Extract a browser's cookies, retrying the keyring backends yt-dlp mis-detects.
+
+    Only relevant on Linux; on every other platform the plain extraction is
+    returned unchanged.
+    """
+    jar = _extract_browser_jar(browser)
+    if not sys.platform.startswith("linux") or _youtube_cookies(jar):
+        return jar
+
+    for keyring in _LINUX_KEYRING_BACKENDS:
+        try:
+            retry = _extract_browser_jar(browser, keyring=keyring)
+        except Exception as exc:
+            logger.debug("Cookie extraction from %s via %s failed: %s", browser, keyring, exc)
+            continue
+        if _youtube_cookies(retry):
+            logger.info("Extracted cookies from %s using the %s keyring", browser, keyring)
+            return retry
+
+    return jar
 
 
 def _patch_yt_dlp_browsers() -> None:
@@ -985,7 +1033,7 @@ class AuthManager:
 
         for browser in _BROWSERS:
             try:
-                jar = _extract_browser_jar(browser)
+                jar = _extract_browser_jar_with_keyring_fallback(browser)
                 yt_cookies = [c for c in jar if c.domain == ".youtube.com"]
                 if any(c.name in ("SAPISID", "__Secure-3PAPISID") for c in yt_cookies):
                     return browser, yt_cookies, list(jar)
@@ -1077,7 +1125,7 @@ class AuthManager:
         """Extract YouTube cookies from *browser* and write auth.json."""
         try:
             _patch_yt_dlp_browsers()
-            jar = _extract_browser_jar(browser)
+            jar = _extract_browser_jar_with_keyring_fallback(browser)
         except Exception as exc:
             logger.warning("Cookie extraction from %s failed: %s", browser, exc)
             return False

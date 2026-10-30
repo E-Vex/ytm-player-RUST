@@ -55,6 +55,12 @@ dependencies = [
     # import (socket.CMSG_LEN) and which use their own media integrations
     # (#106, #110).
     "dbus-fast>=5.0.0; sys_platform == 'linux'",
+    # secretstorage lets yt-dlp read Chromium-family browsers' cookie
+    # encryption key from the OS keyring (GNOME Keyring / KWallet). Without
+    # it, browser cookie extraction silently yields an empty jar on Linux
+    # and `ytm setup` reports "No .youtube.com cookies found" even for a
+    # browser that is signed in.
+    "secretstorage>=1.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

@@ -43,6 +43,21 @@ static LYRIC_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
 static COLLAPSE_WS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s{2,}").expect("valid collapse ws regex"));
 
+/// Pattern for "Daily Top 100 Songs" shelf-title rewrite.
+static SHELF_DAILY_TOP_100_SONGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bDaily Top 100 Songs\b").expect("valid shelf title regex")
+});
+
+/// Pattern for "Daily Top Music Videos" shelf-title rewrite.
+static SHELF_DAILY_TOP_MUSIC_VIDEOS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bDaily Top Music Videos\b").expect("valid shelf title regex")
+});
+
+/// Pattern for "Daily Top Songs on Shorts" shelf-title rewrite.
+static SHELF_DAILY_TOP_SHORTS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bDaily Top Songs on Shorts\b").expect("valid shelf title regex")
+});
+
 // ---------------------------------------------------------------------------
 // Module definition
 // ---------------------------------------------------------------------------
@@ -62,6 +77,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(build_playlist_subtitle, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(sanitize_title_for_lyric_lookup, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(format_ago, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(clean_shelf_title, module)?)?;
 
     // BiDi text utilities (ytm_player.utils.bidi equivalents).
     module.add_function(pyo3::wrap_pyfunction!(has_rtl, module)?)?;
@@ -71,6 +87,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(has_non_ascii, module)?)?;
     Ok(())
 }
 
@@ -206,6 +223,54 @@ fn strip_vl_prefix(playlist_id: &str) -> String {
     } else {
         playlist_id.to_string()
     }
+}
+
+/// Normalise a YouTube chart shelf title for compact display.
+/// Mirrors `ytm_player.utils.formatting.clean_shelf_title`.
+/// *region_names* is a Python list of region display names (e.g. "United Kingdom").
+#[pyfunction]
+fn clean_shelf_title(
+    _py: Python,
+    raw: &str,
+    region_names: &Bound<'_, PyList>,
+) -> String {
+    let mut s = raw.trim().to_string();
+
+    // Collect region display names from the Python list.
+    let names: Vec<String> = region_names
+        .iter()
+        .filter_map(|item| item.extract::<String>().ok())
+        .collect();
+
+    // Strip " - Country" suffix (split on the LAST " - ").
+    if let Some(idx) = s.rfind(" - ") {
+        let tail = &s[idx + 3..];
+        if names.iter().any(|name| tail == *name) {
+            s = s[..idx].trim().to_string();
+        }
+    }
+
+    // Strip " Country" suffix.
+    for name in &names {
+        let suffix = format!(" {name}");
+        if s.ends_with(&suffix) {
+            s = s[..s.len() - suffix.len()].trim().to_string();
+            break;
+        }
+    }
+
+    // Regex rewrites (applied in order, all occurrences).
+    s = SHELF_DAILY_TOP_100_SONGS_RE
+        .replace_all(&s, "Daily Top 100")
+        .to_string();
+    s = SHELF_DAILY_TOP_MUSIC_VIDEOS_RE
+        .replace_all(&s, "Daily Top Videos")
+        .to_string();
+    s = SHELF_DAILY_TOP_SHORTS_RE
+        .replace_all(&s, "Daily Top Songs (Shorts)")
+        .to_string();
+
+    s
 }
 
 /// Build the metadata subtitle line for a playlist header.
@@ -808,4 +873,11 @@ fn wrap_line(text: &str, width: i64) -> String {
 #[pyfunction]
 fn transliterate(text: &str) -> String {
     any_ascii::any_ascii(text)
+}
+
+/// Return True if *text* is non-empty and contains any non-ASCII characters.
+/// Mirrors `ytm_player.utils.transliteration.has_non_ascii`.
+#[pyfunction]
+fn has_non_ascii(text: &str) -> bool {
+    !text.is_empty() && !text.is_ascii()
 }

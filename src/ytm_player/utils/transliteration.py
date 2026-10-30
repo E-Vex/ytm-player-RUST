@@ -13,13 +13,17 @@ from functools import lru_cache
 try:
     from ._ytm_player_native import (  # type: ignore[import-not-found]
         transliterate as _native_transliterate,
+        has_non_ascii as _native_has_non_ascii,
     )
 except ImportError:
     _native_transliterate = None
+    _native_has_non_ascii = None
 
 
 def has_non_ascii(text: str) -> bool:
     """Return True if *text* contains any non-ASCII characters."""
+    if _native_has_non_ascii is not None:
+        return _native_has_non_ascii(text)
     return bool(text) and not text.isascii()
 
 
