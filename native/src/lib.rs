@@ -139,6 +139,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // Playback queue engine (ytm_player.services.queue equivalent).
     module.add_class::<QueueCore>()?;
+
+    // Track-table view engine (ui/widgets/track_table.py equivalent):
+    // the filter + sort pass that computes the visible row order.
+    module.add_function(pyo3::wrap_pyfunction!(filter_sort_tracks, module)?)?;
     Ok(())
 }
 
@@ -2272,4 +2276,169 @@ impl QueueCore {
         self.shuffle_order = order;
         self.shuffle_position = position;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Track-table view engine (mirrors ui/widgets/track_table.py)
+// ---------------------------------------------------------------------------
+
+/// The sortable columns of the track table — the `_SORT_KEYS` table in
+/// `ui/widgets/track_table.py`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackSortColumn {
+    Index,
+    Title,
+    Artist,
+    Album,
+    Duration,
+}
+
+impl TrackSortColumn {
+    /// Resolve a sort-column name. Unknown names sort nothing, mirroring
+    /// the Python table lookup `_SORT_KEYS.get(column or "")`.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "index" => Some(Self::Index),
+            "title" => Some(Self::Title),
+            "artist" => Some(Self::Artist),
+            "album" => Some(Self::Album),
+            "duration" => Some(Self::Duration),
+            _ => None,
+        }
+    }
+}
+
+/// Sort-key payload for one row. Every row of one view shares the same
+/// variant (the column fixes it), so ordering never crosses variants;
+/// each payload compares exactly like the Python key expression it
+/// mirrors — strings by `<` (UTF-8 byte order equals code-point order,
+/// so it matches Python's `str` comparison) and ints numerically.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TrackSortKey {
+    Str(String),
+    Int(i64),
+}
+
+/// Lowercased `title`/`album` with the Python fallback's
+/// `(t.get(key) or "")` semantics: missing, `None` and empty all read as
+/// `""`. Non-string values degrade to `""` where the fallback would raise
+/// — `load_tracks` only ever stores strings there.
+fn lowercased_str_field(track: &Bound<'_, PyDict>, key: &str) -> String {
+    track
+        .get_item(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+/// The `_matches_filter` test: a substring of the already-lowercased
+/// *query* against the lowercased title, artist and album (the caller's
+/// `apply_filter` strips and lowercases the query before it gets here).
+fn track_matches_filter(py: Python, track: &Bound<'_, PyDict>, query: &str) -> bool {
+    let title = lowercased_str_field(track, "title");
+    let artist = extract_artist(py, track).to_lowercase();
+    let album = lowercased_str_field(track, "album");
+    title.contains(query) || artist.contains(query) || album.contains(query)
+}
+
+/// Sort key for one row under *column*; `None` reads the row as an empty
+/// track (missing/`None` fields, `"Unknown"` artist, 0 index/duration).
+fn track_sort_key(
+    py: Python,
+    column: TrackSortColumn,
+    track: Option<&Bound<'_, PyDict>>,
+) -> TrackSortKey {
+    let dict = match track {
+        Some(d) => d,
+        None => {
+            return match column {
+                TrackSortColumn::Index | TrackSortColumn::Duration => TrackSortKey::Int(0),
+                _ => TrackSortKey::Str(String::new()),
+            };
+        }
+    };
+    match column {
+        TrackSortColumn::Index => TrackSortKey::Int(
+            dict.get_item("_original_index")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract::<i64>().ok())
+                .unwrap_or(0),
+        ),
+        TrackSortColumn::Title => TrackSortKey::Str(lowercased_str_field(dict, "title")),
+        TrackSortColumn::Artist => TrackSortKey::Str(extract_artist(py, dict).to_lowercase()),
+        TrackSortColumn::Album => TrackSortKey::Str(lowercased_str_field(dict, "album")),
+        TrackSortColumn::Duration => TrackSortKey::Int(extract_duration(py, dict)),
+    }
+}
+
+/// Compute the track-table view order: filter, then sort.
+///
+/// Mirrors `TrackTable._rebuild_view` + `_matches_filter` + `_SORT_KEYS`
+/// from `ui/widgets/track_table.py`:
+///
+/// - *query* arrives already stripped and lowercased (the caller's
+///   `apply_filter` preprocessing); a row matches when the query is a
+///   substring of its lowercased title, artist, or album. An empty query
+///   keeps every row.
+/// - *sort_column* is one of `index` / `title` / `artist` / `album` /
+///   `duration`; `None` or an unknown name leaves load order.
+/// - The sort is stable, and with *sort_reverse* ties still keep their
+///   input order — exactly Python's `list.sort(key=..., reverse=True)`.
+///
+/// Returns the positions (indices into *tracks*) of the visible rows, in
+/// display order, so the caller can slice both its track list and the
+/// `_original_index` map from one pass.
+///
+/// Non-dict rows and non-string title/album values degrade gracefully
+/// (never match a filter, read as empty fields) where the Python fallback
+/// would raise — `load_tracks` guarantees dicts with string fields, and
+/// the engine staying total keeps a malformed row from taking the whole
+/// view down with it.
+#[pyfunction(signature = (tracks, query, sort_column, sort_reverse))]
+fn filter_sort_tracks(
+    py: Python,
+    tracks: &Bound<'_, PyList>,
+    query: &str,
+    sort_column: Option<&str>,
+    sort_reverse: bool,
+) -> Vec<usize> {
+    let column = sort_column.and_then(TrackSortColumn::from_name);
+    let mut positions: Vec<usize> = Vec::with_capacity(tracks.len());
+
+    for (i, item) in tracks.iter().enumerate() {
+        if query.is_empty() {
+            positions.push(i);
+        } else if let Ok(dict) = item.downcast::<PyDict>() {
+            if track_matches_filter(py, dict, query) {
+                positions.push(i);
+            }
+        }
+    }
+
+    if let Some(column) = column {
+        let mut keyed: Vec<(usize, TrackSortKey)> = Vec::with_capacity(positions.len());
+        for &i in &positions {
+            let dict = tracks
+                .get_item(i)
+                .ok()
+                .and_then(|item| item.downcast_into::<PyDict>().ok());
+            keyed.push((i, track_sort_key(py, column, dict.as_ref())));
+        }
+        // Stable sort; a reversed comparator keeps ties in input order,
+        // matching Python's `list.sort(key=..., reverse=True)`.
+        keyed.sort_by(|a, b| {
+            let ord = a.1.cmp(&b.1);
+            if sort_reverse {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        positions = keyed.into_iter().map(|(i, _)| i).collect();
+    }
+
+    positions
 }

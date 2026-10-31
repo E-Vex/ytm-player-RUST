@@ -25,6 +25,8 @@ _MARK_GLYPH = "✓"
 
 # Sort key per sortable column, shared by the visible sort and by
 # ``marked_tracks`` (which orders the whole backing list the same way).
+# The pure-Python reference for the view engine below; the native
+# override at the bottom of this module replaces it when built.
 _SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "index": lambda t: t.get("_original_index", 0),
     "title": lambda t: (t.get("title") or "").lower(),
@@ -32,6 +34,44 @@ _SORT_KEYS: dict[str, Callable[[dict], Any]] = {
     "album": lambda t: (t.get("album") or "").lower(),
     "duration": lambda t: extract_duration(t),
 }
+
+
+def _matches_filter(track: dict, query: str) -> bool:
+    """Check if a track matches the filter (title + artist + album).
+
+    *query* arrives already lowercased (``apply_filter``'s preprocessing);
+    the three fields are lowercased here for the comparison.
+    """
+    title = (track.get("title") or "").lower()
+    artist = extract_artist(track).lower()
+    album = (track.get("album") or "").lower()
+    return query in title or query in artist or query in album
+
+
+def _filter_sort_positions(
+    tracks: list[dict],
+    query: str,
+    sort_column: str | None,
+    sort_reverse: bool,
+) -> list[int]:
+    """Compute the visible-row order of *tracks* — the filter, then the sort.
+
+    The view engine behind ``TrackTable._rebuild_view`` and
+    ``marked_tracks``: *query* (already stripped and lowercased by the
+    caller) keeps the tracks whose lowercased title, artist or album
+    contain it; *sort_column* (one of the ``_SORT_KEYS`` names) then
+    orders them, stably, with ties kept in input order even when
+    *sort_reverse* is set. Returns the positions (indices into *tracks*)
+    of the visible rows, in display order.
+    """
+    if query:
+        kept = [i for i, t in enumerate(tracks) if _matches_filter(t, query)]
+    else:
+        kept = list(range(len(tracks)))
+    key_fn = _SORT_KEYS.get(sort_column or "")
+    if key_fn is not None:
+        kept.sort(key=lambda i: key_fn(tracks[i]), reverse=sort_reverse)
+    return kept
 
 
 class TrackTable(DataTable):
@@ -279,11 +319,15 @@ class TrackTable(DataTable):
         """
         if not self._marked:
             return []
-        ordered = list(self._all_tracks)
-        key_fn = _SORT_KEYS.get(self._sort_column or "")
-        if key_fn is not None:
-            ordered.sort(key=key_fn, reverse=self._sort_reverse)
-        return [t for t in ordered if t["_original_index"] in self._marked]
+        positions = _filter_sort_positions(
+            self._all_tracks, "", self._sort_column, self._sort_reverse
+        )
+        marked: list[dict] = []
+        for i in positions:
+            track = self._all_tracks[i]
+            if track["_original_index"] in self._marked:
+                marked.append(track)
+        return marked
 
     # -- Setup ------------------------------------------------------------
 
@@ -475,7 +519,7 @@ class TrackTable(DataTable):
             self._all_tracks.append(t)
             # If filter is active, only add matching tracks to visible table.
             if self._filter_active and self._filter_text:
-                if not self._matches_filter(t, self._filter_text):
+                if not _matches_filter(t, self._filter_text):
                     continue
             self._tracks.append(t)
             self._filtered_map.append(i)
@@ -1131,26 +1175,16 @@ class TrackTable(DataTable):
 
         One path for filtering, sorting and ``refresh_tracks``, so the
         rows come out the same whichever order the user applied them in
-        — a filter typed on a sorted list keeps the sort.
+        — a filter typed on a sorted list keeps the sort. The order itself
+        comes from ``_filter_sort_positions`` — the native Rust engine
+        when the extension is built, the pure-Python reference otherwise.
         """
-        query = self._filter_text
-        if query:
-            self._tracks = [t for t in self._all_tracks if self._matches_filter(t, query)]
-        else:
-            self._tracks = list(self._all_tracks)
-        key_fn = _SORT_KEYS.get(self._sort_column or "")
-        if key_fn is not None:
-            self._tracks.sort(key=key_fn, reverse=self._sort_reverse)
+        positions = _filter_sort_positions(
+            self._all_tracks, self._filter_text, self._sort_column, self._sort_reverse
+        )
+        self._tracks = [self._all_tracks[i] for i in positions]
         self._filtered_map = [t["_original_index"] for t in self._tracks]
         self._reload_sorted()
-
-    @staticmethod
-    def _matches_filter(track: dict, query: str) -> bool:
-        """Check if a track matches the filter (title + artist + album)."""
-        title = (track.get("title") or "").lower()
-        artist = extract_artist(track).lower()
-        album = (track.get("album") or "").lower()
-        return query in title or query in artist or query in album
 
     def show_filter(self) -> None:
         """Signal that filter mode should begin."""
@@ -1288,3 +1322,35 @@ class TrackTable(DataTable):
                     current = self.selected_original_index
                     self._rebuild_view()
                     self._place_cursor_on(current)
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same view engine; this binding
+# overrides the pure-Python reference above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        filter_sort_tracks as _native_filter_sort_tracks,
+    )
+except ImportError:
+    pass
+else:
+
+    def _filter_sort_positions(  # noqa: F811
+        tracks: list[dict],
+        query: str,
+        sort_column: str | None,
+        sort_reverse: bool,
+    ) -> list[int]:
+        """Compute the visible-row order (native Rust engine).
+
+        Same contract as the pure-Python reference above: returns the
+        positions of the visible rows in display order. Non-dict rows and
+        non-string title/album values degrade gracefully where the
+        reference would raise — ``load_tracks`` never produces them.
+        """
+        return _native_filter_sort_tracks(tracks, query, sort_column, sort_reverse)
