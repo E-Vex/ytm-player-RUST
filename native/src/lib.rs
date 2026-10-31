@@ -16,8 +16,10 @@ static VIEW_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Patterns stripped from titles during lyric-lookup sanitization.
+/// `(?xi)`: case-insensitive + verbose, matching the Python fallback's
+/// `re.IGNORECASE | re.VERBOSE`.
 static LYRIC_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?x)
+    Regex::new(r#"(?xi)
         \s*
         [\(\[]\s*
         (?:
@@ -58,6 +60,27 @@ static SHELF_DAILY_TOP_SHORTS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bDaily Top Songs on Shorts\b").expect("valid shelf title regex")
 });
 
+/// Stream URLs in diagnostics may contain the public IP and signed playback
+/// parameters; the whole URL is removed rather than guessing which query
+/// fields are sensitive. Mirrors `doctor._URL_PATTERN`.
+static DIAG_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(?:https?|tcp)://[^\s<>"']+"#).expect("valid diagnostic url regex")
+});
+
+/// Header-value pairs redacted from diagnostics before the report is shown.
+/// Each keeps its prefix (group 1) and replaces the value with `[REDACTED]`.
+/// Mirrors `doctor._REDACT_PATTERNS` (same order, same grouping).
+static DIAG_REDACT_RES: LazyLock<[Regex; 6]> = LazyLock::new(|| {
+    [
+        Regex::new(r"(?i)(authorization\s*[:=]\s*)(.+)").expect("valid redact regex"),
+        Regex::new(r"(?i)(cookie\s*[:=]\s*)(.+)").expect("valid redact regex"),
+        Regex::new(r"(?i)(bearer\s+)(\S+)").expect("valid redact regex"),
+        Regex::new(r"(?i)(token\s*[:=]\s*)(\S+)").expect("valid redact regex"),
+        Regex::new(r"(?i)(x-goog-pageid\s*[:=]\s*)(\S+)").expect("valid redact regex"),
+        Regex::new(r"(SAPISID\s*=\s*)(\S+)").expect("valid redact regex"),
+    ]
+});
+
 // ---------------------------------------------------------------------------
 // Module definition
 // ---------------------------------------------------------------------------
@@ -89,6 +112,11 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(has_non_ascii, module)?)?;
+
+    // Diagnostics (ytm_player.utils.doctor / logging equivalents).
+    module.add_function(pyo3::wrap_pyfunction!(redact, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(argv_is_ytm, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(filter_log_lines, module)?)?;
     Ok(())
 }
 
@@ -336,10 +364,16 @@ fn build_playlist_subtitle(
 }
 
 fn capitalize_first(s: &str) -> String {
+    // Mirror Python's str.capitalize(): first char uppercased, the rest
+    // lowercased ("PUBLIC" -> "Public", not "PUBLIC").
     let mut c = s.chars();
     match c.next() {
         None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        Some(f) => {
+            let mut out: String = f.to_uppercase().collect();
+            out.extend(c.flat_map(char::to_lowercase));
+            out
+        }
     }
 }
 
@@ -391,11 +425,10 @@ fn extract_artist_names<'py>(
             if let Ok(Some(name)) = get_optional_string(py, dict, "name") {
                 names.push(name);
             }
-        } else if let Ok(s) = item.downcast::<PyString>() {
-            if let Ok(name) = s.to_str() {
-                if !name.is_empty() {
-                    names.push(name.to_string());
-                }
+        } else if let Ok(s) = item.str().and_then(|s| s.to_str().map(|s| s.to_string())) {
+            // Mirrors the Python reference's ``str(a)`` for non-dict runs.
+            if !s.is_empty() {
+                names.push(s);
             }
         }
     }
@@ -421,6 +454,9 @@ fn parse_duration_string(dur: &str) -> Option<i64> {
 }
 
 /// Extract duration in seconds from various track dict formats.
+/// Mirrors the Python reference exactly: ``duration_seconds`` goes through
+/// ``int()`` (int, numeric string, truncating float — never colon parsing);
+/// ``duration``/``length`` accept plain ints and "M:SS"/"H:MM:SS" strings.
 #[pyfunction]
 fn extract_duration(_py: Python, track: &Bound<'_, PyDict>) -> i64 {
     // duration_seconds
@@ -428,10 +464,15 @@ fn extract_duration(_py: Python, track: &Bound<'_, PyDict>) -> i64 {
         if let Ok(i) = dur.extract::<i64>() {
             return i;
         }
+        // int("12") — numeric strings, no colon parsing.
         if let Some(s) = dur.downcast::<PyString>().ok().and_then(|s| s.to_str().ok()) {
-            if let Some(secs) = parse_duration_string(s) {
-                return secs;
+            if let Ok(i) = s.trim().parse::<i64>() {
+                return i;
             }
+        }
+        // int(12.7) — Python truncates floats toward zero.
+        if let Ok(f) = dur.extract::<f64>() {
+            return f as i64;
         }
     }
     // duration
@@ -518,11 +559,18 @@ fn normalize_tracks<'py>(
 
         let raw_artists = get_optional_any(track, "artists")?;
         let views = get_optional_any(track, "views")?;
-        let mut artists_list: Vec<String> = Vec::new();
+        // Mirror the Python reference: the ``artists`` list keeps the
+        // ORIGINAL entries (dicts stay dicts), dropping only view-count
+        // pseudo-artist runs — downstream consumers navigate by name/id.
+        let mut artists_entries: Vec<Bound<'py, PyAny>> = Vec::new();
         if let Some(ref raw) = raw_artists {
             if let Ok(list) = raw.downcast::<PyList>() {
                 let views_ref = views.as_ref();
-                artists_list = extract_artist_names(py, &list, views_ref);
+                for item in list.iter() {
+                    if !is_view_count_run(&item, views_ref) {
+                        artists_entries.push(item);
+                    }
+                }
             }
         }
 
@@ -588,9 +636,13 @@ fn normalize_tracks<'py>(
         let set_video_id = get_optional_string(py, track, "setVideoId")?;
 
         let entry = PyDict::new(py);
+        // Key order mirrors the Python reference's dict literal so
+        // serialized/iterated shapes are identical.
         entry.set_item("video_id", video_id.as_str())?;
         entry.set_item("title", title.as_str())?;
         entry.set_item("artist", artist.as_str())?;
+        let artists_pylist = PyList::new(py, artists_entries)?;
+        entry.set_item("artists", artists_pylist)?;
         entry.set_item("album", album.as_str())?;
         match &album_id {
             Some(aid) => entry.set_item("album_id", aid.as_str())?,
@@ -613,9 +665,6 @@ fn normalize_tracks<'py>(
             Some(svid) => entry.set_item("setVideoId", svid.as_str())?,
             None => entry.set_item("setVideoId", pyo3::types::PyNone::get(py))?,
         }
-        let artists_pylist =
-            PyList::new(py, artists_list.iter().map(|s| s.as_str()).collect::<Vec<&str>>())?;
-        entry.set_item("artists", artists_pylist)?;
 
         normalized.append(entry)?;
     }
@@ -635,7 +684,11 @@ fn sanitize_title_for_lyric_lookup(title: &str, artist: Option<&str>) -> String 
             let cleaned_lower = cleaned.to_lowercase();
             let prefix_lower = format!("{} - ", artist.to_lowercase());
             if cleaned_lower.starts_with(&prefix_lower) {
-                cleaned = cleaned[prefix_lower.len()..].to_string();
+                // Python slices by ``len(prefix_lower)`` — code points, not
+                // bytes — so a multi-byte lowercase mapping can't split a
+                // char boundary or panic here.
+                let skip = prefix_lower.chars().count();
+                cleaned = cleaned.chars().skip(skip).collect();
             }
         }
     }
@@ -917,4 +970,80 @@ fn transliterate(text: &str) -> String {
 #[pyfunction]
 fn has_non_ascii(text: &str) -> bool {
     !text.is_empty() && !text.is_ascii()
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics (mirrors ytm_player/utils/doctor.py and logging.py)
+// ---------------------------------------------------------------------------
+
+/// Redact recognized auth headers/tokens and HTTP(S)/TCP URLs from
+/// diagnostic text. Mirrors `ytm_player.utils.doctor._redact` exactly:
+/// each header pattern keeps its prefix and masks the rest of the line,
+/// then whole URLs are replaced with `[URL REDACTED]`.
+#[pyfunction]
+fn redact(text: &str) -> String {
+    let mut out = text.to_string();
+    for re in DIAG_REDACT_RES.iter() {
+        out = re.replace_all(&out, "${1}[REDACTED]").into_owned();
+    }
+    DIAG_URL_RE.replace_all(&out, "[URL REDACTED]").into_owned()
+}
+
+/// Mirror `pathlib.PurePath.name` for the platform's path syntax: split on
+/// separators, drop empty and `.` components, and return the last remaining
+/// component ("" when none). `..` is kept, matching pathlib.
+fn py_path_name(path: &str) -> String {
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let mut name = String::new();
+    for component in path.split(separators) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        name = component.to_string();
+    }
+    name
+}
+
+/// True when *argv* is a real ytm-player entry point. Mirrors
+/// `ytm_player.utils.doctor._argv_is_ytm`: the `ytm` console script
+/// (interpreter in argv[0], script path in argv[1]) or `python -m
+/// ytm_player`; never an unrelated process whose cmdline merely mentions
+/// a ytm-player path.
+#[pyfunction]
+fn argv_is_ytm(argv: Vec<String>) -> bool {
+    let head_names: Vec<String> = argv.iter().take(2).map(|a| py_path_name(a)).collect();
+    head_names.iter().any(|name| name == "ytm") || argv.iter().any(|a| a == "ytm_player")
+}
+
+/// Filter already-read log lines down to those at or above *min_level* and
+/// return the last *n* joined together. Mirrors the pure filtering core of
+/// `ytm_player.utils.logging.get_recent_log_lines` (file I/O stays in
+/// Python): lines keep their trailing newlines, unknown levels apply no
+/// filter, and the tail slice follows Python's `lines[-n:]` semantics.
+#[pyfunction(signature = (lines, n, min_level = None))]
+fn filter_log_lines(lines: Vec<String>, n: i64, min_level: Option<&str>) -> String {
+    let mut kept = lines;
+    if let Some(level) = min_level {
+        const ORDER: [&str; 5] = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"];
+        let upper = level.to_uppercase();
+        if let Some(threshold) = ORDER.iter().position(|o| *o == upper) {
+            let wanted: Vec<String> = ORDER[threshold..]
+                .iter()
+                .map(|w| format!("[{w}]"))
+                .collect();
+            kept.retain(|line| wanted.iter().any(|w| line.contains(w.as_str())));
+        }
+    }
+    // Mirror Python's `lines[-n:]`: positive n keeps the last n, zero keeps
+    // everything (`lines[-0:]` is `lines[0:]`), negative n drops the leading
+    // -n entries (empty when -n exceeds the length).
+    let len = kept.len();
+    let start = if n > 0 {
+        len.saturating_sub(n as usize)
+    } else if n == 0 {
+        0
+    } else {
+        ((-n) as i128).min(len as i128) as usize
+    };
+    kept[start..].concat()
 }

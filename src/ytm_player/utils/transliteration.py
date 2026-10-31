@@ -11,9 +11,11 @@ from __future__ import annotations
 from functools import lru_cache
 
 try:
+    from ._ytm_player_native import (
+        has_non_ascii as _native_has_non_ascii,
+    )
     from ._ytm_player_native import (  # type: ignore[import-not-found]
         transliterate as _native_transliterate,
-        has_non_ascii as _native_has_non_ascii,
     )
 except ImportError:
     _native_transliterate = None

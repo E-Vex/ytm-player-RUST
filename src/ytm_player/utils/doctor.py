@@ -20,6 +20,20 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementations defined below.
+try:
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
+        argv_is_ytm as _native_argv_is_ytm,
+    )
+    from ._ytm_player_native import (
+        redact as _native_redact,
+    )
+except ImportError:
+    _native_argv_is_ytm = None
+    _native_redact = None
+
 # Stream URLs may contain the public IP and signed playback parameters.
 # Remove the whole URL rather than guessing which query fields are sensitive.
 _URL_PATTERN = re.compile(r"\b(?:https?|tcp)://[^\s<>\"']+", re.IGNORECASE)
@@ -36,6 +50,8 @@ _REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _redact(text: str) -> str:
+    if _native_redact is not None:
+        return _native_redact(text)
     for pat in _REDACT_PATTERNS:
         text = pat.sub(r"\1[REDACTED]", text)
     return _URL_PATTERN.sub("[URL REDACTED]", text)
@@ -112,6 +128,8 @@ def _argv_is_ytm(argv: list[str]) -> bool:
     processes whose cmdline merely contains a path like /ytm-player or
     …/ytm_player/… (e.g. an editor with the repo open).
     """
+    if _native_argv_is_ytm is not None:
+        return _native_argv_is_ytm(argv)
     head_names = [Path(a).name for a in argv[:2]]
     return "ytm" in head_names or "ytm_player" in argv
 

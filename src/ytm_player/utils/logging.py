@@ -20,6 +20,16 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementations defined below.
+try:
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
+        filter_log_lines as _native_filter_log_lines,
+    )
+except ImportError:
+    _native_filter_log_lines = None
+
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] [%(threadName)s] %(name)s: %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -222,6 +232,8 @@ def get_recent_log_lines(log_file: Path, n: int = 50, *, min_level: str | None =
             lines = f.readlines()
     except OSError:
         return ""
+    if _native_filter_log_lines is not None:
+        return _native_filter_log_lines(lines, n, min_level)
     if min_level is not None:
         order = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         try:

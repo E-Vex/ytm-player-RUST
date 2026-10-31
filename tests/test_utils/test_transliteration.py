@@ -1,17 +1,13 @@
 """Tests for the transliteration utility module."""
 
+from importlib.util import find_spec
 from unittest.mock import patch
 
 import pytest
 
 from ytm_player.utils.transliteration import has_non_ascii, transliterate_line
 
-try:
-    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
-
-    _HAVE_NATIVE = True
-except ImportError:
-    _HAVE_NATIVE = False
+_HAVE_NATIVE = find_spec("ytm_player.utils._ytm_player_native") is not None
 
 # ── has_non_ascii ─────────────────────────────────────────────────────────────
 

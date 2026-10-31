@@ -8,61 +8,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# Try to load the native Rust implementation via PyO3.  If the compiled
-# extension is unavailable (e.g. during development without a Rust toolchain),
-# fall back to the pure-Python implementations defined below.
-try:
-    from ._ytm_player_native import (  # type: ignore[import-not-found]
-        format_duration as _native_format_duration,
-        truncate as _native_truncate,
-        format_count as _native_format_count,
-        format_size as _native_format_size,
-        get_video_id as _native_get_video_id,
-        is_valid_video_id as _native_is_valid_video_id,
-        extract_artist as _native_extract_artist,
-        extract_duration as _native_extract_duration,
-        normalize_tracks as _native_normalize_tracks,
-        strip_vl_prefix as _native_strip_vl_prefix,
-        build_playlist_subtitle as _native_build_playlist_subtitle,
-        sanitize_title_for_lyric_lookup as _native_sanitize_title_for_lyric_lookup,
-        format_ago as _native_format_ago,
-        clean_shelf_title as _native_clean_shelf_title,
-    )
-    _HAVE_NATIVE = True
-except ImportError:
-    _HAVE_NATIVE = False
-
-
-class _VideoIdPattern:
-    """Wrapper that mimics ``re.Pattern.match`` for the native validator.
-
-    ``is_valid_video_id`` returns a bool; all call sites only use the result
-    in a boolean context, so this thin adapter is sufficient.
-    """
-
-    def __init__(self, check_fn):
-        self._check = check_fn
-
-    def match(self, video_id: str) -> bool:
-        return bool(self._check(video_id))
-
-
-if _HAVE_NATIVE:
-    VALID_VIDEO_ID = _VideoIdPattern(_native_is_valid_video_id)
-    format_duration = _native_format_duration
-    truncate = _native_truncate
-    format_count = _native_format_count
-    format_size = _native_format_size
-    get_video_id = _native_get_video_id
-    extract_artist = _native_extract_artist
-    extract_duration = _native_extract_duration
-    normalize_tracks = _native_normalize_tracks
-    strip_vl_prefix = _native_strip_vl_prefix
-    build_playlist_subtitle = _native_build_playlist_subtitle
-    sanitize_title_for_lyric_lookup = _native_sanitize_title_for_lyric_lookup
-else:
-    # Shared regex for validating YouTube video IDs (pure-Python fallback).
-    VALID_VIDEO_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+# Shared regex for validating YouTube video IDs (pure-Python fallback; the
+# native override at the bottom of this module replaces it when built).
+VALID_VIDEO_ID = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def format_duration(seconds: int) -> str:
@@ -250,13 +198,6 @@ def clean_shelf_title(raw: str) -> str:
     event pills need the prefix to stay visually distinguishable
     from country chart pills.
     """
-    if _HAVE_NATIVE:
-        from ytm_player.services.regions import CHART_REGIONS
-
-        return _native_clean_shelf_title(
-            raw, [name for _, name in CHART_REGIONS]
-        )
-
     from ytm_player.services.regions import CHART_REGIONS
 
     s = raw.strip()
@@ -276,10 +217,10 @@ def clean_shelf_title(raw: str) -> str:
 
 
 def format_ago(timestamp: datetime) -> str:
-    if _HAVE_NATIVE:
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        return _native_format_ago(timestamp.timestamp())
+    # Naive datetimes are interpreted as UTC (a naive timestamp() would
+    # silently use the local zone instead).
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
 
     now = datetime.now(timezone.utc)
 
@@ -444,3 +385,96 @@ def sanitize_title_for_lyric_lookup(title: str, artist: str = "") -> str:
             cleaned = cleaned[len(prefix_lower) :]
     cleaned = cleaned.strip()
     return cleaned if cleaned else title
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same functions; these bindings override
+# the pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+
+class _VideoIdPattern:
+    """Wrapper that mimics ``re.Pattern.match`` for the native validator.
+
+    ``is_valid_video_id`` returns a bool; all call sites only use the result
+    in a boolean context, so this thin adapter is sufficient.
+    """
+
+    def __init__(self, check_fn):
+        self._check = check_fn
+
+    def match(self, video_id: str) -> bool:
+        return bool(self._check(video_id))
+
+
+try:
+    from ._ytm_player_native import (  # type: ignore[import-not-found]
+        build_playlist_subtitle as _native_build_playlist_subtitle,
+    )
+    from ._ytm_player_native import (
+        clean_shelf_title as _native_clean_shelf_title,
+    )
+    from ._ytm_player_native import (
+        extract_artist as _native_extract_artist,
+    )
+    from ._ytm_player_native import (
+        extract_duration as _native_extract_duration,
+    )
+    from ._ytm_player_native import (
+        format_ago as _native_format_ago,
+    )
+    from ._ytm_player_native import (
+        format_count as _native_format_count,
+    )
+    from ._ytm_player_native import (
+        format_duration as _native_format_duration,
+    )
+    from ._ytm_player_native import (
+        format_size as _native_format_size,
+    )
+    from ._ytm_player_native import (
+        get_video_id as _native_get_video_id,
+    )
+    from ._ytm_player_native import (
+        is_valid_video_id as _native_is_valid_video_id,
+    )
+    from ._ytm_player_native import (
+        normalize_tracks as _native_normalize_tracks,
+    )
+    from ._ytm_player_native import (
+        sanitize_title_for_lyric_lookup as _native_sanitize_title_for_lyric_lookup,
+    )
+    from ._ytm_player_native import (
+        strip_vl_prefix as _native_strip_vl_prefix,
+    )
+    from ._ytm_player_native import (
+        truncate as _native_truncate,
+    )
+except ImportError:
+    pass
+else:
+    VALID_VIDEO_ID = _VideoIdPattern(_native_is_valid_video_id)  # type: ignore[assignment]
+    format_duration = _native_format_duration  # type: ignore[assignment]
+    truncate = _native_truncate  # type: ignore[assignment]
+    format_count = _native_format_count  # type: ignore[assignment]
+    format_size = _native_format_size  # type: ignore[assignment]
+    get_video_id = _native_get_video_id  # type: ignore[assignment]
+    extract_artist = _native_extract_artist  # type: ignore[assignment]
+    extract_duration = _native_extract_duration  # type: ignore[assignment]
+    normalize_tracks = _native_normalize_tracks  # type: ignore[assignment]
+    strip_vl_prefix = _native_strip_vl_prefix  # type: ignore[assignment]
+    build_playlist_subtitle = _native_build_playlist_subtitle  # type: ignore[assignment]
+    sanitize_title_for_lyric_lookup = _native_sanitize_title_for_lyric_lookup  # type: ignore[assignment]
+
+    def clean_shelf_title(raw: str) -> str:  # noqa: F811
+        """Normalise a YouTube chart shelf title (native)."""
+        from ytm_player.services.regions import CHART_REGIONS
+
+        return _native_clean_shelf_title(raw, [name for _, name in CHART_REGIONS])
+
+    def format_ago(timestamp: datetime) -> str:  # noqa: F811
+        """Relative-time formatting (native)."""
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return _native_format_ago(timestamp.timestamp())

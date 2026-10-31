@@ -491,6 +491,61 @@ class TestGetRecentLogLinesFilter:
         assert "info 1" not in out
         assert "warn 1" in out
 
+    def test_missing_file_returns_empty(self, tmp_path: Path):
+        from ytm_player.utils.logging import get_recent_log_lines
+
+        assert get_recent_log_lines(tmp_path / "nope.log") == ""
+
+    def test_tail_respects_n(self, tmp_path: Path):
+        from ytm_player.utils.logging import get_recent_log_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text("".join(f"2026-04-30 [INFO] foo: line {i}\n" for i in range(10)))
+        out = get_recent_log_lines(log, n=3)
+        assert "line 6" not in out
+        assert "line 7" in out
+        assert "line 9" in out
+
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+
+class TestNativeParity:
+    """When the Rust extension is built, get_recent_log_lines must return
+    exactly what the pure-Python filtering would return for the same file
+    (level filtering, unknown levels, and tail slicing)."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize("min_level", [None, "DEBUG", "warning", "ERROR", "CRITICAL", "BOGUS"])
+    @pytest.mark.parametrize("n", [50, 2, 0])
+    def test_filter_native_matches_fallback(
+        self, monkeypatch, tmp_path: Path, n: int, min_level: str | None
+    ):
+        from ytm_player.utils import logging as log_utils
+
+        log = tmp_path / "ytm.log"
+        log.write_text(
+            "2026-04-30 01:00:00 [DEBUG] [MainThread] foo: trace 1\n"
+            "2026-04-30 01:00:01 [INFO] [MainThread] foo: info 1\n"
+            "no level token\n"
+            "2026-04-30 01:00:02 [WARNING] [MainThread] foo: warn 1\n"
+            "2026-04-30 01:00:03 [ERROR] [MainThread] foo: err 1\n"
+            "2026-04-30 01:00:04 [CRITICAL] [MainThread] foo: critical 1\n"
+            "last line without newline"
+        )
+
+        with open(log, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        native = _ytm_player_native.filter_log_lines(lines, n, min_level)
+        monkeypatch.setattr(log_utils, "_native_filter_log_lines", None)
+        fallback = log_utils.get_recent_log_lines(log, n=n, min_level=min_level)
+        assert native == fallback
+
 
 class TestListActiveHooks:
     def test_reports_all_four_hook_categories(self):

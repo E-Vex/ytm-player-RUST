@@ -260,14 +260,19 @@ def wrap_rtl_line(text: str, width: int) -> str:
 try:
     from ._ytm_player_native import (  # type: ignore[import-not-found]
         has_rtl as _native_has_rtl,
+    )
+    from ._ytm_player_native import (
         isolate_bidi as _native_isolate_bidi,
+    )
+    from ._ytm_player_native import (
         reorder_line as _native_reorder_line,
+    )
+    from ._ytm_player_native import (
         wrap_line as _native_wrap_line,
     )
 except ImportError:
     pass
 else:
-
     has_rtl = _native_has_rtl  # type: ignore[assignment]
     isolate_bidi = _native_isolate_bidi  # type: ignore[assignment]
     # Internal symbol is part of this module's test surface.

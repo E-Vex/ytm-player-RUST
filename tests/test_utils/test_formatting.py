@@ -734,3 +734,91 @@ class TestCleanShelfTitle:
 
     def test_whitespace_handling(self):
         assert clean_shelf_title("  Daily Top 100 Songs  ") == "Daily Top 100"
+
+
+# ── native vs fallback parity ────────────────────────────────────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+# Each case is a Python expression evaluated against
+# ytm_player.utils.formatting in two interpreters: this one (native
+# extension loaded) and a child where the extension import is blocked
+# (pure-Python fallback). Their reprs must match exactly.
+_PARITY_CASES = [
+    "format_duration(3661)",
+    "format_duration(-5)",
+    "truncate('Hello World', 8)",
+    "truncate('Hello World', 1)",
+    "format_count(1500)",
+    "format_count(2_500_000_000)",
+    "format_size(1536)",
+    "format_size(5 * 1024**4)",
+    "get_video_id({'videoId': 'abc', 'video_id': 'xyz'})",
+    # VALID_VIDEO_ID intentionally differs in return type between backends
+    # (re.Match vs bool); the documented contract is boolean-context use.
+    "bool(VALID_VIDEO_ID.match('dQw4w9WgXcQ'))",
+    "bool(VALID_VIDEO_ID.match('bad id!'))",
+    "extract_artist({'artists': [{'name': 'A', 'id': '1'}, {'name': '358K views', 'id': None}], 'views': '358K views'})",
+    "extract_artist({'artist': 'X'})",
+    "extract_artist({'artists': ['plain', 7]})",
+    "extract_duration({'duration_seconds': '12'})",
+    "extract_duration({'duration': '3:25'})",
+    "extract_duration({'length': '1:02:03'})",
+    "normalize_tracks([{'videoId': 'x', 'artists': [{'name': 'A', 'id': '1'}, {'name': '358K views', 'id': None}], 'views': '358K views'}])",
+    "normalize_tracks([{'videoId': 'x', 'artists': [{'name': 'A', 'id': '1'}], 'album': {'name': 'AL', 'id': 'al1'}, 'thumbnails': [{'url': 'u1'}, {'url': 'u2'}]}])",
+    "normalize_tracks([{'videoId': '', 'title': 'dropped'}, {'video_id': 'y', 'title': 'kept'}])",
+    "strip_vl_prefix('VLPLabc123')",
+    "build_playlist_subtitle('Alice', 'PUBLIC', None, 5)",
+    "build_playlist_subtitle('Alice', 'PRIVATE', 2023, 5)",
+    "build_playlist_subtitle('Bob', '', '2023', 1)",
+    "sanitize_title_for_lyric_lookup('Bohemian Rhapsody (Official Video)')",
+    "sanitize_title_for_lyric_lookup('Song (feat. Bob (Junior)) [Remastered 2020]')",
+    "sanitize_title_for_lyric_lookup('Artist - Title (Live at X)', 'Artist')",
+    "sanitize_title_for_lyric_lookup('(Official Music Video)')",
+    "sanitize_title_for_lyric_lookup('Title (Radio Remix) (HD)')",
+    "clean_shelf_title('Daily Top Music Videos - United Kingdom')",
+    "clean_shelf_title('Coachella 2026: Daily Top 100 Songs')",
+    "format_ago(datetime(2020, 1, 1, tzinfo=timezone.utc))",
+    "format_ago(datetime(2020, 1, 1))",
+]
+
+
+def _fallback_eval(expr: str) -> str:
+    """Evaluate *expr* in a child interpreter with the native extension
+    blocked, forcing the pure-Python fallbacks."""
+    import subprocess
+    import sys
+
+    prog = (
+        "import sys; "
+        "sys.modules['ytm_player.utils._ytm_player_native'] = None; "
+        "from datetime import datetime, timezone; "
+        "from ytm_player.utils.formatting import *; "
+        f"print(repr({expr}))"
+    )
+    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+class TestNativeParity:
+    """When the Rust extension is built, every ported formatting function
+    must produce byte-for-byte the same output as the pure-Python fallback.
+
+    The fallback runs in a child interpreter with the extension import
+    blocked, so both implementations are compared directly instead of
+    trusting whichever one the test process happened to load.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize("expr", _PARITY_CASES)
+    def test_native_matches_fallback(self, expr):
+        import ytm_player.utils.formatting as fmt
+
+        fallback = _fallback_eval(expr)
+        native = repr(eval(expr, {"datetime": datetime, "timezone": timezone, **vars(fmt)}))
+        assert native == fallback

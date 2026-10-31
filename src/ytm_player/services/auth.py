@@ -102,7 +102,12 @@ def _extract_browser_jar(browser: str, keyring: str | None = None):  # type: ign
 
     if keyring is None:
         return extract_cookies_from_browser(browser)
-    return extract_cookies_from_browser(browser, keyring=keyring)
+    # yt-dlp's stubs type *keyring* as its `_LinuxKeyring` enum, but the
+    # runtime accepts the backend's string name (it maps it internally).
+    return extract_cookies_from_browser(
+        browser,
+        keyring=keyring,  # pyright: ignore[reportArgumentType]
+    )
 
 
 # yt-dlp picks the Linux keyring backend from the desktop environment

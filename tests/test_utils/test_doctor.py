@@ -377,3 +377,63 @@ class TestArgvIsYtm:
         from ytm_player.utils.doctor import _argv_is_ytm
 
         assert not _argv_is_ytm(["/usr/bin/firefox", "--new-window"])
+
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+
+class TestNativeParity:
+    """When the Rust extension is built, its output must match the
+    pure-Python fallback byte-for-byte on the same inputs (mirrors the
+    parity checks the other ported utils rely on)."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "plain diagnostic line\n",
+            "HTTP 403 opening 'https://media.invalid/play?ip=192.0.2.42&sig=x' failed",
+            'HTTP://media.invalid/a(b)?unknown=fake-secret and "tcp://[2001:db8::42]:443"',
+            "Authorization: Bearer fake-auth\nCookie: SAPISID=fake-cookie",
+            "bearer fake-bearer\ntoken: fake-token\nx-goog-pageid: fake-page-id",
+            "SAPISID=fake-cookie\nauthorization=fake\nstatus: 403; retry unavailable",
+            "Version: 2.1.0\nmpv: available\nconfig: /tmp/ytm/config.toml",
+        ],
+    )
+    def test_redact_native_matches_fallback(self, monkeypatch, text):
+        from ytm_player.utils import doctor
+
+        native = _ytm_player_native.redact(text)
+        monkeypatch.setattr(doctor, "_native_redact", None)
+        fallback = doctor._redact(text)
+        assert native == fallback
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [],
+            [""],
+            ["/"],
+            ["/home/u/.venv/bin/python3", "/home/u/.venv/bin/ytm"],
+            ["/usr/bin/ytm"],
+            ["/usr/bin/python3", "-m", "ytm_player"],
+            ["ytm/", "/usr/bin/ytm.exe"],
+            ["nvim", "/home/u/AI/ytm-player/src/ytm_player/cli.py"],
+            ["/usr/bin/firefox", "--new-window"],
+            ["/usr/bin/python3", "-Im", "ytm_player", "--debug"],
+        ],
+    )
+    def test_argv_is_ytm_native_matches_fallback(self, monkeypatch, argv):
+        from ytm_player.utils import doctor
+
+        native = _ytm_player_native.argv_is_ytm(argv)
+        monkeypatch.setattr(doctor, "_native_argv_is_ytm", None)
+        fallback = doctor._argv_is_ytm(argv)
+        assert native == fallback
