@@ -305,6 +305,23 @@ class TestNormalizeTracks:
         result = normalize_tracks([{"videoId": "x", "duration_seconds": 0}])
         assert result[0]["duration"] == 0
 
+    def test_explicit_null_duration_stays_none(self):
+        """A present-but-None duration counts as absent (t.get(k) is not None).
+
+        session.json queues legitimately carry `duration: null` entries, so
+        the native engine must not read them as 0.
+        """
+        result = normalize_tracks(
+            [
+                {"videoId": "x", "duration": None},
+                {"videoId": "y", "duration_seconds": None, "duration": "2:30"},
+                {"videoId": "z", "duration_seconds": None, "length": None},
+            ]
+        )
+        assert result[0]["duration"] is None
+        assert result[1]["duration"] == 150
+        assert result[2]["duration"] is None
+
     def test_length_key_from_watch_playlist(self):
         """get_watch_playlist returns 'length' instead of 'duration'."""
         result = normalize_tracks([{"videoId": "x", "title": "Radio Track", "length": "3:07"}])
@@ -772,6 +789,9 @@ _PARITY_CASES = [
     "normalize_tracks([{'videoId': 'x', 'artists': [{'name': 'A', 'id': '1'}, {'name': '358K views', 'id': None}], 'views': '358K views'}])",
     "normalize_tracks([{'videoId': 'x', 'artists': [{'name': 'A', 'id': '1'}], 'album': {'name': 'AL', 'id': 'al1'}, 'thumbnails': [{'url': 'u1'}, {'url': 'u2'}]}])",
     "normalize_tracks([{'videoId': '', 'title': 'dropped'}, {'video_id': 'y', 'title': 'kept'}])",
+    "normalize_tracks([{'videoId': 'x', 'duration': None}])",
+    "normalize_tracks([{'videoId': 'x', 'duration_seconds': None, 'duration': '2:30'}])",
+    "normalize_tracks([{'videoId': 'x', 'duration_seconds': None, 'length': None}])",
     "strip_vl_prefix('VLPLabc123')",
     "build_playlist_subtitle('Alice', 'PUBLIC', None, 5)",
     "build_playlist_subtitle('Alice', 'PRIVATE', 2023, 5)",
