@@ -22,6 +22,16 @@ from typing import Any, Awaitable, Callable
 
 from ytm_player.config.paths import PID_FILE, SECURE_FILE_MODE, secure_chmod
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementation defined below.
+try:
+    from .utils._ytm_player_native import (  # type: ignore[import-not-found]
+        looks_like_ytm as _native_looks_like_ytm,
+    )
+except ImportError:
+    _native_looks_like_ytm = None
+
 logger = logging.getLogger(__name__)
 
 _MAX_MSG = 65536  # 64 KB
@@ -149,6 +159,8 @@ def _looks_like_ytm(argv: list[str]) -> bool:
     instance steal a live TUI's PID file. Only positive evidence that the
     process is something else entirely may return False.
     """
+    if _native_looks_like_ytm is not None:
+        return _native_looks_like_ytm(argv)
     for arg in argv:
         # Separator-agnostic basename: Windows image paths must also parse
         # when this rule is exercised off-Windows (tests, ps output quirks).

@@ -63,7 +63,7 @@ For NixOS, Gentoo, Windows-specific mpv DLL setup, source builds, and optional e
 
 ## Native extension (Rust)
 
-The formatting utilities (`ytm_player/utils/formatting.py`), BiDi text utilities (`ytm_player/utils/bidi.py`), transliteration (`ytm_player/utils/transliteration.py`), chart-region normalisation (`ytm_player/services/regions.py`), yt-dlp option normalisation (`ytm_player/services/yt_dlp_options.py`), and the diagnostics text pipeline (redaction, log-line filtering, and process matching in `ytm_player/utils/doctor.py` and `ytm_player/utils/logging.py`) are implemented in Rust via [PyO3](https://pyo3.rs/) for better performance. The pure-Python fallbacks are always used automatically when the compiled extension is unavailable, so nothing is required to run ytm-player — but building the native extension is recommended for source installs.
+The formatting utilities (`ytm_player/utils/formatting.py`), BiDi text utilities (`ytm_player/utils/bidi.py`), transliteration (`ytm_player/utils/transliteration.py`), chart-region normalisation (`ytm_player/services/regions.py`), yt-dlp option normalisation (`ytm_player/services/yt_dlp_options.py`), the single-instance argv heuristic (`ytm_player/ipc.py`), and the diagnostics text pipeline (redaction, log-line filtering, and process matching in `ytm_player/utils/doctor.py` and `ytm_player/utils/logging.py`) are implemented in Rust via [PyO3](https://pyo3.rs/) for better performance. The pure-Python fallbacks are always used automatically when the compiled extension is unavailable, so nothing is required to run ytm-player — but building the native extension is recommended for source installs.
 
 ### Prerequisites
 

@@ -287,6 +287,71 @@ class TestLooksLikeYtm:
         assert "pytest" in " ".join(argv)
 
 
+# ── native vs fallback parity ────────────────────────────────────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+# The same conservative-match cases as TestLooksLikeYtm plus separator /
+# case / emptiness edge cases. Each argv is checked against the native
+# implementation in this interpreter and the pure-Python fallback in a
+# child interpreter with the extension blocked.
+_PARITY_ARGV = [
+    ["/home/u/.venv/bin/python", "/home/u/.venv/bin/ytm"],
+    ["/usr/bin/python3", "-m", "ytm_player"],
+    ["C:\\Users\\u\\venv\\Scripts\\ytm.exe"],
+    ["C:\\Python312\\python.exe"],
+    ["C:\\Windows\\System32\\svchost.exe"],
+    ["/usr/lib/systemd/systemd-oomd"],
+    ["/usr/bin/python3", "/home/u/scripts/backup.py"],
+    ["nvim", "src/ytm_player/ipc.py"],
+    # Edge cases: case-insensitive basename match, trailing separator
+    # (empty basename), mixed separators, empty argv.
+    ["C:\\bin\\YTM.EXE"],
+    ["/opt/ytm.player/bin/launch"],
+    ["/usr/bin/"],
+    ["python3.12", "-m", "ytm_player"],
+    [],
+]
+
+
+class TestLooksLikeYtmNativeParity:
+    """When the Rust extension is built, _looks_like_ytm must answer
+    exactly like the pure-Python fallback for every argv shape.
+
+    The fallback runs in a child interpreter with the extension import
+    blocked, so both implementations are compared directly instead of
+    trusting whichever one the test process happened to load.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize("argv", _PARITY_ARGV)
+    def test_native_matches_fallback(self, argv):
+        import json
+        import subprocess
+
+        import ytm_player.ipc as ipc_mod
+
+        prog = (
+            "import sys; "
+            "sys.modules['ytm_player.utils._ytm_player_native'] = None; "
+            "import json; "
+            "from ytm_player.ipc import _looks_like_ytm; "
+            f"argv = json.loads({json.dumps(argv)!r}); "
+            "print(_looks_like_ytm(argv))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", prog], capture_output=True, text=True, check=True
+        )
+        fallback = out.stdout.strip()
+        native = repr(ipc_mod._looks_like_ytm(argv))
+        assert native == fallback
+
+
 class TestIPCCommandWhitelist:
     def test_play_is_valid(self):
         assert "play" in _VALID_COMMANDS

@@ -128,6 +128,9 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // `~otheruser` via the pwd database, which has no std equivalent.
     module.add_function(pyo3::wrap_pyfunction!(normalize_remote_components, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(normalize_js_runtimes, module)?)?;
+
+    // IPC single-instance guard (ytm_player.ipc equivalent).
+    module.add_function(pyo3::wrap_pyfunction!(looks_like_ytm, module)?)?;
     Ok(())
 }
 
@@ -1197,4 +1200,41 @@ fn normalize_js_runtimes<'py>(
         return Ok(None);
     }
     Ok(Some(result))
+}
+
+// ---------------------------------------------------------------------------
+// IPC single-instance guard (mirrors ytm_player/ipc.py)
+// ---------------------------------------------------------------------------
+
+/// Mirror the lenient entry-point heuristic of
+/// `ytm_player.ipc._looks_like_ytm`: any argument whose
+/// separator-agnostic basename is `ytm` or starts with `ytm.`, or that
+/// contains `ytm_player` anywhere, counts as ours; a single-element argv
+/// whose basename starts with `python` also counts (the Windows
+/// image-name-only probe cannot rule out `python -m ytm_player`). Errs on
+/// the side of True — a false "ours" only preserves the block behavior,
+/// while a false "not ours" could steal a live TUI's PID file.
+#[pyfunction]
+fn looks_like_ytm(argv: Vec<String>) -> bool {
+    fn basename_lower(arg: &str) -> String {
+        arg.replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_lowercase()
+    }
+
+    for arg in &argv {
+        let name = basename_lower(arg);
+        if name == "ytm" || name.starts_with("ytm.") || arg.contains("ytm_player") {
+            return true;
+        }
+    }
+    if argv.len() == 1 {
+        let name = basename_lower(&argv[0]);
+        if name.starts_with("python") {
+            return true;
+        }
+    }
+    false
 }
