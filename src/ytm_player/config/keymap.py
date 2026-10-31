@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -22,7 +23,22 @@ else:
 
 from ytm_player.config.paths import KEYMAP_FILE
 
+# Try to load the native Rust matcher via PyO3.  If the compiled extension
+# is unavailable (e.g. during development without a Rust toolchain), fall
+# back to the pure-Python matching defined below.
+try:
+    from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
+        KeyMatcher as _NativeKeyMatcher,
+    )
+except ImportError:
+    _NativeKeyMatcher = None
+
 logger = logging.getLogger(__name__)
+
+# Sentinel for "native matcher missing or failed to build — stop trying":
+# distinguishes "not built yet" (None) from "unavailable" so match() never
+# retries a failing construction on every keystroke.
+_NATIVE_FAILED = object()
 
 
 class Action(str, Enum):
@@ -204,7 +220,20 @@ def _is_valid_binding(keys: object) -> bool:
 
 @dataclass
 class KeyMap:
+    """Ordered key-sequence → action bindings with prefix matching.
+
+    When the native Rust extension is built, ``match`` resolves sequences
+    through a precomputed hash table (exact map + prefix set) instead of
+    scanning ``bindings`` on every keystroke.  The matcher is rebuilt
+    lazily after every load; code that mutates ``bindings`` directly must
+    reset ``_native_matcher`` to ``None`` so the native table cannot go
+    stale.
+    """
+
     bindings: dict[tuple[str, ...], Action] = field(default_factory=dict)
+    # Tri-state native-matcher cache: None = not built yet, _NATIVE_FAILED
+    # = extension missing / construction failed, KeyMatcher = current.
+    _native_matcher: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def load(cls, path: Path = KEYMAP_FILE) -> Self:
@@ -244,6 +273,7 @@ class KeyMap:
             for key_str in key_strs:
                 seq = parse_key_sequence(key_str)
                 self.bindings[seq] = action
+        self._native_matcher = None  # table changed; rebuild lazily
 
     def _load_from_dict(self, data: dict) -> None:
         self._load_defaults()
@@ -274,13 +304,52 @@ class KeyMap:
                 for key_str in keys:
                     seq = parse_key_sequence(key_str)
                     self.bindings[seq] = action
+        self._native_matcher = None  # table changed; rebuild lazily
 
     def _remove_action(self, action: Action) -> None:
         to_remove = [k for k, v in self.bindings.items() if v == action]
         for key in to_remove:
             del self.bindings[key]
+        self._native_matcher = None  # table changed; rebuild lazily
+
+    def _native_match(
+        self, key_sequence: tuple[str, ...]
+    ) -> tuple[MatchResult, Action | None] | None:
+        """Resolve *key_sequence* through the native Rust matcher.
+
+        Returns ``None`` when the compiled extension is unavailable or
+        failed to build, so ``match`` falls through to the pure-Python
+        path — never a wrong answer, just the slower one.
+        """
+        matcher = self._native_matcher
+        if matcher is None:
+            if _NativeKeyMatcher is None:
+                self._native_matcher = _NATIVE_FAILED
+                return None
+            try:
+                matcher = _NativeKeyMatcher(self.bindings)
+            except Exception:
+                logger.debug(
+                    "Native keymap matcher build failed; using Python fallback.",
+                    exc_info=True,
+                )
+                self._native_matcher = _NATIVE_FAILED
+                return None
+            self._native_matcher = matcher
+        if matcher is _NATIVE_FAILED:
+            return None
+        result, action_name = matcher.match_keys(key_sequence)
+        if result == "exact":
+            return MatchResult.EXACT, Action(action_name)
+        if result == "pending":
+            return MatchResult.PENDING, None
+        return MatchResult.NO_MATCH, None
 
     def match(self, key_sequence: tuple[str, ...]) -> tuple[MatchResult, Action | None]:
+        native = self._native_match(key_sequence)
+        if native is not None:
+            return native
+
         if key_sequence in self.bindings:
             return MatchResult.EXACT, self.bindings[key_sequence]
 

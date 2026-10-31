@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_bidi::bidi_class;
@@ -131,6 +132,9 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // IPC single-instance guard (ytm_player.ipc equivalent).
     module.add_function(pyo3::wrap_pyfunction!(looks_like_ytm, module)?)?;
+
+    // Keymap sequence matching (ytm_player.config.keymap equivalent).
+    module.add_class::<KeyMatcher>()?;
     Ok(())
 }
 
@@ -1237,4 +1241,71 @@ fn looks_like_ytm(argv: Vec<String>) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Keymap sequence matching (mirrors ytm_player/config/keymap.py)
+// ---------------------------------------------------------------------------
+
+/// Native matcher for the KeyMap binding table.
+///
+/// Mirrors the exact/pending/no-match semantics of `KeyMap.match`:
+///
+/// - `("exact", Some(action))` — the pressed sequence is itself a binding.
+///   Exact matches win even when the sequence is also a proper prefix of a
+///   longer binding (the Python reference checks `key_sequence in bindings`
+///   before scanning prefixes).
+/// - `("pending", None)` — the sequence is a proper prefix of at least one
+///   longer binding, so the app should buffer it and wait for more keys.
+///   The empty sequence is pending whenever any binding exists (every
+///   `bound_seq[:0] == ()`), matching the Python fallback's slice
+///   comparison.
+/// - `("no_match", None)` — neither, so the app resets its key buffer.
+///
+/// The Python fallback scans the whole bindings dict for the pending check
+/// on every keystroke; here both lookups are hash queries against tables
+/// precomputed once per binding-table change.
+///
+/// *bindings* is the `KeyMap.bindings` dict mapping sequences (tuples of
+/// key-name strings) to action names. Values may be `Action` members — the
+/// str-enum extracts as its value string.
+#[pyclass(frozen)]
+struct KeyMatcher {
+    /// Bound sequence → action name.
+    exact: HashMap<Vec<String>, String>,
+    /// Every proper prefix (including the empty prefix) of every bound
+    /// sequence — the sequences that can still grow into a binding.
+    prefixes: HashSet<Vec<String>>,
+}
+
+#[pymethods]
+impl KeyMatcher {
+    #[new]
+    fn new(bindings: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let mut exact: HashMap<Vec<String>, String> = HashMap::new();
+        let mut prefixes: HashSet<Vec<String>> = HashSet::new();
+        for (seq_obj, action_obj) in bindings.iter() {
+            let seq: Vec<String> = seq_obj.extract()?;
+            let action: String = action_obj.extract()?;
+            for end in 0..seq.len() {
+                prefixes.insert(seq[..end].to_vec());
+            }
+            // Last write wins, like the Python dict the table came from.
+            exact.insert(seq, action);
+        }
+        Ok(Self { exact, prefixes })
+    }
+
+    /// Classify *seq* against the binding table.
+    /// Returns ("exact", Some(action_name)) | ("pending", None)
+    /// | ("no_match", None) — the action-name form of `KeyMap.match`.
+    fn match_keys(&self, seq: Vec<String>) -> (String, Option<String>) {
+        if let Some(action) = self.exact.get(&seq) {
+            return ("exact".to_string(), Some(action.clone()));
+        }
+        if self.prefixes.contains(&seq) {
+            return ("pending".to_string(), None);
+        }
+        ("no_match".to_string(), None)
+    }
 }
