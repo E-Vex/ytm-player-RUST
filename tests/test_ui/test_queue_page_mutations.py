@@ -171,9 +171,7 @@ async def test_delete_after_sort_in_shuffle_mode():
     queue = _make_queue()
     # Force a deterministic shuffle order instead of toggle_shuffle()'s
     # random one: playback order t3, t1, t4, t2.
-    queue._shuffle = True
-    queue._shuffle_order = [2, 0, 3, 1]
-    queue._shuffle_position = -1
+    queue._force_shuffle_state([2, 0, 3, 1], -1)
     assert _ids(queue) == ["t3", "t1", "t4", "t2"]
 
     app = _QueueHost(queue)

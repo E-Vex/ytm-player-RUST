@@ -32,7 +32,7 @@ def _aligned(queue: QueueManager) -> bool:
     """Entries pair each id with the track ``tracks`` shows at that position."""
     entries = queue.entries
     return (
-        len(queue._entry_ids) == len(queue._tracks)
+        len(entries) == queue.length
         and [t for _, t in entries] == list(queue.tracks)
         and len(set(_ids(queue))) == len(entries)
     )

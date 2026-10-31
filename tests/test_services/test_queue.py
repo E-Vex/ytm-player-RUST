@@ -528,26 +528,20 @@ class TestRadioTracks:
         queue_manager.set_radio_tracks(radio)
         assert queue_manager.length == 7
 
-    def test_set_radio_tracks_empty_shuffle_rebuilds(
-        self, queue_manager, sample_tracks, monkeypatch
-    ):
+    def test_set_radio_tracks_empty_shuffle_rebuilds(self, queue_manager, sample_tracks):
         """Radio tracks into an empty shuffled queue must rebuild the shuffle
-        order — the old piecemeal path skipped _rebuild_shuffle (regression)."""
-        queue_manager._shuffle = True  # shuffle on while queue is still empty
-
-        calls: list[bool] = []
-        original = queue_manager._rebuild_shuffle
-
-        def spy(keep_current: bool = True) -> None:
-            calls.append(keep_current)
-            original(keep_current)
-
-        monkeypatch.setattr(queue_manager, "_rebuild_shuffle", spy)
+        order — a missed rebuild leaves the playback order empty (regression)."""
+        queue_manager.toggle_shuffle()  # shuffle on while queue is still empty
+        assert queue_manager.shuffle_enabled
 
         queue_manager.set_radio_tracks(sample_tracks)
 
-        assert calls == [False]  # full rebuild, matching add_multiple on an empty queue
-        assert sorted(queue_manager._shuffle_order) == list(range(len(sample_tracks)))
+        # Under shuffle the playback order follows the shuffle order; a
+        # queue that skipped the rebuild would show no tracks at all.
+        assert [t["video_id"] for t in queue_manager.tracks] != []
+        assert sorted(t["video_id"] for t in queue_manager.tracks) == sorted(
+            t["video_id"] for t in sample_tracks
+        )
 
 
 class TestQueuePositionTracking:
@@ -805,3 +799,234 @@ class TestShuffleOffKeepsThePlayingOccurrence:
             entry_id, track = queue.entries[queue.current_index]
             assert entry_id == playing_id, f"seed {seed}"
             assert track is playing and queue.current_track is playing
+
+
+# ── Native/fallback parity ──────────────────────────────────────────────
+#
+# When the Rust extension is built, QueueManager runs the native QueueCore;
+# otherwise the pure-Python _QueueCore transcription. Both cores draw
+# randomness through the global ``random`` module, so seeding it
+# identically makes even shuffled playback orders reproducible — and the
+# two implementations comparable byte-for-byte. Each case below is a
+# script run against a fresh QueueManager in this interpreter (native
+# core) and in a child interpreter with the extension import blocked
+# (fallback core); the dumped observable state must match exactly.
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+_DUMP = """(
+    [(i, x["video_id"]) for i, x in q.entries],
+    q.current_index,
+    q.real_index,
+    q.length,
+    q.remaining_tracks,
+    q.shuffle_enabled,
+    q.repeat_mode.value,
+    q.generation,
+    (q.current() or {}).get("video_id"),
+    (q.peek_next() or {}).get("video_id"),
+)"""
+
+_PARITY_CASES: list[tuple[int, str]] = [
+    # Deterministic navigation, no randomness at all.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(5)]); q.jump_to(2); "
+        "q.next_track(); q.previous_track(); q.next_track(); q.next_track()",
+    ),
+    # Exhaustion then repeat-all wraparound.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(3)]); q.jump_to(0); "
+        "q.set_repeat(RepeatMode.ALL); [q.next_track() for _ in range(7)]",
+    ),
+    # Repeat-one keeps returning the same track.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(3)]); q.jump_to(1); "
+        "q.set_repeat(RepeatMode.ONE); [q.next_track() for _ in range(3)]; q.previous_track()",
+    ),
+    # Seeded full shuffle, a walk through it, then unshuffling back.
+    (
+        42,
+        "q.add_multiple([t(f'v{i}') for i in range(8)]); q.jump_to(3); q.toggle_shuffle(); "
+        "[q.next_track() for _ in range(4)]; q.toggle_shuffle()",
+    ),
+    # Shuffle wrap with repeat-all exercises the reshuffle path.
+    (
+        7,
+        "q.add_multiple([t(f'v{i}') for i in range(5)]); q.toggle_shuffle(); "
+        "q.set_repeat(RepeatMode.ALL); [q.next_track() for _ in range(12)]",
+    ),
+    # Removing the current row: removed-current bookkeeping, then EOF picks
+    # the successor.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(5)]); q.jump_to(2); q.remove(2); "
+        "q.current(); q.next_track(); q.next_track()",
+    ),
+    # Removals under a seeded shuffle order.
+    (
+        99,
+        "q.add_multiple([t(f'v{i}') for i in range(6)]); q.toggle_shuffle(); "
+        "q.jump_to(2); q.remove(1); q.remove(3); q.next_track(); q.previous_track()",
+    ),
+    # add_next / add_next_multiple / positioned add under shuffle.
+    (
+        5,
+        "q.add_multiple([t(f'v{i}') for i in range(4)]); q.toggle_shuffle(); q.jump_to(1); "
+        "q.add_next(t('nx')); q.add_next_multiple([t('m1'), t('m2')]); "
+        "q.add(t('ins'), position=1); [q.next_track() for _ in range(3)]",
+    ),
+    # add_next while the audible row was just removed: splice at the boundary.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(4)]); q.jump_to(1); q.remove(1); "
+        "q.add_next(t('after')); q.add_next_multiple([t('b1'), t('b2')]); "
+        "q.next_track(); q.next_track()",
+    ),
+    # Moves, removal by entry id, and the three jump flavours.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(5)]); q.jump_to(2); q.move(0, 3); "
+        "ids = [i for i, _ in q.entries]; q.remove_entry(ids[4]); q.jump_to_entry(ids[1]); "
+        "q.jump_to_real(0); q.remove(0)",
+    ),
+    # play_random + radio dedup (set_radio_tracks skips known video ids).
+    (
+        11,
+        "q.add_multiple([t(f'v{i}') for i in range(5)]); q.play_random(); "
+        "q.set_radio_tracks([t('v2'), t('r1'), t('r2')]); q.play_random()",
+    ),
+    # clear bumps the generation; refill rebuilds the shuffle order.
+    (
+        3,
+        "q.add_multiple([t(f'v{i}') for i in range(4)]); q.clear(); "
+        "q.add_multiple([t(f'n{i}') for i in range(3)]); q.jump_to(0); q.toggle_shuffle()",
+    ),
+    # cycle_repeat walks OFF -> ALL -> ONE -> OFF -> ALL.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(2)]); q.jump_to(0); "
+        "[q.cycle_repeat() for _ in range(5)]; q.next_track()",
+    ),
+    # previous at the shuffle start with repeat-all wraps to the end;
+    # peek_next reports the wrap-around successor without advancing.
+    (
+        8,
+        "q.add_multiple([t(f'v{i}') for i in range(4)]); q.toggle_shuffle(); "
+        "q.set_repeat(RepeatMode.ALL); q.jump_to(0); q.previous_track(); q.peek_next()",
+    ),
+    # The deterministic-shuffle test seam behaves the same on both cores.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(4)]); "
+        "q._force_shuffle_state([2, 0, 3, 1], -1); q.next_track(); q.remove(0)",
+    ),
+]
+
+
+def _native_run(seed: int, script: str) -> str:
+    """Run *script* against a native-core QueueManager in this interpreter."""
+    ns: dict = {
+        "q": QueueManager(),
+        "t": lambda v: {"video_id": v, "title": v},
+        "RepeatMode": RepeatMode,
+    }
+    random.seed(seed)
+    exec(script, ns)  # noqa: S307 - fixed test scripts, not user input
+    return repr(eval(_DUMP, ns))  # noqa: S307
+
+
+def _fallback_run(seed: int, script: str) -> str:
+    """Run *script* against a fallback-core QueueManager in a child
+    interpreter with the native extension import blocked."""
+    import subprocess
+    import sys
+
+    prog = (
+        "import sys\n"
+        "sys.modules['ytm_player.utils._ytm_player_native'] = None\n"
+        "import random\n"
+        f"random.seed({seed})\n"
+        "from ytm_player.services.queue import QueueManager, RepeatMode\n"
+        "q = QueueManager()\n"
+        "def t(v):\n"
+        "    return {'video_id': v, 'title': v}\n"
+        f"{script}\n"
+        f"print(repr({_DUMP}))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, check=True)
+    return out.stdout.strip()
+
+
+class TestNativeParity:
+    """When the Rust extension is built, the native QueueCore must be
+    observably identical to the pure-Python fallback — same tracks, same
+    entry ids, same positions, same seeded shuffle orders — after every
+    scripted operation sequence, so the two implementations cannot drift.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    @pytest.mark.parametrize("seed,script", _PARITY_CASES)
+    def test_native_matches_fallback(self, seed, script):
+        assert _native_run(seed, script) == _fallback_run(seed, script)
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_native_matches_fallback_on_identical_songs(self):
+        """The occurrence-preserving walk from the shuffle-off test, pinned
+        across backends: the same dict object queued six times, seeded
+        random walks, then leaving shuffle must land on the same entry."""
+        script = (
+            "rng = random.Random(6)\n"
+            "same = t('same')\n"
+            "q.add_multiple([same for _ in range(6)])\n"
+            "q.jump_to(rng.randrange(6))\n"
+            "q.toggle_shuffle()\n"
+            "for _ in range(rng.randrange(1, 12)):\n"
+            "    step = rng.choice(('next', 'previous', 'jump'))\n"
+            "    if step == 'next':\n"
+            "        q.next_track()\n"
+            "    elif step == 'previous':\n"
+            "        q.previous_track()\n"
+            "    else:\n"
+            "        q.jump_to(rng.randrange(6))\n"
+            "playing_id, playing = q.entries[q.current_index]\n"
+            "q.toggle_shuffle()\n"
+            "assert q.entries[q.current_index][0] == playing_id\n"
+            "assert q.current_track is playing\n"
+        )
+        ns: dict = {
+            "q": QueueManager(),
+            "t": lambda v: {"video_id": v, "title": v},
+            "random": random,
+        }
+        random.seed(1234)
+        exec(script, ns)
+        assert repr(eval(_DUMP, ns)) == _fallback_run(1234, script)
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_monkeypatched_random_shuffle_steers_both_cores(self, monkeypatch):
+        """Patching random.shuffle (as the playback-ownership tests do) must
+        steer the native core exactly like the fallback: the native core
+        calls back into the random module rather than its own generator."""
+        script = (
+            "q.add_multiple([t(c) for c in 'ABCDE'])\n"
+            "q.toggle_shuffle()\n"
+            "[q.next_track() for _ in range(4)]\n"
+        )
+        monkeypatch.setattr(random, "shuffle", lambda items: items.reverse())
+        native_ns: dict = {"q": QueueManager(), "t": lambda v: {"video_id": v, "title": v}}
+        exec(script, native_ns)
+        # With the reversed shuffle the visible order is E..A and playback
+        # has walked E, D, C, B.
+        assert [x["video_id"] for x in native_ns["q"].tracks] == list("EDCBA")
+        native_dump = repr(eval(_DUMP, native_ns))
+
+        fallback_script = "import random\nrandom.shuffle = lambda items: items.reverse()\n" + script
+        assert native_dump == _fallback_run(0, fallback_script)
