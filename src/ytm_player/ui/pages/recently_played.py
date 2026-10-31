@@ -136,14 +136,15 @@ def _enrich(track: dict, extra: dict) -> dict:
     return merged
 
 
-def _compose_all(local: list[dict], account: list[dict]) -> list[dict]:
+def _compose_all(local: list[dict], account: list[dict], cap: int = _MAX_TRACKS) -> list[dict]:
     """Local rows first, in their own order, then account-only rows in server order.
 
     One row per video ID. A track in both keeps the local row -- its position
     and ``played_at`` -- with the fields the local row lacks (artist and album
     IDs, thumbnail) filled in from the account row. Deduplication happens
     before the account-only cap, so that cap never counts rows the local
-    block already shows.
+    block already shows; each source is capped at *cap* rows separately
+    (the page always uses the ``_MAX_TRACKS`` default).
     """
     by_id: dict[str, dict] = {}
     for track in account:
@@ -152,7 +153,7 @@ def _compose_all(local: list[dict], account: list[dict]) -> list[dict]:
             by_id[vid] = track
     rows: list[dict] = []
     seen: set[str] = set()
-    for track in local[:_MAX_TRACKS]:
+    for track in local[:cap]:
         vid = get_video_id(track)
         if not vid or vid in seen:
             continue
@@ -162,7 +163,65 @@ def _compose_all(local: list[dict], account: list[dict]) -> list[dict]:
             track = _enrich(track, extra)
         rows.append(track)
     account_only = [track for vid, track in by_id.items() if vid not in seen]
-    return rows + account_only[:_MAX_TRACKS]
+    return rows + account_only[:cap]
+
+
+def with_accepted_local_play(cache: list[dict], track: dict, cap: int) -> list[dict]:
+    """*cache* with an accepted play of *track* on top, capped at *cap* rows.
+
+    The Local tab's optimistic update: the local history query groups by
+    track, so the cache lists a track once — rows of the same track make
+    way for the played track's fresh copy at the top, other rows keep
+    their place, and the cap trims from the end. No occurrence stamp —
+    the local view keys rows by video ID.
+    """
+    video_id = get_video_id(track)
+    updated = [dict(track)] + [t for t in cache if get_video_id(t) != video_id]
+    return updated[:cap]
+
+
+def park_pending_play(
+    pending: list[tuple[int, dict]], seq: int, track: dict, cap: int
+) -> list[tuple[int, dict]]:
+    """*pending* with an accepted play of *track* parked ahead of the fetch.
+
+    The parking half of the app's accepted-play handling: the fresh entry
+    goes on top (newest first) carrying *seq* and a copy of *track*; older
+    entries for the same track are dropped — one pending row per track,
+    the newest — and the list is capped at *cap* entries from the front.
+    Kept entries are the same tuple objects; only the new entry is built.
+    """
+    video_id = get_video_id(track)
+    updated = [(seq, dict(track))] + [
+        entry for entry in pending if get_video_id(entry[1]) != video_id
+    ]
+    return updated[:cap]
+
+
+def merge_pending_account_plays(
+    feed: list[dict], fetch_seq: int, pending: list[tuple[int, dict]]
+) -> list[dict]:
+    """Fold *pending* accepted plays into *feed* (see the page method).
+
+    A play accepted after the fetch started (sequence number above
+    *fetch_seq*) post-dates the feed, so it goes ahead of it, superseding
+    the feed's most recent listing of the track if there is one (see
+    ``_with_accepted_play``). A play accepted before the fetch started is
+    already reflected in the feed: its server position stands. Only when
+    the feed does not list such a play yet does it go ahead of the feed,
+    behind the newer plays. *feed* itself is returned untouched when
+    nothing is pending.
+    """
+    if not pending:
+        return feed
+    feed_ids = {get_video_id(t) for t in feed}
+    merged = list(feed)
+    # Oldest first, so the newest play ends up on top.
+    for seq, track in reversed(pending):
+        if seq <= fetch_seq and get_video_id(track) in feed_ids:
+            continue
+        merged = _with_accepted_play(merged, track)
+    return merged
 
 
 class RecentTab(Static):
@@ -433,17 +492,7 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
         when the feed does not list such a play yet does it go ahead of the
         feed, behind the newer plays.
         """
-        pending = self._take_pending_account_plays()
-        if not pending:
-            return feed
-        feed_ids = {get_video_id(t) for t in feed}
-        merged = list(feed)
-        # Oldest first, so the newest play ends up on top.
-        for seq, track in reversed(pending):
-            if seq <= fetch_seq and get_video_id(track) in feed_ids:
-                continue
-            merged = _with_accepted_play(merged, track)
-        return merged
+        return merge_pending_account_plays(feed, fetch_seq, self._take_pending_account_plays())
 
     def _take_pending_account_plays(self) -> list[tuple[int, dict]]:
         pending = getattr(self.app, "_ytm_history_pending", None)
@@ -501,9 +550,7 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
         if index == _TAB_YTM:
             updated = _with_accepted_play(cache, track)
         else:
-            video_id = get_video_id(track)
-            updated = [dict(track)] + [t for t in cache if get_video_id(t) != video_id]
-            updated = updated[:_MAX_TRACKS]
+            updated = with_accepted_local_play(cache, track, _MAX_TRACKS)
         self._set_cache(index, updated)
         self._refresh_tab_from_cache(index)
 
@@ -742,3 +789,81 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
         host = cast("YTMHostBase", self.app)
         source = "YT Music" if self._active_tab == _TAB_YTM else "Recently Played"
         await host._fetch_and_play_radio(seeds, label=f"Radio: {source}")
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same history-merge engine; these
+# bindings override the pure-Python reference above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        compose_all_rows as _native_compose_all_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        enrich_track as _native_enrich_track,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        merge_pending_account_plays as _native_merge_pending_account_plays,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        occurrence_key as _native_occurrence_key,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        park_pending_play as _native_park_pending_play,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        stamp_track as _native_stamp_track,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        with_accepted_local_play as _native_with_accepted_local_play,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        with_accepted_play as _native_with_accepted_play,
+    )
+except ImportError:
+    pass
+else:
+
+    def _stamp(track: dict, occurrence: int | None = None) -> dict:  # noqa: F811
+        """A stamped copy of *track* (native Rust engine)."""
+        return _native_stamp_track(track, occurrence)
+
+    def _occurrence_key(track: dict) -> Hashable:  # noqa: F811
+        """The row's occurrence identity (native Rust engine)."""
+        return _native_occurrence_key(track)
+
+    def _with_accepted_play(cache: list[dict], track: dict) -> list[dict]:  # noqa: F811
+        """*cache* with an accepted play on top (native Rust engine)."""
+        return _native_with_accepted_play(cache, track)
+
+    def _enrich(track: dict, extra: dict) -> dict:  # noqa: F811
+        """*track* with lacking fields filled from *extra* (native Rust engine)."""
+        return _native_enrich_track(track, extra)
+
+    def _compose_all(  # noqa: F811
+        local: list[dict], account: list[dict], cap: int = _MAX_TRACKS
+    ) -> list[dict]:
+        """The All-tab row composition (native Rust engine)."""
+        return _native_compose_all_rows(local, account, cap)
+
+    def with_accepted_local_play(  # noqa: F811
+        cache: list[dict], track: dict, cap: int
+    ) -> list[dict]:
+        """*cache* with an accepted local play on top (native Rust engine)."""
+        return _native_with_accepted_local_play(cache, track, cap)
+
+    def park_pending_play(  # noqa: F811
+        pending: list[tuple[int, dict]], seq: int, track: dict, cap: int
+    ) -> list[tuple[int, dict]]:
+        """*pending* with a play parked ahead of the fetch (native Rust engine)."""
+        return _native_park_pending_play(pending, seq, track, cap)
+
+    def merge_pending_account_plays(  # noqa: F811
+        feed: list[dict], fetch_seq: int, pending: list[tuple[int, dict]]
+    ) -> list[dict]:
+        """Fold *pending* accepted plays into *feed* (native Rust engine)."""
+        return _native_merge_pending_account_plays(feed, fetch_seq, pending)

@@ -1026,6 +1026,7 @@ class PlaybackMixin(YTMHostBase):
             _TAB_YTM,
             RecentlyPlayedPage,
             _with_accepted_play,
+            park_pending_play,
         )
 
         video_id = get_video_id(track)
@@ -1035,10 +1036,9 @@ class PlaybackMixin(YTMHostBase):
         if cache is None:
             self._ytm_history_pending_seq += 1
             pending = self._ytm_history_pending
-            pending[:] = [(self._ytm_history_pending_seq, dict(track))] + [
-                entry for entry in pending if get_video_id(entry[1]) != video_id
-            ]
-            del pending[_YTM_PENDING_MAX:]
+            pending[:] = park_pending_play(
+                pending, self._ytm_history_pending_seq, track, _YTM_PENDING_MAX
+            )
             return
         self._ytm_history = _with_accepted_play(cache, track)
 
