@@ -121,6 +121,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(redact, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(argv_is_ytm, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(filter_log_lines, module)?)?;
+
+    // yt-dlp option normalisation (ytm_player.services.yt_dlp_options
+    // equivalents). The path expanders (normalize_cookiefile /
+    // normalize_cafile) stay in Python: pathlib's expanduser handles
+    // `~otheruser` via the pwd database, which has no std equivalent.
+    module.add_function(pyo3::wrap_pyfunction!(normalize_remote_components, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(normalize_js_runtimes, module)?)?;
     Ok(())
 }
 
@@ -1066,4 +1073,128 @@ fn filter_log_lines(lines: Vec<String>, n: i64, min_level: Option<&str>) -> Stri
         ((-n) as i128).min(len as i128) as usize
     };
     kept[start..].concat()
+}
+
+// ---------------------------------------------------------------------------
+// yt-dlp option normalisation (mirrors ytm_player/services/yt_dlp_options.py)
+// ---------------------------------------------------------------------------
+
+/// Split a string by commas/whitespace and drop empties. Mirrors
+/// `yt_dlp_options._split_csv_or_space`.
+fn split_csv_or_space(value: &str) -> Vec<String> {
+    value
+        .replace(',', " ")
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
+/// Parse a `runtime[:path]` token into (name, optional path). Mirrors
+/// `yt_dlp_options._parse_runtime_token`: an empty/whitespace spec or an
+/// empty runtime name yields None; a colon-delimited path is kept only when
+/// it is non-blank after stripping.
+fn parse_runtime_token(spec: &str) -> Option<(String, Option<String>)> {
+    let token = spec.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let (runtime, path) = match token.split_once(':') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (token, None),
+    };
+    let name = runtime.trim().to_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => Some((name, Some(p.to_string()))),
+        None => Some((name, None)),
+    }
+}
+
+/// Return a yt-dlp compatible remote_components list, or None when unset or
+/// blank. Mirrors `yt_dlp_options.normalize_remote_components`: a string is
+/// split on commas/whitespace; any other non-None value is iterated and each
+/// item is coerced with str() then stripped (empty results dropped).
+#[pyfunction]
+fn normalize_remote_components<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyList>>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let parts: Vec<String> = if let Ok(s) = value.extract::<String>() {
+        split_csv_or_space(&s)
+    } else {
+        let mut parts = Vec::new();
+        for item in value.try_iter()? {
+            let item = item?;
+            let text = item.str()?.to_str()?.trim().to_string();
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+        parts
+    };
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PyList::new(py, parts)?))
+}
+
+/// Return a yt-dlp compatible js_runtimes dict, or None when unset or blank.
+/// Mirrors `yt_dlp_options.normalize_js_runtimes`: a dict maps
+/// lowercased/stripped names to their config sub-dicts verbatim (non-dict
+/// configs become {}); a string or iterable of `runtime[:path]` tokens is
+/// parsed into {"name": {"path": ...}} entries. Insertion order and the
+/// later-duplicate-wins behaviour match Python dict semantics.
+#[pyfunction]
+fn normalize_js_runtimes<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    let result = PyDict::new(py);
+
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        for (runtime, config) in dict.iter() {
+            let name = runtime.str()?.to_str()?.trim().to_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            if config.is_instance_of::<PyDict>() {
+                result.set_item(name, config)?;
+            } else {
+                result.set_item(name, PyDict::new(py))?;
+            }
+        }
+    } else {
+        let specs: Vec<String> = if let Ok(s) = value.extract::<String>() {
+            split_csv_or_space(&s)
+        } else {
+            let mut specs = Vec::new();
+            for item in value.try_iter()? {
+                let item = item?;
+                specs.push(item.str()?.to_str()?.to_string());
+            }
+            specs
+        };
+        for spec in specs {
+            if let Some((name, path)) = parse_runtime_token(&spec) {
+                let config = PyDict::new(py);
+                if let Some(p) = path {
+                    config.set_item("path", p)?;
+                }
+                result.set_item(name, config)?;
+            }
+        }
+    }
+
+    if result.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(result))
 }

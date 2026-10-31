@@ -10,6 +10,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ytm_player.config.settings import YtDlpSettings
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementations defined below.  The extension
+# module lives in the utils package next to the other native bindings.
+try:
+    from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
+        normalize_js_runtimes as _native_normalize_js_runtimes,
+    )
+    from ..utils._ytm_player_native import (
+        normalize_remote_components as _native_normalize_remote_components,
+    )
+except ImportError:
+    _native_normalize_js_runtimes = None
+    _native_normalize_remote_components = None
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +53,8 @@ def normalize_cookiefile(value: str | os.PathLike[str] | None) -> str | None:
 
 def normalize_remote_components(value: str | list[str] | None) -> list[str] | None:
     """Return yt-dlp compatible remote_components list."""
+    if _native_normalize_remote_components is not None:
+        return _native_normalize_remote_components(value)
     if value is None:
         return None
     if isinstance(value, str):
@@ -69,6 +85,8 @@ def normalize_js_runtimes(
 
     yt-dlp Python API expects: {"runtime": {<config>}}
     """
+    if _native_normalize_js_runtimes is not None:
+        return _native_normalize_js_runtimes(value)
     if value is None:
         return None
 
