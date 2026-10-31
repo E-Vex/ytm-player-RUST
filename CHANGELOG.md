@@ -10,6 +10,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 **New features**
 
+- **The native Rust extension is now built and tested in CI:** a new `native` job (Python 3.10 + 3.14 on Ubuntu) runs `cargo fmt --check` and `cargo clippy -D warnings`, compiles the extension via `native/build.sh`, and re-runs the full pytest suite with it loaded. Previously CI never compiled the extension, so every native/fallback parity test silently skipped and a commit that broke the Rust build — or made a native function diverge from its pure-Python fallback — still passed. `native/Cargo.toml` now also declares the documented `rust-version = "1.98"` MSRV.
 - **Diagnostics pipeline ported to Rust:** the `ytm doctor` redaction pass (auth headers, tokens, and HTTP/TCP URL stripping), the log-line level filtering behind `get_recent_log_lines`, and the running-instance argv matcher now run in the native Rust extension when it is built, with the pure-Python fallbacks kept for installs without it.
 - **Native/fallback parity tests:** when the Rust extension is built, the ported formatting, diagnostics, and log-filtering functions are compared byte-for-byte against their pure-Python fallbacks (run in a child interpreter with the extension blocked), so the two implementations cannot silently drift apart.
 

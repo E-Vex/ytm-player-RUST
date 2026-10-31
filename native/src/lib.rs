@@ -19,7 +19,8 @@ static VIEW_COUNT_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// `(?xi)`: case-insensitive + verbose, matching the Python fallback's
 /// `re.IGNORECASE | re.VERBOSE`.
 static LYRIC_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?xi)
+    Regex::new(
+        r#"(?xi)
         \s*
         [\(\[]\s*
         (?:
@@ -39,21 +40,21 @@ static LYRIC_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
         )
         \s*[\)\]]
         \s*
-    "#).expect("valid lyric noise regex")
+    "#,
+    )
+    .expect("valid lyric noise regex")
 });
 
 static COLLAPSE_WS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s{2,}").expect("valid collapse ws regex"));
 
 /// Pattern for "Daily Top 100 Songs" shelf-title rewrite.
-static SHELF_DAILY_TOP_100_SONGS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bDaily Top 100 Songs\b").expect("valid shelf title regex")
-});
+static SHELF_DAILY_TOP_100_SONGS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bDaily Top 100 Songs\b").expect("valid shelf title regex"));
 
 /// Pattern for "Daily Top Music Videos" shelf-title rewrite.
-static SHELF_DAILY_TOP_MUSIC_VIDEOS_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bDaily Top Music Videos\b").expect("valid shelf title regex")
-});
+static SHELF_DAILY_TOP_MUSIC_VIDEOS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bDaily Top Music Videos\b").expect("valid shelf title regex"));
 
 /// Pattern for "Daily Top Songs on Shorts" shelf-title rewrite.
 static SHELF_DAILY_TOP_SHORTS_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -98,7 +99,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(normalize_tracks, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(strip_vl_prefix, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(build_playlist_subtitle, module)?)?;
-    module.add_function(pyo3::wrap_pyfunction!(sanitize_title_for_lyric_lookup, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        sanitize_title_for_lyric_lookup,
+        module
+    )?)?;
     module.add_function(pyo3::wrap_pyfunction!(format_ago, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(clean_shelf_title, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(normalise_region, module)?)?;
@@ -151,7 +155,7 @@ fn get_optional_any<'py>(
     dict: &Bound<'py, PyDict>,
     key: &str,
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
-    Ok(dict.get_item(key)?)
+    dict.get_item(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,11 +262,7 @@ fn strip_vl_prefix(playlist_id: &str) -> String {
 /// Mirrors `ytm_player.utils.formatting.clean_shelf_title`.
 /// *region_names* is a Python list of region display names (e.g. "United Kingdom").
 #[pyfunction]
-fn clean_shelf_title(
-    _py: Python,
-    raw: &str,
-    region_names: &Bound<'_, PyList>,
-) -> String {
+fn clean_shelf_title(_py: Python, raw: &str, region_names: &Bound<'_, PyList>) -> String {
     let mut s = raw.trim().to_string();
 
     // Collect region display names from the Python list.
@@ -465,7 +465,11 @@ fn extract_duration(_py: Python, track: &Bound<'_, PyDict>) -> i64 {
             return i;
         }
         // int("12") — numeric strings, no colon parsing.
-        if let Some(s) = dur.downcast::<PyString>().ok().and_then(|s| s.to_str().ok()) {
+        if let Some(s) = dur
+            .downcast::<PyString>()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+        {
             if let Ok(i) = s.trim().parse::<i64>() {
                 return i;
             }
@@ -480,7 +484,11 @@ fn extract_duration(_py: Python, track: &Bound<'_, PyDict>) -> i64 {
         if let Ok(i) = dur.extract::<i64>() {
             return i;
         }
-        if let Some(s) = dur.downcast::<PyString>().ok().and_then(|s| s.to_str().ok()) {
+        if let Some(s) = dur
+            .downcast::<PyString>()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+        {
             if s.contains(':') {
                 if let Some(secs) = parse_duration_string(s) {
                     return secs;
@@ -493,7 +501,11 @@ fn extract_duration(_py: Python, track: &Bound<'_, PyDict>) -> i64 {
         if let Ok(i) = dur.extract::<i64>() {
             return i;
         }
-        if let Some(s) = dur.downcast::<PyString>().ok().and_then(|s| s.to_str().ok()) {
+        if let Some(s) = dur
+            .downcast::<PyString>()
+            .ok()
+            .and_then(|s| s.to_str().ok())
+        {
             if let Some(secs) = parse_duration_string(s) {
                 return secs;
             }
@@ -518,7 +530,7 @@ fn extract_artist(py: Python, track: &Bound<'_, PyDict>) -> String {
         let views = track.get_item("views").ok().flatten();
         let views_ref = views.as_ref();
         if let Ok(list) = artists.downcast::<PyList>() {
-            let names = extract_artist_names(py, &list, views_ref);
+            let names = extract_artist_names(py, list, views_ref);
             if !names.is_empty() {
                 return names.join(", ");
             }
@@ -578,15 +590,13 @@ fn normalize_tracks<'py>(
         let (album, album_id) = match album_info {
             Some(ref a) if a.is_instance_of::<PyDict>() => {
                 let dict = a.downcast::<PyDict>().unwrap();
-                let album = match get_optional_string(py, dict, "name")? {
-                    Some(a) => a,
-                    _ => String::new(),
-                };
+                let album = get_optional_string(py, dict, "name")?.unwrap_or_default();
                 let album_id = get_optional_string(py, dict, "id")?;
                 (album, album_id)
             }
             Some(ref a) => {
-                let album = a.downcast::<PyString>()
+                let album = a
+                    .downcast::<PyString>()
                     .ok()
                     .and_then(|s| s.to_str().ok())
                     .map(|s| s.to_string())
@@ -866,7 +876,13 @@ fn do_reorder(text: &str) -> String {
         .iter()
         .map(|word| match word_direction(word) {
             Direction::R => 1,
-            Direction::L => if base_level == 1 { 2 } else { 0 },
+            Direction::L => {
+                if base_level == 1 {
+                    2
+                } else {
+                    0
+                }
+            }
             Direction::N => base_level,
         })
         .collect();
@@ -950,7 +966,11 @@ fn wrap_line(text: &str, width: i64) -> String {
         lines.push(current_words.join(" "));
     }
 
-    lines.iter().map(|line| do_reorder(line)).collect::<Vec<String>>().join("\n")
+    lines
+        .iter()
+        .map(|line| do_reorder(line))
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------

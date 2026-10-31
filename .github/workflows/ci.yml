@@ -57,3 +57,42 @@ jobs:
       # never pulls dbus-fast in even when it's present. macOS/Windows runners
       # correctly never install it (sys_platform marker).
       - run: pytest --cov=ytm_player --cov-report=term-missing
+
+  # Build the native Rust/PyO3 extension and run the test suite with it
+  # loaded. Without this job every `skipif(not _HAVE_NATIVE)` parity test
+  # silently skips and a commit that breaks the extension build — or makes a
+  # native function diverge from its pure-Python fallback — still shows green.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported Python range: 3.10 is the abi3 floor,
+        # 3.14 exercises the PYO3_USE_ABI3_FORWARD_COMPATIBILITY path in
+        # native/build.sh.
+        python-version: ["3.10", "3.14"]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      # ubuntu-latest images ship rustup; install the stable toolchain with
+      # the lint components explicitly so the job is independent of whatever
+      # toolchain version happens to be preinstalled.
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: rustfmt
+        run: cargo fmt --check
+        working-directory: native
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: native
+      - run: pip install -e ".[dev]"
+      - name: Build extension
+        run: ./build.sh
+        working-directory: native
+      - name: pytest with native extension
+        run: pytest

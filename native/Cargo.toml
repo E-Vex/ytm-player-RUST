@@ -2,6 +2,9 @@
 name = "ytm_player_native"
 version = "2.1.0"
 edition = "2021"
+# Minimum supported Rust toolchain — matches the requirement documented in
+# README.md. Enforced by cargo when building with an older toolchain.
+rust-version = "1.98"
 description = "Native (Rust/PyO3) performance utilities for ytm-player"
 
 [lib]

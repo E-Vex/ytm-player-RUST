@@ -119,7 +119,7 @@ The codebase uses ~263 `except Exception:` blocks as a deliberate graceful-degra
 
 Three GitHub Actions workflows live in `.github/workflows/`:
 
-- `ci.yml` — runs ruff lint + format check, then pytest on the matrix `[3.10, 3.14]` × `[ubuntu, macos, windows]` (6 jobs total).
+- `ci.yml` — runs ruff lint + format check, then pytest on the matrix `[3.10, 3.14]` × `[ubuntu, macos, windows]` (6 jobs total), plus a `native` job on `[3.10, 3.14]` × ubuntu that runs `cargo fmt --check` + `cargo clippy -D warnings`, builds the PyO3 extension via `native/build.sh`, and re-runs pytest with the extension loaded — so every `skipif(not _HAVE_NATIVE)` parity test actually executes and native/fallback divergence fails the build.
 - `check-python-versions.yml` — runs monthly (1st of each month, 09:00 UTC) and opens a maintenance issue when CPython releases a new stable major.minor version newer than our matrix ceiling. Idempotent — won't reopen if an issue is already open. Uses pyyaml to parse the matrix robustly.
 - `publish.yml` — tag-triggered (`v*`) and `workflow_dispatch`. Builds wheel + sdist, smoke-tests the wheel against `ytm --version` in a fresh venv, uploads to PyPI via OIDC trusted publishing (no API tokens), then creates a GitHub Release with the matching CHANGELOG section attached. Manual dispatch can target TestPyPI for dry-runs.
 
