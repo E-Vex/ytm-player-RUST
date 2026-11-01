@@ -149,6 +149,16 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // the buffer resets.
     module.add_function(pyo3::wrap_pyfunction!(feed_key, module)?)?;
 
+    // Action dispatch engine (app/_keys.py _handle_action equivalent):
+    // the dispatch-table walk (which branch handles an action, and the
+    // page the navigations target), the pane decision behind the routed
+    // navigation actions, the CURRENT_CONTEXT album-target extraction,
+    // and the TOGGLE_SHUFFLE lock gate.
+    module.add_function(pyo3::wrap_pyfunction!(dispatch_route, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(route_navigation_action, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(current_context_target, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(shuffle_lock_blocked, module)?)?;
+
     // Playback queue engine (ytm_player.services.queue equivalent).
     module.add_class::<QueueCore>()?;
 
@@ -1850,6 +1860,223 @@ fn feed_key<'py>(
         return key_outcome(py, "pending", &grown_list, count_buffer, None, None);
     }
     key_outcome(py, "no_match", &PyList::empty(py), "", None, None)
+}
+
+// ---------------------------------------------------------------------------
+// Action dispatch engine (mirrors app/_keys.py's _handle_action routing)
+// ---------------------------------------------------------------------------
+
+/// Assemble one dispatch outcome map: fresh in every field, like every
+/// engine outcome. *branch* and *page* pass through as the matched
+/// row's own objects — the engine never re-types them — so a stub table
+/// returns its stub tokens exactly like the fallback.
+fn dispatch_outcome<'py>(
+    py: Python<'py>,
+    branch: &Bound<'py, PyAny>,
+    page: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("branch", branch)?;
+    out.set_item("page", page)?;
+    Ok(out)
+}
+
+/// Unpack one dispatch-table row exactly like the fallback's
+/// `for member, branch, page in table`: any 3-iterable works (a tuple
+/// in production, a generator or `__getitem__` sequence in a stub),
+/// with CPython's unpack TypeErrors and ValueErrors otherwise — the
+/// not-enough/too-many counts are the items actually yielded, and the
+/// "cannot unpack non-iterable" rewrite only applies to a type with no
+/// iteration support at all (an `__iter__` that itself raises keeps its
+/// own error, like CPython's `tp_iter` check).
+fn unpack_dispatch_row<'py>(
+    row: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let py = row.py();
+    let mut items = match row.try_iter() {
+        Ok(items) => items,
+        Err(err) => {
+            if err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+                // `type(row).__iter__` present and non-None mirrors
+                // tp_iter being filled; anything else is CPython's
+                // non-iterable rewrite.
+                let type_iter = row
+                    .get_type()
+                    .getattr("__iter__")
+                    .ok()
+                    .filter(|attr| !attr.is_none());
+                if type_iter.is_none() {
+                    let type_name = row
+                        .get_type()
+                        .name()
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "cannot unpack non-iterable {type_name} object"
+                    )));
+                }
+            }
+            return Err(err);
+        }
+    };
+    let member = match items.next() {
+        Some(item) => item?,
+        None => {
+            return Err(PyValueError::new_err(
+                "not enough values to unpack (expected 3, got 0)",
+            ))
+        }
+    };
+    let branch = match items.next() {
+        Some(item) => item?,
+        None => {
+            return Err(PyValueError::new_err(
+                "not enough values to unpack (expected 3, got 1)",
+            ))
+        }
+    };
+    let page = match items.next() {
+        Some(item) => item?,
+        None => {
+            return Err(PyValueError::new_err(
+                "not enough values to unpack (expected 3, got 2)",
+            ))
+        }
+    };
+    if items.next().is_some() {
+        return Err(PyValueError::new_err(
+            "too many values to unpack (expected 3)",
+        ));
+    }
+    Ok((member, branch, page))
+}
+
+/// The dispatch table behind `_handle_action` from `app/_keys.py` —
+/// which branch of the dispatch handles an action, and for the page
+/// navigations which page it targets.
+///
+/// Mirrors the pure-Python reference (`_dispatch_route`): `None`
+/// dispatches nothing, each row of *table* is compared in order with
+/// Python `==` (subject on the left — exactly like the reference
+/// `match`'s lazily evaluated value patterns, first equal match wins,
+/// so a plain `"play_pause"` string dispatches like the str-enum
+/// member) and anything no row claims is unhandled. *table* is the
+/// module's own ordered `(Action, branch, page)` tuple in production;
+/// a stub table drives the walk identically. The outcome map carries
+/// `{"branch": str, "page": str | None}` — fresh in every field, with
+/// the matched row's branch/page objects passed through unchanged —
+/// and neither *action* nor *table* is mutated.
+#[pyfunction]
+#[pyo3(signature = (action, table))]
+fn dispatch_route<'py>(
+    py: Python<'py>,
+    action: &Bound<'py, PyAny>,
+    table: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if action.is_none() {
+        let branch = PyString::new(py, "none");
+        let none = py.None().into_bound(py);
+        return dispatch_outcome(py, &branch, &none);
+    }
+    for row in table.try_iter()? {
+        let (member, branch, page) = unpack_dispatch_row(&row?)?;
+        if action.eq(&member)? {
+            return dispatch_outcome(py, &branch, &page);
+        }
+    }
+    let branch = PyString::new(py, "unhandled");
+    let none = py.None().into_bound(py);
+    dispatch_outcome(py, &branch, &none)
+}
+
+/// The pane decision behind `_route_navigation_action` from
+/// `app/_keys.py` — which pane a routed navigation action targets.
+///
+/// Mirrors the pure-Python reference (`_navigation_action_route`): the
+/// Playlists sidebar's widget while that pane holds focus and the
+/// action is in *sidebar_actions*, the lyrics pane's widget while it
+/// holds focus and the action is in *lyrics_actions*, and the page
+/// otherwise. Membership goes through Python's `in` (hash + `==`), so
+/// the caller's frozensets — or a stub's sets — decide exactly like
+/// the fallback, and a plain string action routes like its member. The
+/// reference's `if`/`elif` collapses to two independent gates: the
+/// `elif` is only skipped when the first gate holds, which already
+/// means the pane is Playlists and the lyrics gate could never fire.
+/// Returns `"sidebar" | "lyrics" | "page"`.
+#[pyfunction]
+#[pyo3(signature = (pane, action, sidebar_actions, lyrics_actions))]
+fn route_navigation_action<'py>(
+    pane: &str,
+    action: &Bound<'py, PyAny>,
+    sidebar_actions: &Bound<'py, PyAny>,
+    lyrics_actions: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    if pane == PANE_PLAYLISTS && sidebar_actions.contains(action)? {
+        return Ok("sidebar".to_string());
+    }
+    if pane == PANE_LYRICS && lyrics_actions.contains(action)? {
+        return Ok("lyrics".to_string());
+    }
+    Ok("page".to_string())
+}
+
+/// The album-target extraction behind the CURRENT_CONTEXT dispatch
+/// branch of `_handle_action` from `app/_keys.py`.
+///
+/// Mirrors the pure-Python reference (`_current_context_target`): a
+/// falsy *track* (nothing playing — an empty dict counts) can only
+/// notify; otherwise the album id is `track.get("album_id")`, falling
+/// back to `track.get("album")["id"]` when the former is falsy and the
+/// album is a dict (`isinstance`, so a dict subclass passes). A truthy
+/// id navigates; anything else notifies. The id passes through as the
+/// object it is. Returns `{"outcome": "navigate", "album_id": <id>}` or
+/// `{"outcome": "notify", "reason": "no_track" | "no_album"}`.
+#[pyfunction]
+fn current_context_target<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if !track.is_truthy()? {
+        let out = PyDict::new(py);
+        out.set_item("outcome", "notify")?;
+        out.set_item("reason", "no_track")?;
+        return Ok(out);
+    }
+    let mut album_id = track.call_method1("get", ("album_id",))?;
+    if !album_id.is_truthy()? {
+        let album = track.call_method1("get", ("album",))?;
+        if album.is_instance_of::<PyDict>() {
+            album_id = album.call_method1("get", ("id",))?;
+        }
+    }
+    if album_id.is_truthy()? {
+        let out = PyDict::new(py);
+        out.set_item("outcome", "navigate")?;
+        out.set_item("album_id", &album_id)?;
+        return Ok(out);
+    }
+    let out = PyDict::new(py);
+    out.set_item("outcome", "notify")?;
+    out.set_item("reason", "no_album")?;
+    Ok(out)
+}
+
+/// The Shuffle-lock gate behind the TOGGLE_SHUFFLE dispatch branch of
+/// `_handle_action` from `app/_keys.py`.
+///
+/// Mirrors the pure-Python reference (`_shuffle_lock_blocked`): with a
+/// falsy context id there is nothing locked (and *prefs* is never
+/// consulted — the reference's `ctx and ...` short-circuits the same
+/// way); otherwise `prefs.get(context_id)` decides with Python
+/// truthiness. *prefs* is read duck-typed, so the ShufflePreferences
+/// service, a mock, or a plain dict all behave identically.
+#[pyfunction]
+fn shuffle_lock_blocked(context_id: &Bound<'_, PyAny>, prefs: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !context_id.is_truthy()? {
+        return Ok(false);
+    }
+    let value = prefs.call_method1("get", (context_id,))?;
+    value.is_truthy()
 }
 
 // ---------------------------------------------------------------------------
