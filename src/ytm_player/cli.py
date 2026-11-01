@@ -468,6 +468,41 @@ def history_search(limit: int, compact_json: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cli_stats_payload(
+    total_plays: Any,
+    total_seconds: Any,
+    unique_tracks: Any,
+    top_tracks: Any,
+) -> dict[str, Any]:
+    """The aggregate listening-stats payload the ``stats`` command outputs.
+
+    The pure half of the standalone ``ytm stats`` read: the four-key
+    dict assembled from the three scalar aggregates (total plays,
+    total listened seconds, unique tracks) and the top-tracks list, in
+    this insertion order — the key order the JSON output preserves.
+    The three scalars pass through as the objects they are — the
+    counts straight from the SQLite ``fetchone()`` cells. The
+    top-tracks list is rebuilt from the fetched row tuples' first
+    four fields (``r[0]`` … ``r[3]`` — video_id, title, artist,
+    play_count), each row becoming a fresh map in that order; a
+    longer row's extras are simply never read. The inputs are never
+    mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cli_stats_payload``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return {
+        "total_plays": total_plays,
+        "total_seconds": total_seconds,
+        "unique_tracks": unique_tracks,
+        "top_tracks": [
+            {"video_id": r[0], "title": r[1], "artist": r[2], "play_count": r[3]}
+            for r in top_tracks
+        ],
+    }
+
+
 @main.command()
 @click.option("--json", "compact_json", is_flag=True, help="Compact JSON output.")
 def stats(compact_json: bool) -> None:
@@ -498,15 +533,7 @@ def stats(compact_json: bool) -> None:
                 "FROM play_history GROUP BY video_id ORDER BY play_count DESC LIMIT 10"
             ).fetchall()
 
-            data = {
-                "total_plays": total_plays,
-                "total_seconds": total_seconds,
-                "unique_tracks": unique_tracks,
-                "top_tracks": [
-                    {"video_id": r[0], "title": r[1], "artist": r[2], "play_count": r[3]}
-                    for r in top_tracks
-                ],
-            }
+            data = _cli_stats_payload(total_plays, total_seconds, unique_tracks, top_tracks)
     except sqlite3.Error as exc:
         _error(f"Failed to read history database: {exc}")
 
@@ -648,3 +675,20 @@ def config() -> None:
         subprocess.run([*shlex.split(editor), target], check=True)
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
         _error(f"Failed to open editor: {exc}")
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python transcriptions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements (the
+# lesson that produced formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cli_stats_payload as _native_cli_stats_payload,
+    )
+except ImportError:
+    pass
+else:
+    _cli_stats_payload = _native_cli_stats_payload  # type: ignore[assignment]
