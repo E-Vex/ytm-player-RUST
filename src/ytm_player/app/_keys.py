@@ -1,13 +1,25 @@
-"""Key handling and action dispatch mixin for YTMPlayerApp."""
+"""Key handling and action dispatch mixin for YTMPlayerApp.
+
+The count/sequence buffer state machine is split out of ``on_key``: the
+pure engine — ``_feed_key`` (the count-prefix accumulation and the
+sequence-buffer resolution behind every keystroke) — is implemented by
+the Rust extension (``_ytm_player_native.feed_key``) when it is built and
+by the pure-Python transcription below otherwise. The mixin inspects the
+event's focus context, applies the engine's outcome to the buffers,
+suppresses the event as told and awaits the resolved action; the
+``_handle_action`` dispatch table and the pane routing below it remain
+pure mixin concerns (widget I/O).
+"""
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from textual.events import Key
 
 from ytm_player.app._base import YTMHostBase
-from ytm_player.config import Action, MatchResult
+from ytm_player.config import Action, KeyMap, MatchResult
 from ytm_player.ui.playback_bar import PlaybackBar
 from ytm_player.ui.sidebars.lyrics_sidebar import LyricsSidebar
 from ytm_player.ui.sidebars.playlist_sidebar import PlaylistSidebar
@@ -103,6 +115,86 @@ def _normalize_key_components(key: str, character: str | None, is_printable: boo
     return key_map.get(key, key)
 
 
+def _feed_key(
+    key: str,
+    key_buffer: list[str],
+    count_buffer: str,
+    keymap: KeyMap,
+) -> dict[str, Any]:
+    """The count/sequence buffer state machine behind ``on_key``.
+
+    The pure half of ``KeyHandlingMixin.on_key``: a digit key with an
+    empty *key_buffer* accumulates the *count_buffer* prefix (the event
+    is default-prevented but not stopped); anything else is appended to
+    the sequence buffer and classified by ``keymap.match`` — an exact
+    match resolves the count (``int(count_buffer)`` — which raises for
+    digit-classified non-decimal keys like ``'²'``, the reference's
+    latent wart — defaulting to 1 when no count was typed, capped at
+    ``_MAX_KEY_COUNT``) and clears both buffers, a pending prefix keeps
+    the grown sequence waiting for more keys (the count survives the
+    prefix: ``5`` ``g`` ``g`` goes to top with count 5), and no match
+    clears both buffers while letting the event flow on.
+
+    Implemented by the Rust extension (``_ytm_player_native.feed_key``)
+    when it is built; this pure-Python transcription is the fallback
+    otherwise. The outcome map is fresh in every field and neither input
+    is mutated: ``{"outcome": "count_digit" | "exact" | "pending" |
+    "no_match", "prevent_default": bool, "stop": bool, "key_buffer":
+    list, "count_buffer": str, "count": int | None, "action": Action |
+    None}``.
+    """
+    # Digit handling: accumulate count prefix if no keys buffered yet.
+    if key.isdigit() and not key_buffer:
+        return {
+            "outcome": "count_digit",
+            "prevent_default": True,
+            "stop": False,
+            "key_buffer": list(key_buffer),
+            "count_buffer": count_buffer + key,
+            "count": None,
+            "action": None,
+        }
+
+    sequence = (*key_buffer, key)
+    result, action = keymap.match(sequence)
+
+    if result == MatchResult.EXACT:
+        count = int(count_buffer) if count_buffer else 1
+        count = min(count, _MAX_KEY_COUNT)  # Safety cap.
+        return {
+            "outcome": "exact",
+            "prevent_default": True,
+            "stop": True,
+            "key_buffer": [],
+            "count_buffer": "",
+            "count": count,
+            "action": action,
+        }
+
+    if result == MatchResult.PENDING:
+        # Waiting for more keys in the sequence.
+        return {
+            "outcome": "pending",
+            "prevent_default": True,
+            "stop": True,
+            "key_buffer": list(sequence),
+            "count_buffer": count_buffer,
+            "count": None,
+            "action": None,
+        }
+
+    # No match -- reset buffers.
+    return {
+        "outcome": "no_match",
+        "prevent_default": False,
+        "stop": False,
+        "key_buffer": [],
+        "count_buffer": "",
+        "count": None,
+        "action": None,
+    }
+
+
 class KeyHandlingMixin(YTMHostBase):
     """Keyboard input processing and action dispatch."""
 
@@ -111,6 +203,13 @@ class KeyHandlingMixin(YTMHostBase):
 
         Supports vim-style count prefixes (e.g. "5j" to move down 5 rows)
         and multi-key sequences (e.g. "g g" to go to top).
+
+        The count/sequence buffer state machine (digit accumulation,
+        sequence classification, count resolution and buffer resets) is
+        delegated to the ``_feed_key`` engine above — native when the
+        Rust extension is built, the pure-Python transcription otherwise;
+        this handler keeps the event/focus inspection, applies the
+        engine's outcome and awaits the dispatched action.
         """
         # Don't intercept keys when a modal screen is active -- let the
         # modal's own widgets (Input, ListView, etc.) handle them.
@@ -127,35 +226,17 @@ class KeyHandlingMixin(YTMHostBase):
 
         key = self._normalize_key(event)
 
-        # Digit handling: accumulate count prefix if no keys buffered yet.
-        if key.isdigit() and not self._key_buffer:
-            self._count_buffer += key
+        outcome = _feed_key(key, self._key_buffer, self._count_buffer, self.keymap)
+        self._key_buffer = outcome["key_buffer"]
+        self._count_buffer = outcome["count_buffer"]
+
+        if outcome["prevent_default"]:
             event.prevent_default()
-            return
-
-        self._key_buffer.append(key)
-        sequence = tuple(self._key_buffer)
-
-        result, action = self.keymap.match(sequence)
-
-        if result == MatchResult.EXACT:
-            count = int(self._count_buffer) if self._count_buffer else 1
-            count = min(count, _MAX_KEY_COUNT)  # Safety cap.
-            self._key_buffer.clear()
-            self._count_buffer = ""
-            event.prevent_default()
-            event.stop()
-            await self._handle_action(action, count)
-
-        elif result == MatchResult.PENDING:
-            # Waiting for more keys in the sequence.
-            event.prevent_default()
+        if outcome["stop"]:
             event.stop()
 
-        else:
-            # No match -- reset buffers.
-            self._key_buffer.clear()
-            self._count_buffer = ""
+        if outcome["outcome"] == "exact":
+            await self._handle_action(outcome["action"], outcome["count"])
 
     @staticmethod
     def _normalize_key(event: Key) -> str:
@@ -409,14 +490,17 @@ class KeyHandlingMixin(YTMHostBase):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same key-name normalisation; this
-# binding replaces the pure-Python transcription above when the extension
-# is importable.  The rebinding must happen AFTER the definition above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statement (the lesson that produced formatting.py's dead native
+# The Rust extension implements the same engines; these bindings replace
+# the pure-Python transcriptions above when the extension is importable.
+# The rebinding must happen AFTER the definitions above — assigning the
+# native functions any earlier would be clobbered by the ``def``
+# statements (the lesson that produced formatting.py's dead native
 # bindings).
 
 try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        feed_key as _native_feed_key,
+    )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         normalize_key as _native_normalize_key,
     )
@@ -426,3 +510,4 @@ else:
     _normalize_key_components = (  # type: ignore[assignment]
         _native_normalize_key
     )
+    _feed_key = _native_feed_key  # type: ignore[assignment]
