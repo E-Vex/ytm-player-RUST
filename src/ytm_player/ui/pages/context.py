@@ -1,4 +1,15 @@
-"""Dynamic context page for album, artist, and playlist detail views."""
+"""Dynamic context page for album, artist, and playlist detail views.
+
+The view-model assembly behind every context type — the album and
+playlist header compositions and the artist discography (top songs,
+albums+singles, related artists, and the see-all section selection
+behind the discography expansion) — is implemented by the Rust
+extension (``_ytm_player_native``) when it is built and by the
+pure-Python transcriptions in this module otherwise; the
+bottom-of-module seam rebinds the engine to the native functions when
+the extension is importable. The builders below only do I/O and
+rendering.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +40,11 @@ from ytm_player.utils.formatting import extract_artist, normalize_tracks
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Context view-model engine
+# ---------------------------------------------------------------------------
+
+
 def _load_failure_message(context_type: str) -> str:
     """Failure-state message shown when fetching album/artist/playlist
     data fails. Points the user at the log file so they can self-diagnose
@@ -38,6 +54,148 @@ def _load_failure_message(context_type: str) -> str:
         f"Couldn't load this {context_type}. Check the log at "
         f"~/.config/ytm-player/logs/ytm.log for details."
     )
+
+
+def album_header(data: dict[str, Any]) -> dict[str, Any]:
+    """The album page's view model — the pure core of ``_build_album``.
+
+    Composes the header (``title``, raw, falling back to
+    ``"Unknown Album"``; the ``"artist · year · N track(s)"`` subtitle,
+    with the artist through ``extract_artist``, the year segment only
+    when truthy and interpolated via ``str()``, and the ``!= 1`` plural
+    rule), the normalized track list, and the unavailable count
+    (``len(raw) - len(normalized)``) behind the header's
+    "N unavailable tracks hidden" label.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.album_header``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = data.get("title", "Unknown Album")
+    artist_name = extract_artist(data)
+    year = data.get("year", "")
+    raw_tracks = data.get("tracks", [])
+    tracks = normalize_tracks(raw_tracks)
+    track_count = len(tracks)
+
+    subtitle_parts = [artist_name]
+    if year:
+        subtitle_parts.append(str(year))
+    subtitle_parts.append(f"{track_count} track{'s' if track_count != 1 else ''}")
+
+    return {
+        "title": title,
+        "subtitle": " · ".join(subtitle_parts),
+        "tracks": tracks,
+        "unavailable": len(raw_tracks) - track_count,
+    }
+
+
+def playlist_header(data: dict[str, Any]) -> dict[str, Any]:
+    """The playlist page's view model — the pure core of
+    ``_build_playlist``.
+
+    Composes the header (``title`` falling back to "Unknown Playlist";
+    the owner — ``author.get("name", "Unknown")`` for a dict ``author``,
+    ``str(author)`` otherwise; the "owner · N track(s)" subtitle plus
+    " (loading N total…)" when a truthy ``trackCount`` exceeds the
+    normalized count), the normalized track list, the unavailable count,
+    the ``owned`` truthiness behind the Add-to-Library button, and the
+    ``fetch_remaining``/``raw_count`` pair behind the background fetch
+    of the playlist's tail (``trackCount > len(raw)``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_header``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = data.get("title", "Unknown Playlist")
+    author = data.get("author", {})
+    owner = author.get("name", "Unknown") if isinstance(author, dict) else str(author)
+    raw_tracks = data.get("tracks", [])
+    tracks = normalize_tracks(raw_tracks)
+    track_count = len(tracks)
+    total_count = data.get("trackCount") or track_count
+
+    subtitle = f"{owner} · {track_count} track{'s' if track_count != 1 else ''}"
+    if total_count > track_count:
+        subtitle += f" (loading {total_count} total…)"
+
+    return {
+        "title": title,
+        "subtitle": subtitle,
+        "tracks": tracks,
+        "unavailable": len(raw_tracks) - track_count,
+        "owned": bool(data.get("owned", False)),
+        "fetch_remaining": total_count > len(raw_tracks),
+        "raw_count": len(raw_tracks),
+    }
+
+
+def artist_discography(data: dict[str, Any]) -> dict[str, Any]:
+    """The artist page's view model — the pure core of ``_build_artist``
+    and the discography assembly at the heart of the context page.
+
+    Reads the artist ``name`` (falling back to "Unknown Artist") and the
+    subscribers line (``f"{subs} subscribers"`` for a truthy value), the
+    top songs (``songs.results`` normalized) with the browse id of the
+    playlist holding the artist's full song list, the discography rows
+    (the albums section's ``results`` concatenated after the singles
+    section's), and the similar-artists bar (the first 8 related
+    artists' names — ``name`` for dict rows, ``str(row)`` otherwise —
+    joined on " · " over the truthy ones).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_discography``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    name = data.get("name", "Unknown Artist")
+    subs = data.get("subscribers", "")
+    subscriber_text = f"{subs} subscribers" if subs else ""
+
+    songs_section = data.get("songs", {})
+    top_songs = songs_section.get("results", []) if isinstance(songs_section, dict) else []
+    songs_browse_id = songs_section.get("browseId") if isinstance(songs_section, dict) else None
+
+    albums_section = data.get("albums", {})
+    albums_list = albums_section.get("results", []) if isinstance(albums_section, dict) else []
+    singles_section = data.get("singles", {})
+    singles_list = singles_section.get("results", []) if isinstance(singles_section, dict) else []
+
+    related_section = data.get("related", {})
+    related_artists = (
+        related_section.get("results", []) if isinstance(related_section, dict) else []
+    )
+    related_text = ""
+    if related_artists:
+        names = [a.get("name", "") if isinstance(a, dict) else str(a) for a in related_artists[:8]]
+        related_text = "Similar Artists: " + " · ".join(n for n in names if n)
+
+    return {
+        "name": name,
+        "subscriber_text": subscriber_text,
+        "top_songs": normalize_tracks(top_songs),
+        "songs_browse_id": songs_browse_id,
+        "albums": albums_list + singles_list,
+        "related_text": related_text,
+    }
+
+
+def expandable_sections(data: dict[str, Any]) -> list[Any]:
+    """The sections of a ``get_artist`` payload that carry a "see all"
+    page — a dict section with truthy ``browseId`` and ``params`` — in
+    the albums-then-singles order, as the original section objects so
+    the caller's ``section["results"] = full`` swap lands in the
+    fetched payload (#138).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.expandable_sections``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return [
+        s
+        for s in (data.get("albums"), data.get("singles"))
+        if isinstance(s, dict) and s.get("browseId") and s.get("params")
+    ]
 
 
 class _ArtistAlbumList(DataTable):
@@ -234,15 +392,13 @@ class ContextPage(TrackFilterHost, Widget):
         """Swap get_artist's 10-item albums/singles previews for the full lists.
 
         get_artist returns only the first page of each section; a section
-        that carries ``browseId`` + ``params`` has a "see all" page (#138).
-        Sections without them, and fetches that come back empty, keep the
+        that carries ``browseId`` + ``params`` has a "see all" page (#138)
+        — the section selection runs through the (native-backed) engine,
+        the concurrent fetch stays here because it is I/O. Sections
+        without them, and fetches that come back empty, keep the
         preview.
         """
-        sections = [
-            s
-            for s in (data.get("albums"), data.get("singles"))
-            if isinstance(s, dict) and s.get("browseId") and s.get("params")
-        ]
+        sections = expandable_sections(data)
         if not sections:
             return
         full_lists = await asyncio.gather(
@@ -355,18 +511,7 @@ class ContextPage(TrackFilterHost, Widget):
         self.set_timer(0.1, lambda: self._focus_track_table())
 
     def _build_album(self, container: Vertical) -> None:
-        data = self._data
-        title = data.get("title", "Unknown Album")
-        artist_name = extract_artist(data)
-        year = data.get("year", "")
-        raw_tracks = data.get("tracks", [])
-        tracks = normalize_tracks(raw_tracks)
-        track_count = len(tracks)
-
-        subtitle_parts = [artist_name]
-        if year:
-            subtitle_parts.append(str(year))
-        subtitle_parts.append(f"{track_count} track{'s' if track_count != 1 else ''}")
+        view = album_header(self._data)
 
         header = Vertical(classes="context-header")
         container.mount(header)
@@ -374,9 +519,9 @@ class ContextPage(TrackFilterHost, Widget):
         header.mount(title_row)
         title_row.mount(Label("[b]Album[/b]", markup=True))
         title_row.mount(Static("[+ Add to Library]", id="add-to-library-btn", markup=True))
-        header.mount(Label(title, classes="context-title"))
-        header.mount(Label(" \u00b7 ".join(subtitle_parts), classes="context-subtitle"))
-        unavailable = len(raw_tracks) - track_count
+        header.mount(Label(view["title"], classes="context-title"))
+        header.mount(Label(view["subtitle"], classes="context-subtitle"))
+        unavailable = view["unavailable"]
         if unavailable:
             header.mount(
                 Label(f"{unavailable} unavailable tracks hidden", classes="context-subtitle")
@@ -384,34 +529,22 @@ class ContextPage(TrackFilterHost, Widget):
 
         table = TrackTable(show_album=False, id="context-tracks")
         container.mount(table)
-        table.load_tracks(tracks)
+        table.load_tracks(view["tracks"])
 
     def _build_playlist(self, container: Vertical) -> None:
-        data = self._data
-        title = data.get("title", "Unknown Playlist")
-        author = data.get("author", {})
-        owner = author.get("name", "Unknown") if isinstance(author, dict) else str(author)
-        raw_tracks = data.get("tracks", [])
-        tracks = normalize_tracks(raw_tracks)
-        track_count = len(tracks)
-        total_count = data.get("trackCount") or track_count
-
-        subtitle = f"{owner} \u00b7 {track_count} track{'s' if track_count != 1 else ''}"
-        if total_count > track_count:
-            subtitle += f" (loading {total_count} total\u2026)"
+        view = playlist_header(self._data)
 
         header = Vertical(classes="context-header")
         container.mount(header)
         title_row = Horizontal(classes="context-header-row")
         header.mount(title_row)
-        owned = data.get("owned", False)
         title_row.mount(Label("[b]Playlist[/b]", markup=True))
-        if not owned:
+        if not view["owned"]:
             title_row.mount(Static("[+ Add to Library]", id="add-to-library-btn", markup=True))
         title_row.mount(Static("[▶ Start Radio]", id="start-radio-btn", markup=True))
-        header.mount(Label(title, classes="context-title"))
-        header.mount(Label(subtitle, classes="context-subtitle"))
-        unavailable = len(raw_tracks) - track_count
+        header.mount(Label(view["title"], classes="context-title"))
+        header.mount(Label(view["subtitle"], classes="context-subtitle"))
+        unavailable = view["unavailable"]
         if unavailable:
             header.mount(
                 Label(f"{unavailable} unavailable tracks hidden", classes="context-subtitle")
@@ -419,13 +552,13 @@ class ContextPage(TrackFilterHost, Widget):
 
         table = TrackTable(show_album=True, id="context-tracks")
         container.mount(table)
-        table.load_tracks(tracks)
+        table.load_tracks(view["tracks"])
 
         # Kick off background fetch for remaining tracks if the first batch
         # didn't cover the full playlist.
-        if total_count > len(raw_tracks):
+        if view["fetch_remaining"]:
             self.run_worker(
-                self._fetch_remaining_tracks(len(raw_tracks)),
+                self._fetch_remaining_tracks(view["raw_count"]),
                 name="fetch_remaining",
                 group=self.LOAD_GROUP,
             )
@@ -486,17 +619,14 @@ class ContextPage(TrackFilterHost, Widget):
             logger.debug("Failed to append remaining artist songs", exc_info=True)
 
     def _build_artist(self, container: Vertical) -> None:
-        data = self._data
-        name = data.get("name", "Unknown Artist")
-        subs = data.get("subscribers", "")
-        subscriber_text = f"{subs} subscribers" if subs else ""
+        view = artist_discography(self._data)
 
         header = Vertical(classes="context-header")
         container.mount(header)
         header.mount(Label("[b]Artist[/b]", markup=True))
-        header.mount(Label(name, classes="context-title"))
-        if subscriber_text:
-            header.mount(Label(subscriber_text, classes="context-subtitle"))
+        header.mount(Label(view["name"], classes="context-title"))
+        if view["subscriber_text"]:
+            header.mount(Label(view["subscriber_text"], classes="context-subtitle"))
 
         # Two-column layout: top songs on left, albums on right.
         columns = Horizontal(classes="artist-columns")
@@ -506,17 +636,15 @@ class ContextPage(TrackFilterHost, Widget):
         columns.mount(left)
         left.mount(Label("[b]Top Songs[/b]", markup=True))
 
-        songs_section = data.get("songs", {})
-        top_songs = songs_section.get("results", []) if isinstance(songs_section, dict) else []
         top_tracks_table = TrackTable(show_album=False, id="context-tracks")
         left.mount(top_tracks_table)
-        top_tracks_table.load_tracks(normalize_tracks(top_songs))
+        top_tracks_table.load_tracks(view["top_songs"])
 
         # ytmusicapi truncates artist songs to ~5 by default. The full list
         # lives at songs_section["browseId"] as a regular playlist. Fetch
         # it in the background and silently swap the table contents in
         # when ready (closes #55).
-        songs_browse_id = songs_section.get("browseId") if isinstance(songs_section, dict) else None
+        songs_browse_id = view["songs_browse_id"]
         if songs_browse_id:
             self.run_worker(
                 self._fetch_full_artist_songs(songs_browse_id, top_tracks_table),
@@ -529,29 +657,13 @@ class ContextPage(TrackFilterHost, Widget):
         columns.mount(right)
         right.mount(Label("[b]Albums / Singles[/b]", markup=True))
 
-        albums_section = data.get("albums", {})
-        albums_list = albums_section.get("results", []) if isinstance(albums_section, dict) else []
-        singles_section = data.get("singles", {})
-        singles_list = (
-            singles_section.get("results", []) if isinstance(singles_section, dict) else []
-        )
-        all_albums = albums_list + singles_list
-
         album_table = _ArtistAlbumList(id="context-albums")
         right.mount(album_table)
-        album_table.load_albums(all_albums)
+        album_table.load_albums(view["albums"])
 
         # Similar artists bar at the bottom.
-        related_section = data.get("related", {})
-        related_artists = (
-            related_section.get("results", []) if isinstance(related_section, dict) else []
-        )
-        if related_artists:
-            names = [
-                a.get("name", "") if isinstance(a, dict) else str(a) for a in related_artists[:8]
-            ]
-            similar_text = "Similar Artists: " + " \u00b7 ".join(n for n in names if n)
-            container.mount(Label(similar_text, classes="similar-artists-bar"))
+        if view["related_text"]:
+            container.mount(Label(view["related_text"], classes="similar-artists-bar"))
 
     def _focus_track_table(self) -> None:
         """Focus the track table after content loads."""
@@ -698,3 +810,33 @@ class ContextPage(TrackFilterHost, Widget):
             await table.handle_action(action, count)
         except Exception:
             logger.debug("Failed to delegate action to context track table", exc_info=True)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same view-model assembly; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        album_header as _native_album_header,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        artist_discography as _native_artist_discography,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        expandable_sections as _native_expandable_sections,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_header as _native_playlist_header,
+    )
+except ImportError:
+    pass
+else:
+    album_header = _native_album_header  # type: ignore[assignment]
+    playlist_header = _native_playlist_header  # type: ignore[assignment]
+    artist_discography = _native_artist_discography  # type: ignore[assignment]
+    expandable_sections = _native_expandable_sections  # type: ignore[assignment]
