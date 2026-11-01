@@ -259,6 +259,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // update_play_listened_seconds.
     module.add_function(pyo3::wrap_pyfunction!(play_log_row, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(listened_delta, module)?)?;
+
+    // Command palette catalog (app/_commands.py equivalent): the
+    // (name, help) catalog behind the command provider — the data both
+    // the discovery list and the query search dispatch over, with the
+    // per-entry callback resolution staying on the Python side next to
+    // the Textual hit machinery.
+    module.add_function(pyo3::wrap_pyfunction!(command_catalog, module)?)?;
     Ok(())
 }
 
@@ -5788,4 +5795,23 @@ fn listened_delta<'py>(
     }
     // delta = listened_seconds - old_seconds
     Ok(Some(listened_seconds.sub(&old_seconds)?))
+}
+
+/// The command palette catalog behind `YTMCommandProvider` from
+/// `app/_commands.py` — the pure core of the command provider.
+///
+/// Mirrors the pure-Python reference (`_command_catalog`): the
+/// `(name, help)` pair for every ytm-player command, in dispatch
+/// order — the data both the discovery list and the query search
+/// walk. The names are the palette's dispatch keys (the Python side
+/// resolves each to its host callback through `_command_callback`),
+/// so they must stay unique and in sync with the resolvers. A fresh
+/// list of fresh tuples comes back on every call — nothing is cached,
+/// so no shared mutable state can ever leak between calls.
+#[pyfunction]
+fn command_catalog() -> Vec<(String, String)> {
+    vec![(
+        "Theme: Set Current as Default".to_string(),
+        "Save the active theme to config.toml".to_string(),
+    )]
 }
