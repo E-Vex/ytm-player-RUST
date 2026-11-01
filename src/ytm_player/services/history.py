@@ -1,4 +1,15 @@
-"""Play and search history tracking using async SQLite."""
+"""Play and search history tracking using async SQLite.
+
+The two pure cores of the play-history writes are dual-implemented:
+``_play_log_row`` (the skip gate and insert-row assembly behind
+``log_play``) and ``_listened_delta`` (the stored-vs-new
+listened-seconds decision behind ``update_play_listened_seconds``) are
+implemented by the Rust extension
+(``_ytm_player_native.play_log_row`` /
+``_ytm_player_native.listened_delta``) when it is built and by the
+pure-Python transcriptions below otherwise; the manager's methods only
+perform the reads and writes around them.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +17,7 @@ import asyncio
 import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -48,6 +60,69 @@ CREATE TABLE IF NOT EXISTS play_stats (
     last_played TEXT
 );
 """
+
+
+def _play_log_row(
+    track: Any,
+    listened_seconds: Any,
+    source: Any,
+    min_listen_seconds: Any,
+) -> dict[str, Any] | None:
+    """The row a counted play writes — or ``None`` when the listen doesn't count.
+
+    The pure half of ``HistoryManager.log_play``: the skip gate
+    (``listened_seconds <= min_listen_seconds`` — skips never reach the
+    database, checked before anything else is touched) and the
+    insert-row assembly — ``video_id`` through ``[]`` (a missing key
+    raises, the reference's one indexing read), ``title`` / ``artist`` /
+    ``album`` through duck-typed ``.get`` with the ``""`` defaults, and
+    ``duration`` through ``extract_duration`` (the
+    ``duration_seconds`` → ``duration`` → ``length`` chain). Every
+    value passes through as the object it is — ``listened_seconds``
+    and ``source`` included — into a fresh map; the inputs are never
+    mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.play_log_row``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if listened_seconds <= min_listen_seconds:
+        return None
+
+    from ytm_player.utils.formatting import extract_duration
+
+    return {
+        "video_id": track["video_id"],
+        "title": track.get("title", ""),
+        "artist": track.get("artist", ""),
+        "album": track.get("album", ""),
+        "duration": extract_duration(track),
+        "listened_seconds": listened_seconds,
+        "source": source,
+    }
+
+
+def _listened_delta(old_value: Any, listened_seconds: Any) -> Any:
+    """The delta a finalised listen writes — or ``None`` when there is nothing to write.
+
+    The pure half of ``HistoryManager.update_play_listened_seconds``:
+    the stored value is coerced with ``int(old_value or 0)`` (every
+    falsy cell — ``None``, ``0``, ``""``, ``False`` — reads as zero)
+    and a listen that does not strictly exceed the stored seconds
+    writes nothing. Otherwise the delta is
+    ``listened_seconds - old_seconds``, exact at any magnitude. Where
+    the coercion would raise (``int("4.5")``'s ``ValueError``, the
+    ``TypeError`` for an unconvertible value) the error propagates,
+    exactly like the reference's inline arithmetic.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.listened_delta``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    old_seconds = int(old_value or 0)
+    if listened_seconds <= old_seconds:
+        return None
+    return listened_seconds - old_seconds
 
 
 class HistoryManager:
@@ -213,21 +288,22 @@ class HistoryManager:
         """Record a track play event.
 
         Skips are ignored: the play is only logged when *listened_seconds*
-        exceeds the minimum threshold.
+        exceeds the minimum threshold. The skip gate and the insert-row
+        assembly are resolved by the ``_play_log_row`` engine (native
+        when the Rust extension is built, the pure-Python transcription
+        otherwise); this method performs the writes. The engine runs
+        ahead of the initialised-DB check, so with a well-formed track
+        an uninitialised manager raises exactly the reference's
+        ``RuntimeError`` — only a junk track on an uninitialised manager
+        surfaces its own ``KeyError`` first, a doubly-unreachable
+        combination.
         """
-        if listened_seconds <= min_listen_seconds:
+        row = _play_log_row(track, listened_seconds, source, min_listen_seconds)
+        if row is None:
             return None
 
         if self._db is None:
             raise RuntimeError("Database not initialized")
-
-        from ytm_player.utils.formatting import extract_duration
-
-        video_id = track["video_id"]
-        title = track.get("title", "")
-        artist = track.get("artist", "")
-        album = track.get("album", "")
-        duration = extract_duration(track)
 
         try:
             cursor = await self._db.execute(
@@ -237,7 +313,15 @@ class HistoryManager:
                      listened_seconds, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (video_id, title, artist, album, duration, listened_seconds, source),
+                (
+                    row["video_id"],
+                    row["title"],
+                    row["artist"],
+                    row["album"],
+                    row["duration"],
+                    row["listened_seconds"],
+                    row["source"],
+                ),
             )
 
             await self._db.execute(
@@ -252,17 +336,24 @@ class HistoryManager:
                     total_listened_seconds = total_listened_seconds + excluded.total_listened_seconds,
                     last_played = datetime('now')
                 """,
-                (video_id, title, artist, listened_seconds),
+                (row["video_id"], row["title"], row["artist"], row["listened_seconds"]),
             )
 
             await self._db.commit()
             return cursor.lastrowid
         except (OSError, sqlite3.Error) as exc:
-            logger.exception("Failed to log play (video_id=%r)", video_id)
+            logger.exception("Failed to log play (video_id=%r)", row["video_id"])
             raise RuntimeError(f"Failed to write to history database: {exc}") from exc
 
     async def update_play_listened_seconds(self, play_id: int, listened_seconds: int) -> None:
-        """Update an already-counted play with its final listen duration."""
+        """Update an already-counted play with its final listen duration.
+
+        The stored-vs-new listened-seconds decision — the ``int(...) or 0``
+        coercion, the no-write gate and the delta — is resolved by the
+        ``_listened_delta`` engine (native when the Rust extension is
+        built, the pure-Python transcription otherwise); the row read
+        and the writes stay here, exactly as lazy as the reference.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
 
@@ -275,10 +366,9 @@ class HistoryManager:
             if row is None:
                 return
 
-            old_seconds = int(row["listened_seconds"] or 0)
-            if listened_seconds <= old_seconds:
+            delta = _listened_delta(row["listened_seconds"], listened_seconds)
+            if delta is None:
                 return
-            delta = listened_seconds - old_seconds
 
             await self._db.execute(
                 "UPDATE play_history SET listened_seconds = ? WHERE id = ?",
@@ -425,3 +515,23 @@ class HistoryManager:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (
+        listened_delta as _native_listened_delta,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        play_log_row as _native_play_log_row,
+    )
+except ImportError:
+    pass
+else:
+    _play_log_row = _native_play_log_row  # type: ignore[assignment]
+    _listened_delta = _native_listened_delta  # type: ignore[assignment]

@@ -251,6 +251,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(playlist_header, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(artist_discography, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(expandable_sections, module)?)?;
+
+    // Play-history row engine (ytm_player/services/history.py
+    // equivalent): the skip gate and insert-row assembly behind
+    // HistoryManager.log_play, and the stored-vs-new listened-seconds
+    // decision (the int coercion, no-write gate and delta) behind
+    // update_play_listened_seconds.
+    module.add_function(pyo3::wrap_pyfunction!(play_log_row, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(listened_delta, module)?)?;
     Ok(())
 }
 
@@ -5569,4 +5577,215 @@ fn artist_discography<'py>(
     out.set_item("albums", PyList::new(py, album_rows)?)?;
     out.set_item("related_text", related_text)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Play-history row engine (mirrors ytm_player/services/history.py)
+// ---------------------------------------------------------------------------
+
+/// `int(value)` — CPython's own builtin, dispatched directly.
+///
+/// The history row engine coerces caller-wide values (SQLite cells,
+/// configured thresholds, track duration fields), where `int()`'s
+/// acceptance set is larger than any transcription wants to spell out:
+/// float truncation, decimal strings with signs, underscores, surrounding
+/// whitespace and non-ASCII digits, `__int__`/`__index__` dispatch,
+/// bigints beyond i64 — and the exact `ValueError`/`TypeError` messages
+/// where the reference would raise. The coercion runs once per logged
+/// play or finalised listen, as far from a hot path as the extension
+/// gets, so exactness costs nothing measurable.
+fn builtin_int<'py>(py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let int_type = py.import("builtins")?.getattr("int")?;
+    int_type.call1((value,))
+}
+
+/// The duration chain behind `log_play`'s row assembly — a duck-typed
+/// transcription of `extract_duration` from `utils/formatting.py`, every
+/// read through the track's own `get` method so a dict subclass
+/// overriding it steers both backends identically.
+///
+/// `duration_seconds` is coerced through `int()` whenever present (the
+/// reference's `is not None` gate — `False` and `""` both coerce), with
+/// the `(ValueError, TypeError)` swallow: a numeric string parses, a
+/// `"M:SS"` spelling falls through, a float truncates. `duration` and
+/// `length` accept any int — bools included, the object itself returned
+/// (`True` stays `True`, exactly like the fallback) — and
+/// `":"`-bearing strings, split and recombined with Python arithmetic
+/// (`int(a) * 60 + int(b)` for `M:SS`, the `H:MM:SS` three-part form,
+/// a `ValueError` from either parse swallowed, everything else passing
+/// through). No match yields 0. Where a read raises — a track without
+/// `get`, or a `get` that raises — the error surfaces exactly where the
+/// fallback's would.
+fn play_extract_duration<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // dur = track.get("duration_seconds") — duck-typed, no default.
+    let dur = track.call_method1("get", ("duration_seconds",))?;
+    if !dur.is_none() {
+        // return int(dur) — except (ValueError, TypeError): pass
+        match builtin_int(py, &dur) {
+            Ok(coerced) => return Ok(coerced),
+            Err(err)
+                if err.is_instance_of::<PyValueError>(py)
+                    || err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    for key in ["duration", "length"] {
+        // dur = track.get(key)
+        let dur = track.call_method1("get", (key,))?;
+        // if isinstance(dur, int): return dur — the object itself, bools
+        // included (the reference returns True, never 1).
+        if dur.is_instance_of::<PyInt>() {
+            return Ok(dur);
+        }
+        // if isinstance(dur, str) and ":" in dur
+        if dur.is_instance_of::<PyString>() && dur.contains(":")? {
+            // parts = dur.split(":") — the str protocol, subclass
+            // overrides included.
+            let parts = dur.call_method1("split", (":",))?;
+            if let Some(seconds) = duration_parts_seconds(py, &parts)? {
+                return Ok(seconds);
+            }
+        }
+    }
+    Ok(0i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any())
+}
+
+/// `int(parts[0]) * 60 + int(parts[1])` (and the `H:MM:SS` three-part
+/// form) over a split duration string — Python's own arithmetic through
+/// the number protocol, exact at any magnitude. A `ValueError` from
+/// either `int()` parse maps to None: the reference's
+/// `except ValueError: pass` falls through to the next duration key.
+/// Everything else — a split override returning something unindexable,
+/// a `TypeError` from a non-string part — propagates, exactly like the
+/// fallback.
+fn duration_parts_seconds<'py>(
+    py: Python<'py>,
+    parts: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    // len(parts) == 2 / == 3 — PyObject_Size, raising like len() would.
+    // Any other length (a "1:2:3:4" spelling, say) matches neither of the
+    // reference's two if-statements and falls through to the next
+    // duration key without parsing anything. The parses and arithmetic
+    // live in the helper so a `?` there returns from *it*, landing in
+    // the ValueError match below — not straight out of this function.
+    let total = match parts.len()? {
+        2 => combine_duration_parts(py, parts, 2),
+        3 => combine_duration_parts(py, parts, 3),
+        _ => return Ok(None),
+    };
+    match total {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if err.is_instance_of::<PyValueError>(py) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// The pieces of one split duration string, parsed and recombined —
+/// `int(parts[0]) * 60 + int(parts[1])` for `M:SS`, the `H:MM:SS`
+/// three-part form for a length of 3. Python's own arithmetic through
+/// the number protocol, exact at any magnitude.
+fn combine_duration_parts<'py>(
+    py: Python<'py>,
+    parts: &Bound<'py, PyAny>,
+    len: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    let first = builtin_int(py, &parts.get_item(0)?)?;
+    let second = builtin_int(py, &parts.get_item(1)?)?;
+    if len == 2 {
+        return first.mul(60i64)?.add(&second);
+    }
+    let third = builtin_int(py, &parts.get_item(2)?)?;
+    first.mul(3600i64)?.add(&second.mul(60i64)?)?.add(&third)
+}
+
+/// The row assembly behind `HistoryManager.log_play` — the pure core of
+/// `services/history.py`'s play logging.
+///
+/// Mirrors the pure-Python reference (`_play_log_row`): the skip gate
+/// comes first — `listened_seconds <= min_listen_seconds` through
+/// Python's own `<=` (bools compare as ints, floats numerically, and the
+/// same `TypeError` where Python's comparison would reject the pair) —
+/// returning None for every listen the reference would drop before
+/// touching anything else. Otherwise the insert row is assembled from
+/// the track: `video_id` through `[]` (the reference's one indexing
+/// read, a missing key raising KeyError), `title` / `artist` / `album`
+/// through duck-typed `.get` with the `""` defaults, and `duration`
+/// through the duration chain above. Every value passes through as the
+/// object it is — `listened_seconds` and `source` included — into a
+/// fresh map, and the inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (track, listened_seconds, source, min_listen_seconds))]
+fn play_log_row<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+    listened_seconds: &Bound<'py, PyAny>,
+    source: &Bound<'py, PyAny>,
+    min_listen_seconds: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    // if listened_seconds <= min_listen_seconds: return None
+    if listened_seconds.le(min_listen_seconds)? {
+        return Ok(None);
+    }
+    // video_id = track["video_id"] — the [] read, KeyError wart included.
+    let video_id = track.get_item("video_id")?;
+    // title/artist/album = track.get(key, "") — duck-typed .get with the
+    // "" defaults; an object without .get raises the reference's
+    // AttributeError.
+    let empty: Bound<'py, PyAny> = PyString::new(py, "").into_any();
+    let title = track.call_method1("get", ("title", empty.clone()))?;
+    let artist = track.call_method1("get", ("artist", empty.clone()))?;
+    let album = track.call_method1("get", ("album", empty))?;
+    // duration = extract_duration(track)
+    let duration = play_extract_duration(py, track)?;
+    let out = PyDict::new(py);
+    out.set_item("video_id", video_id)?;
+    out.set_item("title", title)?;
+    out.set_item("artist", artist)?;
+    out.set_item("album", album)?;
+    out.set_item("duration", duration)?;
+    out.set_item("listened_seconds", listened_seconds)?;
+    out.set_item("source", source)?;
+    Ok(Some(out))
+}
+
+/// The listened-seconds update decision behind
+/// `HistoryManager.update_play_listened_seconds`.
+///
+/// Mirrors the pure-Python reference (`_listened_delta`): the stored
+/// value is coerced with `int(old_value or 0)` — Python truthiness
+/// picking the 0 for every falsy cell (None, 0, 0.0, "", False, empty
+/// containers), the builtin `int()` for everything else, with its exact
+/// `ValueError`/`TypeError` where the reference's coercion would raise
+/// (both propagate identically out of the caller). A listen that does
+/// not strictly exceed the stored seconds writes nothing (None).
+/// Otherwise the delta — `listened_seconds - old_seconds` through
+/// Python's own subtraction — comes back as the object the reference's
+/// arithmetic would produce, exact at any magnitude.
+#[pyfunction]
+#[pyo3(signature = (old_value, listened_seconds))]
+fn listened_delta<'py>(
+    py: Python<'py>,
+    old_value: &Bound<'py, PyAny>,
+    listened_seconds: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    // old_seconds = int(old_value or 0)
+    let old_seconds = if old_value.is_truthy()? {
+        builtin_int(py, old_value)?
+    } else {
+        0i64.into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any()
+    };
+    // if listened_seconds <= old_seconds: return
+    if listened_seconds.le(&old_seconds)? {
+        return Ok(None);
+    }
+    // delta = listened_seconds - old_seconds
+    Ok(Some(listened_seconds.sub(&old_seconds)?))
 }
