@@ -45,6 +45,64 @@ _LYRICS_PANE_ACTIONS = frozenset(
 )
 
 
+def _normalize_key_components(key: str, character: str | None, is_printable: bool) -> str:
+    """Convert a Textual key event's primitive components into the string
+    format used by KeyMap.
+
+    Textual key names like 'ctrl+r' become 'C-r', 'shift+tab' becomes
+    'S-tab', 'alt+v' becomes 'M-v'; a single-code-point printable
+    non-whitespace character is itself (Textual names punctuation
+    symbolically — '>' arrives as 'greater_than_sign' — while the keymap
+    binds the literal character; whitespace keeps its name); the special
+    names below are remapped and everything else passes through.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.normalize_key``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    # Textual uses names like "ctrl+x", "shift+tab", "alt+v".
+    if key.startswith("ctrl+"):
+        return f"C-{key[5:]}"
+    if key.startswith("shift+"):
+        return f"S-{key[6:]}"
+    if key.startswith("alt+"):
+        return f"M-{key[4:]}"
+
+    # Textual names punctuation symbolically (">" arrives as
+    # "greater_than_sign", "^" as "circumflex_accent") while the keymap
+    # binds the literal character, so prefer the character itself.
+    # Whitespace is excluded so "space" keeps its name.
+    if character is not None and len(character) == 1 and is_printable and not character.isspace():
+        return character
+
+    # Map Textual's special key names to our keymap names.
+    key_map = {
+        "up": "up",
+        "down": "down",
+        "left": "left",
+        "right": "right",
+        "home": "home",
+        "end": "end",
+        "pageup": "page_up",
+        "pagedown": "page_down",
+        "page_up": "page_up",
+        "page_down": "page_down",
+        "backspace": "backspace",
+        "delete": "delete",
+        "tab": "tab",
+        "enter": "enter",
+        "return": "enter",
+        "escape": "escape",
+        "plus": "+",
+        "minus": "-",
+        "equals": "=",
+        "question_mark": "?",
+        "slash": "/",
+    }
+
+    return key_map.get(key, key)
+
+
 class KeyHandlingMixin(YTMHostBase):
     """Keyboard input processing and action dispatch."""
 
@@ -104,52 +162,17 @@ class KeyHandlingMixin(YTMHostBase):
         """Convert a Textual Key event into the string format used by KeyMap.
 
         Textual key names like 'ctrl+r' become 'C-r', 'shift+tab' becomes
-        'S-tab', etc.
+        'S-tab', etc. Delegates to the engine (native when built) with the
+        event's primitive components; a duck-typed stand-in's non-string
+        character reads as ``None``, degenerating exactly like the
+        reference's own ``len(character) == 1`` gate.
         """
-        key = event.key
-
-        # Textual uses names like "ctrl+x", "shift+tab", "alt+v".
-        if key.startswith("ctrl+"):
-            return f"C-{key[5:]}"
-        if key.startswith("shift+"):
-            return f"S-{key[6:]}"
-        if key.startswith("alt+"):
-            return f"M-{key[4:]}"
-
-        # Textual names punctuation symbolically (">" arrives as
-        # "greater_than_sign", "^" as "circumflex_accent") while the keymap
-        # binds the literal character, so prefer the character itself.
-        # Whitespace is excluded so "space" keeps its name.
-        char = event.character
-        if char is not None and len(char) == 1 and event.is_printable and not char.isspace():
-            return char
-
-        # Map Textual's special key names to our keymap names.
-        key_map = {
-            "up": "up",
-            "down": "down",
-            "left": "left",
-            "right": "right",
-            "home": "home",
-            "end": "end",
-            "pageup": "page_up",
-            "pagedown": "page_down",
-            "page_up": "page_up",
-            "page_down": "page_down",
-            "backspace": "backspace",
-            "delete": "delete",
-            "tab": "tab",
-            "enter": "enter",
-            "return": "enter",
-            "escape": "escape",
-            "plus": "+",
-            "minus": "-",
-            "equals": "=",
-            "question_mark": "?",
-            "slash": "/",
-        }
-
-        return key_map.get(key, key)
+        character = event.character
+        return _normalize_key_components(
+            event.key,
+            character if isinstance(character, str) else None,
+            bool(event.is_printable),
+        )
 
     async def _handle_action(self, action: Action | None, count: int = 1) -> None:
         """Dispatch a resolved action to the appropriate handler."""
@@ -383,3 +406,23 @@ class KeyHandlingMixin(YTMHostBase):
         page = self._get_current_page()
         if page and hasattr(page, "handle_action"):
             await page.handle_action(action, count)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same key-name normalisation; this
+# binding replaces the pure-Python transcription above when the extension
+# is importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        normalize_key as _native_normalize_key,
+    )
+except ImportError:
+    pass
+else:
+    _normalize_key_components = (  # type: ignore[assignment]
+        _native_normalize_key
+    )

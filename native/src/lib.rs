@@ -137,6 +137,11 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // Keymap sequence matching (ytm_player.config.keymap equivalent).
     module.add_class::<KeyMatcher>()?;
+    // Key-name normalisation (app/_keys.py equivalent): the
+    // Textual-key-to-keymap-name translation that feeds sequence
+    // matching — modifier prefixes, printable-character preference,
+    // and the special-name remap.
+    module.add_function(pyo3::wrap_pyfunction!(normalize_key, module)?)?;
 
     // Playback queue engine (ytm_player.services.queue equivalent).
     module.add_class::<QueueCore>()?;
@@ -1374,6 +1379,108 @@ impl KeyMatcher {
             return ("pending".to_string(), None);
         }
         ("no_match".to_string(), None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Key-name normalisation (mirrors app/_keys.py's _normalize_key)
+// ---------------------------------------------------------------------------
+
+/// CPython's `str.isspace()` acceptance set for a single character.
+/// Rust's `char::is_whitespace()` (the Unicode `White_Space` property)
+/// would disagree on `\x1c`–`\x1f`, which CPython accepts, so the set is
+/// spelled out instead of delegating.
+fn py_isspace(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n'
+            | '\u{0b}'
+            | '\u{0c}'
+            | '\r'
+            | '\u{1c}'
+            | '\u{1d}'
+            | '\u{1e}'
+            | '\u{1f}'
+            | ' '
+            | '\u{85}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+/// Convert a Textual key event's primitive components into the string
+/// format used by `KeyMap`.
+///
+/// Mirrors `_normalize_key` from `app/_keys.py`, decomposed into the
+/// event's primitives so the engine itself is pure: the key name, the
+/// optional character, and the character's printability. Textual key
+/// names like `ctrl+r` become `C-r`, `shift+tab` becomes `S-tab`,
+/// `alt+v` becomes `M-v`; a single-code-point printable non-whitespace
+/// character is itself (Textual names punctuation symbolically — `>`
+/// arrives as `greater_than_sign` — while the keymap binds the literal
+/// character; whitespace keeps its name); the special names below are
+/// remapped and everything else passes through unchanged.
+///
+/// Faithful to the reference's gates: `len(character) == 1` counts code
+/// points (a two-code-point decomposed character falls through to the
+/// name mapping, exactly like Python's `len`), printability is the
+/// caller-supplied `Key.is_printable`, and `isspace` is CPython's set
+/// (see `py_isspace`), not the Unicode property.
+#[pyfunction]
+#[pyo3(signature = (key, character, is_printable))]
+fn normalize_key(key: &str, character: Option<&str>, is_printable: bool) -> String {
+    if let Some(rest) = key.strip_prefix("ctrl+") {
+        return format!("C-{rest}");
+    }
+    if let Some(rest) = key.strip_prefix("shift+") {
+        return format!("S-{rest}");
+    }
+    if let Some(rest) = key.strip_prefix("alt+") {
+        return format!("M-{rest}");
+    }
+
+    // `character is not None and len(character) == 1 and is_printable
+    //  and not character.isspace()`
+    if let Some(ch) = character {
+        let mut chars = ch.chars();
+        if let (Some(c), None) = (chars.next(), chars.next()) {
+            if is_printable && !py_isspace(c) {
+                return c.to_string();
+            }
+        }
+    }
+
+    // Textual's special key names remapped to the keymap's names;
+    // everything else passes through as-is.
+    let mapped = match key {
+        "up" => Some("up"),
+        "down" => Some("down"),
+        "left" => Some("left"),
+        "right" => Some("right"),
+        "home" => Some("home"),
+        "end" => Some("end"),
+        "pageup" => Some("page_up"),
+        "pagedown" => Some("page_down"),
+        "page_up" => Some("page_up"),
+        "page_down" => Some("page_down"),
+        "backspace" => Some("backspace"),
+        "delete" => Some("delete"),
+        "tab" => Some("tab"),
+        "enter" => Some("enter"),
+        "return" => Some("enter"),
+        "escape" => Some("escape"),
+        "plus" => Some("+"),
+        "minus" => Some("-"),
+        "equals" => Some("="),
+        "question_mark" => Some("?"),
+        "slash" => Some("/"),
+        _ => None,
+    };
+    match mapped {
+        Some(m) => m.to_string(),
+        None => key.to_string(),
     }
 }
 
