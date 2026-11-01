@@ -773,10 +773,14 @@ class TestIPCTcpAuth:
 
 
 def test_whitelist_matches_handler_cases():
-    """The frozenset gate and the mixin's match arms must not drift apart.
+    """The frozenset gate and the mixin's dispatch table must not drift apart.
 
-    Reads app/_ipc.py as text (no heavy app import) and compares its
-    ``case "..."`` command literals against _VALID_COMMANDS.
+    Reads app/_ipc.py as text (no heavy app import) and compares the
+    ``_IPC_DISPATCH_TABLE`` rows' command literals against
+    ``_VALID_COMMANDS`` — the table is the dispatch's source of truth
+    since the branch-token port (the wire protocol itself is unchanged:
+    like/dislike/unlike remain the commands, routed through the shared
+    "rate" branch with their ratings carried by the rows).
     """
     import re
 
@@ -784,5 +788,11 @@ def test_whitelist_matches_handler_cases():
 
     src_path = Path(ytm_player.__file__).parent / "app" / "_ipc.py"
     text = src_path.read_text(encoding="utf-8")
-    cases = set(re.findall(r'case "(\w+)":', text))
-    assert cases == set(_VALID_COMMANDS)
+    table_match = re.search(
+        r"_IPC_DISPATCH_TABLE: tuple\[tuple\[str, str, str \| None\], \.\.\.\] = \((.*?)\n\)",
+        text,
+        re.DOTALL,
+    )
+    assert table_match, "the dispatch table literal was not found in app/_ipc.py"
+    rows = re.findall(r'\("(\w+)", "\w+", ', table_match.group(1))
+    assert rows and set(rows) == set(_VALID_COMMANDS)
