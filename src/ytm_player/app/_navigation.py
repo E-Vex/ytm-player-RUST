@@ -24,6 +24,7 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 from ytm_player.app._base import YTMHostBase
+from ytm_player.app._sidebar import sidebar_visible_for_page
 from ytm_player.config import Action
 from ytm_player.ui.playback_bar import FooterBar
 
@@ -359,8 +360,11 @@ class NavigationMixin(YTMHostBase):
         except Exception:
             logger.exception("Failed to update header back/forward button visibility")
 
-        # Apply per-page playlist sidebar visibility.
-        sidebar_visible = self._sidebar_per_page.get(page_name, self._sidebar_default)
+        # Apply per-page playlist sidebar visibility — through the sidebar
+        # engine's read, so it runs native when the extension is built.
+        sidebar_visible = sidebar_visible_for_page(
+            self._sidebar_per_page, page_name, self._sidebar_default
+        )
         self._apply_playlist_sidebar(sidebar_visible)
 
         # Apply global lyrics sidebar visibility.

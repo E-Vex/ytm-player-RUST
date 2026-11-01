@@ -1,4 +1,21 @@
-"""Sidebar toggling and playlist sidebar event handling mixin for YTMPlayerApp."""
+"""Sidebar toggling and playlist sidebar event handling mixin for YTMPlayerApp.
+
+The pane-routing state machine is split out of ``SidebarMixin``: the pure
+engine — ``sidebar_visible_for_page`` / ``toggle_sidebar_state`` /
+``ensure_sidebar_visible`` (the per-page playlist-sidebar visibility
+bookkeeping), ``visible_panes`` (the left-to-right visible pane list),
+``pane_of_focused`` (resolving the focused widget's pane from its ancestor
+chain), ``pane_focus_target`` (the focus gate: the Playlists pane is always
+focusable — focusing it auto-shows it — the lyrics pane only while open,
+anything else normalises to content) and ``next_pane_left`` /
+``next_pane_right`` / ``next_pane_cycle`` (the Ctrl+w h / l / w movement
+decisions) — is implemented by the Rust extension
+(``_ytm_player_native.sidebar_visible_for_page`` & co.) when it is built
+and by the pure-Python transcriptions below otherwise. The mixin reads the
+app state, applies the engine's outcomes and does the widget I/O; the
+sidebar message handlers and the playlist CRUD workers in the second half
+of the mixin remain pure mixin concerns (service calls + widget I/O).
+"""
 
 from __future__ import annotations
 
@@ -21,6 +38,149 @@ PANE_CONTENT = "content"
 PANE_LYRICS = "lyrics"
 
 
+# ── Sidebar pane-routing engine ─────────────────────────────────────
+
+
+def sidebar_visible_for_page(per_page: dict[str, bool], page: str, default: bool) -> bool:
+    """The playlist-sidebar visibility stored for *page*.
+
+    The pure half of ``SidebarMixin._is_playlist_sidebar_visible`` (and the
+    read behind the toggle/ensure bookkeeping): an empty *page* (no page
+    mounted yet) reads Library, exactly like the reference's ``page or
+    "library"``. The stored value — or *default* when the page has no
+    entry — is returned raw, so a truthy non-bool stored value (a
+    hand-edited ``session.json``) flows on with its own truthiness, like
+    the mixin's original inline ``.get``.
+    """
+    return per_page.get(page or "library", default)
+
+
+def toggle_sidebar_state(per_page: dict[str, bool], page: str, default: bool) -> dict:
+    """Flip the playlist-sidebar visibility stored for *page*.
+
+    The pure half of ``SidebarMixin._toggle_playlist_sidebar``: an empty
+    *page* means Library; the new state is the negation of the current one
+    (``default`` when the page has no entry) and lands in a fresh copy of
+    *per_page* — inputs are never mutated. Returns ``{"visible": bool,
+    "sidebar_per_page": dict}``.
+    """
+    key = page or "library"
+    new_state = not per_page.get(key, default)
+    fresh = dict(per_page)
+    fresh[key] = new_state
+    return {"visible": new_state, "sidebar_per_page": fresh}
+
+
+def ensure_sidebar_visible(per_page: dict[str, bool], page: str, default: bool) -> dict:
+    """Make the playlist-sidebar entry for *page* visible, if it isn't.
+
+    The pure half of ``SidebarMixin._ensure_playlist_sidebar_visible``:
+    when the current value (*default* for a missing entry) is falsy, a
+    fresh copy of *per_page* gets ``True`` written for the page; otherwise
+    the map is returned unchanged (still a fresh copy, like every engine
+    outcome). Returns ``{"changed": bool, "sidebar_per_page": dict}``.
+    """
+    key = page or "library"
+    if per_page.get(key, default):
+        return {"changed": False, "sidebar_per_page": dict(per_page)}
+    fresh = dict(per_page)
+    fresh[key] = True
+    return {"changed": True, "sidebar_per_page": fresh}
+
+
+def visible_panes(playlist_sidebar_visible: bool, lyrics_open: bool) -> list[str]:
+    """The visible panes in left-to-right order; content is always present."""
+    panes: list[str] = []
+    if playlist_sidebar_visible:
+        panes.append(PANE_PLAYLISTS)
+    panes.append(PANE_CONTENT)
+    if lyrics_open:
+        panes.append(PANE_LYRICS)
+    return panes
+
+
+def pane_of_focused(focused: object) -> str:
+    """The pane the *focused* widget lives in, from its ancestor chain.
+
+    The pure half of ``SidebarMixin._current_pane``: walk the focused
+    widget's parent chain looking for a known pane container
+    (``#playlist-sidebar`` / ``#lyrics-sidebar`` / ``#main-content``) and
+    return its pane. A chain with no known container means content — the
+    ``_active_pane`` hint fallback only applies when nothing is focused,
+    which the mixin handles before calling. Attribute reads are
+    duck-typed (``getattr(node, "id", None)``), so any widget-like object
+    works and a node without the attribute reads as id-less.
+    """
+    node: object = focused
+    while node is not None:
+        node_id = getattr(node, "id", None)
+        if node_id == "playlist-sidebar":
+            return PANE_PLAYLISTS
+        if node_id == "lyrics-sidebar":
+            return PANE_LYRICS
+        if node_id == "main-content":
+            return PANE_CONTENT
+        node = getattr(node, "parent", None)
+    return PANE_CONTENT
+
+
+def pane_focus_target(pane: str, lyrics_open: bool) -> str | None:
+    """Whether *pane* can take keyboard focus, and what to focus.
+
+    The gate behind ``SidebarMixin._focus_pane``: the Playlists pane is
+    always focusable (focusing it auto-shows the sidebar), the lyrics pane
+    only while it is open, and anything else — the content pane or an
+    unknown pane name — normalises to content. Returns None when the pane
+    cannot take focus (lyrics while closed), meaning "no move".
+    """
+    if pane == PANE_PLAYLISTS:
+        return PANE_PLAYLISTS
+    if pane == PANE_LYRICS:
+        return PANE_LYRICS if lyrics_open else None
+    return PANE_CONTENT
+
+
+def next_pane_left(current_pane: str) -> str:
+    """Ctrl+w h — the pane left of *current_pane*.
+
+    Reaching the Playlists sidebar from the content pane auto-shows it
+    (via the focus gate), so left never fails; lyrics steps to content.
+    Any other pane also goes to Playlists, like the reference's else.
+    """
+    if current_pane == PANE_LYRICS:
+        return PANE_CONTENT
+    return PANE_PLAYLISTS
+
+
+def next_pane_right(current_pane: str, lyrics_open: bool) -> str | None:
+    """Ctrl+w l — the pane right of *current_pane*, or None at the edge.
+
+    Playlists steps to content; content enters the lyrics pane only when
+    it is open; lyrics (or an unknown pane) is already at the rightmost
+    reachable position — None means "stay put", and the caller skips the
+    focus move entirely.
+    """
+    if current_pane == PANE_PLAYLISTS:
+        return PANE_CONTENT
+    if current_pane == PANE_CONTENT and lyrics_open:
+        return PANE_LYRICS
+    return None
+
+
+def next_pane_cycle(current_pane: str, playlist_sidebar_visible: bool, lyrics_open: bool) -> str:
+    """Ctrl+w w — the next visible pane after *current_pane*, wrapping.
+
+    The cycle runs through :func:`visible_panes` left-to-right; a
+    *current_pane* that isn't visible (hidden lyrics, an unknown name) is
+    treated as content, so the cycle always has a starting point — content
+    is always in the list.
+    """
+    panes = visible_panes(playlist_sidebar_visible, lyrics_open)
+    current = current_pane if current_pane in panes else PANE_CONTENT
+    idx = panes.index(current)
+    return panes[(idx + 1) % len(panes)]
+
+
 class SidebarMixin(YTMHostBase):
     """Sidebar toggling and playlist sidebar event handlers."""
 
@@ -28,11 +188,11 @@ class SidebarMixin(YTMHostBase):
 
     def _toggle_playlist_sidebar(self) -> None:
         """Toggle the playlist sidebar for the current page."""
-        page = self._current_page or "library"
-        current = self._sidebar_per_page.get(page, self._sidebar_default)
-        new_state = not current
-        self._sidebar_per_page[page] = new_state
-        self._apply_playlist_sidebar(new_state)
+        outcome = toggle_sidebar_state(
+            self._sidebar_per_page, self._current_page, self._sidebar_default
+        )
+        self._sidebar_per_page = outcome["sidebar_per_page"]
+        self._apply_playlist_sidebar(outcome["visible"])
 
     def _toggle_lyrics_sidebar(self) -> None:
         """Toggle the lyrics sidebar globally."""
@@ -121,25 +281,22 @@ class SidebarMixin(YTMHostBase):
 
     def _is_playlist_sidebar_visible(self) -> bool:
         """Whether the Playlists sidebar is shown on the current page."""
-        page = self._current_page or "library"
-        return self._sidebar_per_page.get(page, self._sidebar_default)
+        return sidebar_visible_for_page(
+            self._sidebar_per_page, self._current_page, self._sidebar_default
+        )
 
     def _ensure_playlist_sidebar_visible(self) -> None:
         """Show the Playlists sidebar on the current page if it is hidden."""
-        page = self._current_page or "library"
-        if not self._sidebar_per_page.get(page, self._sidebar_default):
-            self._sidebar_per_page[page] = True
+        outcome = ensure_sidebar_visible(
+            self._sidebar_per_page, self._current_page, self._sidebar_default
+        )
+        self._sidebar_per_page = outcome["sidebar_per_page"]
+        if outcome["changed"]:
             self._apply_playlist_sidebar(True)
 
     def _visible_panes(self) -> list[str]:
         """Visible panes in left-to-right order. Content is always present."""
-        panes: list[str] = []
-        if self._is_playlist_sidebar_visible():
-            panes.append(PANE_PLAYLISTS)
-        panes.append(PANE_CONTENT)
-        if self._lyrics_sidebar_open:
-            panes.append(PANE_LYRICS)
-        return panes
+        return visible_panes(self._is_playlist_sidebar_visible(), self._lyrics_sidebar_open)
 
     def _focus_content_widget(self) -> None:
         """Move Textual focus to the first focusable widget in the content
@@ -184,24 +341,17 @@ class SidebarMixin(YTMHostBase):
             return getattr(self, "_active_pane", PANE_CONTENT)
         if focused is None:
             return getattr(self, "_active_pane", PANE_CONTENT)
-        node = focused
-        while node is not None:
-            node_id = getattr(node, "id", None)
-            if node_id == "playlist-sidebar":
-                return PANE_PLAYLISTS
-            if node_id == "lyrics-sidebar":
-                return PANE_LYRICS
-            if node_id == "main-content":
-                return PANE_CONTENT
-            node = getattr(node, "parent", None)
-        return PANE_CONTENT
+        return pane_of_focused(focused)
 
     def _focus_pane(self, pane: str) -> None:
         """Move keyboard focus to *pane*, updating ``_active_pane`` and the
         focused widget so the move is visibly indicated."""
         from textual.widgets import ListView
 
-        if pane == PANE_PLAYLISTS:
+        target = pane_focus_target(pane, self._lyrics_sidebar_open)
+        if target is None:
+            return
+        if target == PANE_PLAYLISTS:
             # Auto-show the sidebar when focus is requested for it.
             self._ensure_playlist_sidebar_visible()
             self._active_pane = PANE_PLAYLISTS
@@ -212,10 +362,7 @@ class SidebarMixin(YTMHostBase):
                 list_view.focus()
             except Exception:
                 logger.debug("Failed to focus playlist sidebar pane", exc_info=True)
-        elif pane == PANE_LYRICS:
-            # Lyrics are only focusable when the pane is visible.
-            if not self._lyrics_sidebar_open:
-                return
+        elif target == PANE_LYRICS:
             self._active_pane = PANE_LYRICS
             try:
                 self.query_one("#ls-scroll").focus()
@@ -228,28 +375,25 @@ class SidebarMixin(YTMHostBase):
     def _focus_pane_left(self) -> None:
         """Ctrl+w h — move focus left. Reaches the Playlists sidebar from the
         content pane (auto-showing it), and steps lyrics → content."""
-        if self._current_pane() == PANE_LYRICS:
-            self._focus_pane(PANE_CONTENT)
-        else:
-            self._focus_pane(PANE_PLAYLISTS)
+        self._focus_pane(next_pane_left(self._current_pane()))
 
     def _focus_pane_right(self) -> None:
         """Ctrl+w l — move focus right: playlists → content → lyrics. Lyrics
-        is only entered when the lyrics pane is visible."""
-        current = self._current_pane()
-        if current == PANE_PLAYLISTS:
-            self._focus_pane(PANE_CONTENT)
-        elif current == PANE_CONTENT and self._lyrics_sidebar_open:
-            self._focus_pane(PANE_LYRICS)
-        # Already at the rightmost reachable pane — stay put.
+        is only entered when the lyrics pane is visible; at the rightmost
+        reachable pane the engine says None and no move happens."""
+        target = next_pane_right(self._current_pane(), self._lyrics_sidebar_open)
+        if target is not None:
+            self._focus_pane(target)
 
     def _cycle_pane(self) -> None:
         """Ctrl+w w — cycle focus through the visible panes, wrapping."""
-        panes = self._visible_panes()
-        current = self._current_pane()
-        current = current if current in panes else PANE_CONTENT
-        idx = panes.index(current)
-        self._focus_pane(panes[(idx + 1) % len(panes)])
+        self._focus_pane(
+            next_pane_cycle(
+                self._current_pane(),
+                self._is_playlist_sidebar_visible(),
+                self._lyrics_sidebar_open,
+            )
+        )
 
     # ── Sidebar message handlers ─────────────────────────────────────
 
@@ -548,3 +692,52 @@ class SidebarMixin(YTMHostBase):
         except Exception:
             logger.exception("Failed to remove playlist %r", playlist_id)
             self.notify("Failed to remove playlist", severity="error", timeout=3)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same pane-routing engines; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ensure_sidebar_visible as _native_ensure_sidebar_visible,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        next_pane_cycle as _native_next_pane_cycle,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        next_pane_left as _native_next_pane_left,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        next_pane_right as _native_next_pane_right,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        pane_focus_target as _native_pane_focus_target,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        pane_of_focused as _native_pane_of_focused,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        sidebar_visible_for_page as _native_sidebar_visible_for_page,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        toggle_sidebar_state as _native_toggle_sidebar_state,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        visible_panes as _native_visible_panes,
+    )
+except ImportError:
+    pass
+else:
+    sidebar_visible_for_page = _native_sidebar_visible_for_page  # type: ignore[assignment]
+    toggle_sidebar_state = _native_toggle_sidebar_state  # type: ignore[assignment]
+    ensure_sidebar_visible = _native_ensure_sidebar_visible  # type: ignore[assignment]
+    visible_panes = _native_visible_panes  # type: ignore[assignment]
+    pane_of_focused = _native_pane_of_focused  # type: ignore[assignment]
+    pane_focus_target = _native_pane_focus_target  # type: ignore[assignment]
+    next_pane_left = _native_next_pane_left  # type: ignore[assignment]
+    next_pane_right = _native_next_pane_right  # type: ignore[assignment]
+    next_pane_cycle = _native_next_pane_cycle  # type: ignore[assignment]
