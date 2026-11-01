@@ -10,11 +10,14 @@ duration chain). ``_listened_delta`` is the engine behind
 coercion of the stored cell, the no-write gate and the delta.
 ``_stats_payload`` is the engine behind ``HistoryManager.get_stats``:
 the five-key aggregate dict assembled from the three scalar aggregates
-and the two top lists, in the JSON consumers' key order. The
-pure-Python transcriptions live in ``services/history.py``; when the
-Rust extension is built the same engines run natively
-(``_ytm_player_native.play_log_row`` / ``listened_delta`` /
-``stats_payload``).
+and the two top lists, in the JSON consumers' key order.
+``_row_dicts`` is the engine behind every history read — the five
+getters' and the CLI's ``_query_history``'s ``[dict(row) for row in
+rows]`` materialisation, each fetched row converted through the
+``dict`` constructor. The pure-Python transcriptions live in
+``services/history.py``; when the Rust extension is built the same
+engines run natively (``_ytm_player_native.play_log_row`` /
+``listened_delta`` / ``stats_payload`` / ``row_dicts``).
 
 The unit tests below assert the engines' contract on whichever backend
 is loaded. When the extension is built, the parity tests additionally
@@ -27,12 +30,18 @@ identically — so the two implementations cannot drift apart.
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 
 import pytest
 
-from ytm_player.services.history import _listened_delta, _play_log_row, _stats_payload
+from ytm_player.services.history import (
+    _listened_delta,
+    _play_log_row,
+    _row_dicts,
+    _stats_payload,
+)
 
 try:
     from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
@@ -390,6 +399,156 @@ class TestStatsPayload:
         assert top_artists == [{"artist": "A"}]
 
 
+class TestRowDicts:
+    """The row materialisation behind every history read."""
+
+    def _fetch_rows(self, columns: list[str], data: list[tuple]) -> list[sqlite3.Row]:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"CREATE TABLE t ({', '.join(columns)})")
+        conn.executemany(
+            f"INSERT INTO t VALUES ({', '.join('?' * len(columns))})",
+            data,
+        )
+        return conn.execute("SELECT * FROM t").fetchall()
+
+    def test_sqlite_rows_become_plain_dicts(self):
+        rows = self._fetch_rows(
+            ["video_id", "title", "played_at"],
+            [("v1", "T1", "2026-01-01"), ("v2", "T2", None)],
+        )
+        out = _row_dicts(rows)
+        assert out == [
+            {"video_id": "v1", "title": "T1", "played_at": "2026-01-01"},
+            {"video_id": "v2", "title": "T2", "played_at": None},
+        ]
+        for item in out:
+            assert type(item) is dict  # plain dicts, never sqlite3.Row
+
+    def test_column_order_is_the_json_output_order(self):
+        # The dicts' key order is the SELECT's column order — the key
+        # order the JSON consumers' output preserves. It must never
+        # silently reorder.
+        rows = self._fetch_rows(["c", "a", "b"], [(1, 2, 3)])
+        out = _row_dicts(rows)
+        assert list(out[0]) == ["c", "a", "b"]
+
+    def test_result_is_a_list(self):
+        assert type(_row_dicts([])) is list
+
+    def test_empty_rows(self):
+        assert _row_dicts([]) == []
+
+    def test_dict_rows_are_copied_not_passed_through(self):
+        rows = [{"a": 1}]
+        out = _row_dicts(rows)
+        assert out[0] == rows[0]
+        assert out[0] is not rows[0]  # copied, never the same object
+        assert type(out[0]) is dict  # a dict subclass row flattens to a dict
+
+    def test_dict_subclass_rows_are_copied_from_internal_storage(self):
+        # CPython's dict() fast path copies a dict subclass that only
+        # overrides keys() wholesale from its internal storage — the
+        # override does not steer the conversion until __iter__ is
+        # overridden too, which drops the row onto the mapping-protocol
+        # path. Both shapes behave identically on both backends.
+        class KeysOverride(dict):
+            def keys(self):
+                return ["renamed"]
+
+        class KeysAndIterOverride(dict):
+            def keys(self):
+                return ["renamed"]
+
+            def __iter__(self):
+                return iter(["renamed"])
+
+        rows = [KeysOverride({"renamed": 7, "ignored": 8})]
+        assert _row_dicts(rows) == [{"renamed": 7, "ignored": 8}]
+        rows = [KeysAndIterOverride({"renamed": 7, "ignored": 8})]
+        assert _row_dicts(rows) == [{"renamed": 7}]
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        rows = [{"bigint": 10**30, "flag": True, "f": 2.5, "none": None, "s": "ü"}]
+        out = _row_dicts(rows)
+        item = out[0]
+        assert item["bigint"] == 10**30
+        assert type(item["bigint"]) is int  # bigint, never truncated
+        assert item["flag"] is True  # the bool object, never 1
+        assert type(item["f"]) is float
+        assert item["none"] is None
+        assert item["s"] == "ü"
+
+    def test_duck_typed_keys_row(self):
+        class RowDuck:
+            def keys(self):
+                return ["x", "y"]
+
+            def __getitem__(self, key):
+                return key.upper()
+
+        assert _row_dicts([RowDuck()]) == [{"x": "X", "y": "Y"}]
+
+    def test_pair_iterable_rows(self):
+        assert _row_dicts([[("a", 1), ("b", 2)]]) == [{"a": 1, "b": 2}]
+
+    def test_duplicate_pair_keys_last_wins(self):
+        assert _row_dicts([[("a", 1), ("a", 2)]]) == [{"a": 2}]
+
+    def test_generator_input_is_consumed(self):
+        rows = iter([{"a": 1}, {"a": 2}])
+        assert _row_dicts(rows) == [{"a": 1}, {"a": 2}]
+
+    def test_fresh_list_and_fresh_dicts_every_call(self):
+        rows = [{"a": 1}]
+        first = _row_dicts(rows)
+        second = _row_dicts(rows)
+        assert first is not second
+        assert first == second
+        assert first[0] is not second[0]
+
+    def test_non_convertible_row_raises_typeerror(self):
+        # dict(5) — no keys method, not iterable — CPython's own message.
+        with pytest.raises(TypeError, match=r"'int' object is not iterable"):
+            _row_dicts([5])
+
+    def test_non_iterable_rows_raises_typeerror(self):
+        # iter(5) — the comprehension's own iteration error.
+        with pytest.raises(TypeError, match=r"'int' object is not iterable"):
+            _row_dicts(5)
+
+    def test_iter_error_keeps_its_own_error(self):
+        class BadIter:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _row_dicts(BadIter())
+
+    def test_keys_attribute_not_callable_raises_typeerror(self):
+        class KeysNotCallable:
+            keys = 5
+
+        with pytest.raises(TypeError, match=r"'int' object is not callable"):
+            _row_dicts([KeysNotCallable()])
+
+    def test_unhashable_duck_key_raises_typeerror(self):
+        class UnhashableKeys:
+            def keys(self):
+                return [["nested"]]
+
+            def __getitem__(self, key):
+                return 1
+
+        with pytest.raises(TypeError, match="unhashable type"):
+            _row_dicts([UnhashableKeys()])
+
+    def test_input_rows_never_mutated(self):
+        rows = [{"a": 1}, [("b", 2)]]
+        _row_dicts(rows)
+        assert rows == [{"a": 1}, [("b", 2)]]
+
+
 # ── Native vs fallback parity ──────────────────────────────────────────
 # The matrices below are shared with the child interpreter as JSON, so
 # every value must be JSON-round-trippable: plain dict tracks, JSON
@@ -570,6 +729,109 @@ _STATS_PARITY_CASES = [
     (12, 3450, 7, ["nested", {"a": 1}], [None]),  # the lists pass through verbatim
 ]
 
+# Row-materialisation cases: the same spec grammar both processes build
+# identically (the "sql" kind reconstructs the production shape — an
+# sqlite3.Row list — from an in-memory table).
+_ROWS_PARITY_CASES = [
+    # The production shape: sqlite3.Row lists.
+    {
+        "t": "sql",
+        "columns": ["video_id", "title", "played_at"],
+        "data": [["v1", "T1", "2026-01-01"], ["v2", "T2", None]],
+    },
+    {"t": "sql", "columns": ["a", "b"], "data": [[1.5, 1], [0, 0]]},
+    {"t": "sql", "columns": ["s"], "data": [["ü"], [""], [None]]},
+    {"t": "sql", "columns": ["a"], "data": []},  # an empty fetch
+    # Dict rows (copied) with the JSON-transportable value zoo.
+    {"t": "list", "items": []},
+    {"t": "list", "items": [{"a": 1}, {"a": 2}]},
+    {"t": "list", "items": [{"bigint": 10**30, "f": 2.5, "none": None, "flag": True}]},
+    # A mixed list: a dict row, a pair-list row, then a non-convertible one.
+    {"t": "list", "items": [{"a": 1}, [["b", 2]], 5]},
+    # A string row: iterable of characters, each not a pair.
+    {"t": "list", "items": ["ab"]},
+    # Duck-typed rows through the mapping protocol.
+    {"t": "duck", "items": [{"x": 1, "y": 2}]},
+    {"t": "duck", "items": [{"bigint": 10**30, "f": 2.5}]},
+    # Rows that are lists of pairs, duplicate keys last-wins.
+    {"t": "pairs", "items": [[["a", 1], ["b", 2]], [["a", 1], ["a", 2]]]},
+    # A generator input.
+    {"t": "gen", "items": [{"a": 1}, {"b": 2}]},
+    {"t": "gen", "items": []},
+    # Error shapes: non-iterable rows input, non-convertible rows,
+    # unhashable duck keys, a raising keys(), a non-callable keys attr.
+    {"t": "int"},
+    {"t": "list", "items": [1, 2]},
+    {"t": "unhashable"},
+    {"t": "raising_keys"},
+    {"t": "keys_not_callable"},
+]
+
+
+class RowDuck:
+    """A row-shaped object steering ``dict()`` through the mapping
+    protocol — its ``keys()`` decides what the materialised dict reads."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def keys(self) -> list:
+        return list(self._data)
+
+    def __getitem__(self, key: str) -> object:
+        return self._data[key]
+
+
+def _build_rows(spec: dict) -> object:
+    """Build the parity-matrix row shapes, identically in both processes."""
+    kind = spec["t"]
+    if kind == "sql":
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"CREATE TABLE t ({', '.join(spec['columns'])})")
+        conn.executemany(
+            f"INSERT INTO t VALUES ({', '.join('?' * len(spec['columns']))})",
+            [tuple(row) for row in spec["data"]],
+        )
+        return conn.execute("SELECT * FROM t").fetchall()
+    if kind == "list":
+        return spec["items"]
+    if kind == "duck":
+        return [RowDuck(d) for d in spec["items"]]
+    if kind == "pairs":
+        return [[tuple(pair) for pair in row] for row in spec["items"]]
+    if kind == "gen":
+        return iter(spec["items"])
+    if kind == "int":
+        return 5
+    if kind == "unhashable":
+
+        class UnhashableKeys:
+            def keys(self):
+                return [["nested"]]
+
+            def __getitem__(self, key):
+                return 1
+
+        return [UnhashableKeys()]
+    if kind == "raising_keys":
+
+        class RaisingKeys:
+            def keys(self):
+                raise RuntimeError("boom")
+
+            def __getitem__(self, key):
+                return 1
+
+        return [RaisingKeys()]
+    if kind == "keys_not_callable":
+
+        class KeysNotCallable:
+            keys = 5
+
+        return [KeysNotCallable()]
+    raise AssertionError(kind)
+
 
 def _build_track(spec: dict) -> object:
     """Build the parity-matrix track shapes, identically in both processes."""
@@ -607,11 +869,17 @@ def _outcome(fn: object, *args: object) -> dict:
 # stdin and prints the reference engines' outcomes as JSON.
 _CHILD_PROG = """
 import json
+import sqlite3
 import sys
 
 sys.modules['ytm_player.utils._ytm_player_native'] = None
 
-from ytm_player.services.history import _listened_delta, _play_log_row, _stats_payload
+from ytm_player.services.history import (
+    _listened_delta,
+    _play_log_row,
+    _row_dicts,
+    _stats_payload,
+)
 
 
 class DuckGet:
@@ -635,6 +903,17 @@ class GetOverride(dict):
         return "OV"
 
 
+class RowDuck:
+    def __init__(self, data):
+        self._data = data
+
+    def keys(self):
+        return list(self._data)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+
 def build_track(spec):
     kind = spec["t"]
     if kind == "dict":
@@ -652,6 +931,53 @@ def build_track(spec):
     raise AssertionError(kind)
 
 
+def build_rows(spec):
+    kind = spec["t"]
+    if kind == "sql":
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"CREATE TABLE t ({', '.join(spec['columns'])})")
+        conn.executemany(
+            f"INSERT INTO t VALUES ({', '.join('?' * len(spec['columns']))})",
+            [tuple(row) for row in spec["data"]],
+        )
+        return conn.execute("SELECT * FROM t").fetchall()
+    if kind == "list":
+        return spec["items"]
+    if kind == "duck":
+        return [RowDuck(d) for d in spec["items"]]
+    if kind == "pairs":
+        return [[tuple(pair) for pair in row] for row in spec["items"]]
+    if kind == "gen":
+        return iter(spec["items"])
+    if kind == "int":
+        return 5
+    if kind == "unhashable":
+        class UnhashableKeys:
+            def keys(self):
+                return [["nested"]]
+
+            def __getitem__(self, key):
+                return 1
+
+        return [UnhashableKeys()]
+    if kind == "raising_keys":
+        class RaisingKeys:
+            def keys(self):
+                raise RuntimeError("boom")
+
+            def __getitem__(self, key):
+                return 1
+
+        return [RaisingKeys()]
+    if kind == "keys_not_callable":
+        class KeysNotCallable:
+            keys = 5
+
+        return [KeysNotCallable()]
+    raise AssertionError(kind)
+
+
 def outcome(fn, *args):
     try:
         return {"ok": fn(*args)}
@@ -666,7 +992,11 @@ rows = [
 ]
 deltas = [outcome(_listened_delta, old, listened) for old, listened in payload["deltas"]]
 stats = [outcome(_stats_payload, *case) for case in payload["stats"]]
-json.dump({"rows": rows, "deltas": deltas, "stats": stats}, sys.stdout)
+row_dicts = [outcome(_row_dicts, build_rows(spec)) for spec in payload["row_dicts"]]
+json.dump(
+    {"rows": rows, "deltas": deltas, "stats": stats, "row_dicts": row_dicts},
+    sys.stdout,
+)
 """
 
 
@@ -674,7 +1004,12 @@ def _fallback_outcomes() -> dict:
     """Run the pure-Python reference engines over the parity cases in a
     child interpreter with the native extension import blocked."""
     payload = json.dumps(
-        {"rows": _PLAY_PARITY_CASES, "deltas": _DELTA_PARITY_CASES, "stats": _STATS_PARITY_CASES}
+        {
+            "rows": _PLAY_PARITY_CASES,
+            "deltas": _DELTA_PARITY_CASES,
+            "stats": _STATS_PARITY_CASES,
+            "row_dicts": _ROWS_PARITY_CASES,
+        }
     )
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
@@ -693,7 +1028,8 @@ def _native_outcomes() -> dict:
     ]
     deltas = [_outcome(_listened_delta, old, listened) for old, listened in _DELTA_PARITY_CASES]
     stats = [_outcome(_stats_payload, *case) for case in _STATS_PARITY_CASES]
-    return {"rows": rows, "deltas": deltas, "stats": stats}
+    row_dicts = [_outcome(_row_dicts, _build_rows(spec)) for spec in _ROWS_PARITY_CASES]
+    return {"rows": rows, "deltas": deltas, "stats": stats, "row_dicts": row_dicts}
 
 
 class TestNativeParity:
@@ -744,3 +1080,26 @@ class TestNativeParity:
                 f"native:   {list(n['ok'])!r}\n"
                 f"fallback: {list(f['ok'])!r}"
             )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_row_dicts_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(_ROWS_PARITY_CASES, native["row_dicts"], fallback["row_dicts"]):
+            assert n == f, (
+                f"native and fallback row-dict outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # Key order is part of the contract (the JSON consumers'
+        # output preserves the SELECT's column order) — compare the
+        # materialised dicts' key lists too, which pins the order.
+        for n, f in zip(native["row_dicts"], fallback["row_dicts"]):
+            if "ok" in n and "ok" in f:
+                native_keys = [list(d) for d in n["ok"]]
+                fallback_keys = [list(d) for d in f["ok"]]
+                assert native_keys == fallback_keys, (
+                    f"native and fallback row-dict key orders differ:\n"
+                    f"native:   {native_keys!r}\n"
+                    f"fallback: {fallback_keys!r}"
+                )

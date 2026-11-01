@@ -39,6 +39,7 @@ from ytm_player.config.paths import (
 from ytm_player.config.settings import get_settings
 from ytm_player.ipc import get_running_pid, ipc_request, is_tui_running, try_claim_pid
 from ytm_player.services.auth import AuthManager
+from ytm_player.services.history import _row_dicts
 from ytm_player.utils.logging import install_excepthooks, setup_logging
 
 # ---------------------------------------------------------------------------
@@ -86,7 +87,10 @@ def _query_history(query: str, limit: int, error_label: str) -> list[dict]:
     """Run a parameterised history query, returning rows as dicts.
 
     Returns an empty list when the database file doesn't exist yet; exits
-    via ``_error`` (labelled *error_label*) on any SQLite failure.
+    via ``_error`` (labelled *error_label*) on any SQLite failure. The
+    row materialisation is resolved by the ``_row_dicts`` engine
+    (native when the Rust extension is built, the pure-Python
+    transcription otherwise); this helper performs the query.
     """
     if not HISTORY_DB.exists():
         return []
@@ -94,7 +98,7 @@ def _query_history(query: str, limit: int, error_label: str) -> list[dict]:
         with sqlite3.connect(str(HISTORY_DB)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, (limit,)).fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
     except sqlite3.Error as exc:
         _error(f"Failed to read {error_label} database: {exc}")
 

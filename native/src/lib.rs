@@ -272,6 +272,25 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // HistoryManager.get_stats from the three scalar aggregates and
     // the two top lists.
     module.add_function(pyo3::wrap_pyfunction!(stats_payload, module)?)?;
+
+    // History-read row materialisation (ytm_player/services/history.py
+    // and cli.py equivalents): the [dict(row) for row in rows]
+    // comprehension behind every history read — the getters'
+    // fetchall() lists and the CLI's _query_history alike — converted
+    // through CPython's own dict constructor.
+    module.add_function(pyo3::wrap_pyfunction!(row_dicts, module)?)?;
+
+    // CLI stats aggregation payload (cli.py equivalent): the four-key
+    // listening-stats dict assembled behind the standalone `ytm stats`
+    // command, with the top-tracks list rebuilt from its row tuples'
+    // first four fields.
+    module.add_function(pyo3::wrap_pyfunction!(cli_stats_payload, module)?)?;
+
+    // IPC dispatch engine (app/_ipc.py _handle_ipc_command equivalent):
+    // the dispatch-table walk behind the CLI-shells command router —
+    // which branch of the match handles each command string, and the
+    // rating the like/dislike/unlike branches rate with.
+    module.add_function(pyo3::wrap_pyfunction!(ipc_dispatch_route, module)?)?;
     Ok(())
 }
 
@@ -5856,4 +5875,143 @@ fn stats_payload<'py>(
     out.set_item("top_artists", top_artists)
         .expect("dict insertion with a str key cannot fail");
     out
+}
+
+/// The row materialisation behind every history read — the
+/// `[dict(row) for row in rows]` list comprehension the history
+/// getters (and the CLI's `_query_history`) each ran inline.
+///
+/// Mirrors the pure-Python reference (`_row_dicts`): *rows* is walked
+/// through Python's iteration protocol (a non-iterable raises
+/// CPython's own `TypeError`; an `__iter__` that itself raises keeps
+/// its own error) and each yielded row is converted through CPython's
+/// own `dict` constructor — fetched from `builtins` and called with
+/// the row as its single argument, so every acceptance shape and every
+/// rejection message comes free: an exact dict is copied, anything
+/// with a `keys` method is read through the mapping protocol
+/// (`sqlite3.Row` — the production shape — and duck-typed rows
+/// alike, a `keys`/`__getitem__` override on a dict subclass
+/// steering the conversion), any other iterable is consumed as
+/// key/value pairs, and everything else raises the constructor's own
+/// `TypeError`. The result is a fresh list of fresh dicts — the input
+/// rows are never mutated, and a dict row is copied, never passed
+/// through by identity.
+#[pyfunction]
+#[pyo3(signature = (rows))]
+fn row_dicts<'py>(py: Python<'py>, rows: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
+    // dict(row) — CPython's own constructor, fetched from builtins at
+    // call time exactly like the comprehension's global lookup, so the
+    // conversion semantics (mapping protocol, pair iteration, dict
+    // copy, and every TypeError message) are the interpreter's own.
+    let dict_ctor = PyModule::import(py, "builtins")?.getattr("dict")?;
+    let out = PyList::empty(py);
+    for row in rows.try_iter()? {
+        let converted = dict_ctor.call1((row?,))?;
+        // dict(...) always returns an exact dict, never a subclass.
+        out.append(converted)?;
+    }
+    Ok(out)
+}
+
+/// The aggregate listening-stats payload behind the CLI's standalone
+/// `ytm stats` command — the pure core of the stats read in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cli_stats_payload`): the
+/// four-key dict assembled from the three scalar aggregates and the
+/// top-tracks list, in the reference's insertion order (the key order
+/// the JSON output preserves — `total_plays`, `total_seconds`,
+/// `unique_tracks`, `top_tracks`). The three scalars pass through as
+/// the objects they are — the counts straight from the SQLite
+/// `fetchone()` cells. The top-tracks list is rebuilt by walking
+/// *top_tracks* through Python's iteration protocol and reading each
+/// row's first four fields through `r[0]` … `r[3]` subscript semantics
+/// (`PyObject_GetItem`, exactly what the comprehension's
+/// `BINARY_SUBSCR` compiles to): a tuple row yields `IndexError` when
+/// shorter than four, a dict row `KeyError` on the int key, a
+/// duck-typed `__getitem__` row steers both backends identically, and
+/// a longer row's extras are simply never read — each row becoming a
+/// fresh `{"video_id", "title", "artist", "play_count"}` map in that
+/// order. The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (total_plays, total_seconds, unique_tracks, top_tracks))]
+fn cli_stats_payload<'py>(
+    py: Python<'py>,
+    total_plays: &Bound<'py, PyAny>,
+    total_seconds: &Bound<'py, PyAny>,
+    unique_tracks: &Bound<'py, PyAny>,
+    top_tracks: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // Only str keys are inserted — always hashable, so the store cannot
+    // fail; each scalar is stored as the object it is, never coerced.
+    out.set_item("total_plays", total_plays)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("total_seconds", total_seconds)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("unique_tracks", unique_tracks)
+        .expect("dict insertion with a str key cannot fail");
+    // [{"video_id": r[0], "title": r[1], "artist": r[2],
+    //   "play_count": r[3]} for r in top_tracks]
+    let items = PyList::empty(py);
+    for row in top_tracks.try_iter()? {
+        let row = row?;
+        let item = PyDict::new(py);
+        for (key, index) in [
+            ("video_id", 0usize),
+            ("title", 1usize),
+            ("artist", 2usize),
+            ("play_count", 3usize),
+        ] {
+            // r[index] — PyObject_GetItem: IndexError on a short
+            // sequence, KeyError(0) on a dict row, whatever a
+            // duck-typed __getitem__ decides.
+            item.set_item(key, row.get_item(index)?)?;
+        }
+        items.append(item)?;
+    }
+    out.set_item("top_tracks", items)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The dispatch table behind `IPCMixin._handle_ipc_command` from
+/// `app/_ipc.py` — which branch of the match handles each IPC command
+/// string, and the rating the like/dislike/unlike branches rate with.
+///
+/// Mirrors the pure-Python reference (`_ipc_dispatch_route`): each row
+/// of *table* is compared in order with Python `==` (subject on the
+/// left — exactly like the reference `match`'s lazily evaluated
+/// literal value patterns, which compile to `command == literal`
+/// comparisons, first equal match wins) and anything no row claims is
+/// unknown. *table* is the module's own ordered
+/// `(command, branch, rating)` tuple in production; a stub table
+/// drives the walk identically, with row unpacking raising CPython's
+/// own for-loop errors (`ValueError` for wrong-length rows, the
+/// `cannot unpack non-iterable …` `TypeError` rewrite only for a type
+/// with no iteration support at all). The outcome map carries
+/// `{"branch": str, "rating": str | None}` — fresh in every field,
+/// with the matched row's branch/rating objects passed through
+/// unchanged — and neither *command* nor *table* is mutated.
+#[pyfunction]
+#[pyo3(signature = (command, table))]
+fn ipc_dispatch_route<'py>(
+    py: Python<'py>,
+    command: &Bound<'py, PyAny>,
+    table: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    for row in table.try_iter()? {
+        let (member, branch, rating) = unpack_dispatch_row(&row?)?;
+        // command == member — subject on the left, exactly like the
+        // reference match's compiled value patterns.
+        if command.eq(&member)? {
+            let out = PyDict::new(py);
+            out.set_item("branch", branch)?;
+            out.set_item("rating", rating)?;
+            return Ok(out);
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("branch", "unknown")?;
+    out.set_item("rating", py.None())?;
+    Ok(out)
 }

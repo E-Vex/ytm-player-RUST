@@ -1,14 +1,17 @@
 """Play and search history tracking using async SQLite.
 
-The three pure cores of the play-history surface are dual-implemented:
+The four pure cores of the play-history surface are dual-implemented:
 ``_play_log_row`` (the skip gate and insert-row assembly behind
 ``log_play``), ``_listened_delta`` (the stored-vs-new
-listened-seconds decision behind ``update_play_listened_seconds``)
-and ``_stats_payload`` (the aggregate payload assembly behind
-``get_stats``) are implemented by the Rust extension
+listened-seconds decision behind ``update_play_listened_seconds``),
+``_stats_payload`` (the aggregate payload assembly behind
+``get_stats``) and ``_row_dicts`` (the row materialisation behind
+every history read — the getters' ``fetchall()`` lists and the CLI's
+``_query_history`` alike) are implemented by the Rust extension
 (``_ytm_player_native.play_log_row`` /
 ``_ytm_player_native.listened_delta`` /
-``_ytm_player_native.stats_payload``) when it is built and by the
+``_ytm_player_native.stats_payload`` /
+``_ytm_player_native.row_dicts``) when it is built and by the
 pure-Python transcriptions below otherwise; the manager's methods only
 perform the reads and writes around them.
 """
@@ -158,6 +161,27 @@ def _stats_payload(
     }
 
 
+def _row_dicts(rows: Any) -> list[dict]:
+    """The row materialisation every history read returns — rows as dicts.
+
+    The pure half of the five getters (``get_search_history``,
+    ``get_play_history``, ``get_recently_played``, ``get_top_tracks``
+    and ``get_top_artists``) and of the CLI's ``_query_history``:
+    ``[dict(row) for row in rows]``, each fetched row converted
+    through the ``dict`` constructor. An ``sqlite3.Row`` (the
+    production shape, both backends) reads through its ``keys()``
+    mapping protocol into a plain dict; a dict row is copied; anything
+    else the constructor accepts works too, and anything it rejects
+    raises its own ``TypeError``. The result is a fresh list of fresh
+    dicts; the input rows are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.row_dicts``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return [dict(row) for row in rows]
+
+
 class HistoryManager:
     """Manages play and search history in a local SQLite database."""
 
@@ -262,7 +286,13 @@ class HistoryManager:
             raise RuntimeError(f"Failed to write to history database: {exc}") from exc
 
     async def get_search_history(self, limit: int = 50) -> list[dict]:
-        """Return recent searches ordered by last_searched descending."""
+        """Return recent searches ordered by last_searched descending.
+
+        The row materialisation is resolved by the ``_row_dicts``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute(
@@ -276,7 +306,7 @@ class HistoryManager:
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
 
     async def get_search_suggestions(self, prefix: str, limit: int = 10) -> list[str]:
         """Return matching query strings for autocomplete."""
@@ -422,7 +452,13 @@ class HistoryManager:
             raise RuntimeError(f"Failed to write to history database: {exc}") from exc
 
     async def get_play_history(self, limit: int = 100) -> list[dict]:
-        """Return play history ordered by most recent first."""
+        """Return play history ordered by most recent first.
+
+        The row materialisation is resolved by the ``_row_dicts``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute(
@@ -436,7 +472,7 @@ class HistoryManager:
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
 
     async def get_recently_played(self, limit: int = 50) -> list[dict]:
         """Return recently-played tracks, deduplicated by video_id.
@@ -445,6 +481,11 @@ class HistoryManager:
         exactly one min/max aggregate, SQLite documents that bare columns
         take their values from the max row — i.e. each video's MOST RECENT
         play. Not portable SQL, but this app is SQLite-only.
+
+        The row materialisation is resolved by the ``_row_dicts``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
         """
         if self._db is None:
             raise RuntimeError("Database not initialized")
@@ -460,7 +501,7 @@ class HistoryManager:
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
 
     async def get_played_video_ids(self) -> set[str]:
         """Return the set of video_ids ever played locally.
@@ -515,7 +556,13 @@ class HistoryManager:
         )
 
     async def get_top_tracks(self, limit: int = 10) -> list[dict]:
-        """Return the most-played tracks."""
+        """Return the most-played tracks.
+
+        The row materialisation is resolved by the ``_row_dicts``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute(
@@ -529,10 +576,16 @@ class HistoryManager:
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
 
     async def get_top_artists(self, limit: int = 10) -> list[dict]:
-        """Return the most-played artists ranked by total play count."""
+        """Return the most-played artists ranked by total play count.
+
+        The row materialisation is resolved by the ``_row_dicts``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute(
@@ -549,7 +602,7 @@ class HistoryManager:
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return _row_dicts(rows)
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
@@ -566,6 +619,9 @@ try:
         play_log_row as _native_play_log_row,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        row_dicts as _native_row_dicts,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         stats_payload as _native_stats_payload,
     )
 except ImportError:
@@ -574,3 +630,4 @@ else:
     _play_log_row = _native_play_log_row  # type: ignore[assignment]
     _listened_delta = _native_listened_delta  # type: ignore[assignment]
     _stats_payload = _native_stats_payload  # type: ignore[assignment]
+    _row_dicts = _native_row_dicts  # type: ignore[assignment]
