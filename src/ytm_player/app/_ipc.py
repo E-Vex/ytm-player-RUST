@@ -1,13 +1,17 @@
 """IPC command handling mixin for YTMPlayerApp.
 
-The dispatch table — which branch of ``_handle_ipc_command``'s match
-handles each IPC command string, and the rating the
-like/dislike/unlike branches rate with — is split out of the mixin:
-the pure engine (``_ipc_dispatch_route``) is implemented by the Rust
-extension (``_ytm_player_native.ipc_dispatch_route``) when it is built
-and by the pure-Python transcription below otherwise. The mixin
-resolves the route and performs the branch's calls; the awaited
-handler calls remain pure mixin concerns.
+Two pure engines are split out of the mixin. The dispatch table —
+which branch of ``_handle_ipc_command``'s match handles each IPC
+command string, and the rating the like/dislike/unlike branches rate
+with — is ``_ipc_dispatch_route``; the seek-offset parser — the
+classification of ``args["offset"]`` into relative/clock/absolute
+seconds with its missing/invalid verdicts — is ``_ipc_seek_offset``.
+Both are implemented by the Rust extension
+(``_ytm_player_native.ipc_dispatch_route`` /
+``_ytm_player_native.ipc_seek_offset``) when it is built and by the
+pure-Python transcriptions below otherwise. The mixin resolves the
+routes and performs the branches' calls; the awaited handler calls
+remain pure mixin concerns.
 """
 
 from __future__ import annotations
@@ -69,6 +73,58 @@ def _ipc_dispatch_route(
         if command == member:
             return {"branch": branch, "rating": rating}
     return {"branch": "unknown", "rating": None}
+
+
+def _ipc_seek_offset(offset: Any) -> dict[str, Any]:
+    """The seek-offset parser behind ``IPCMixin._ipc_seek``.
+
+    The pure half of the seek command: classifying the offset value
+    (whatever ``args.get("offset", "")`` returned) and computing the
+    seconds it names. A falsy value (the missing key's ``""`` default,
+    ``None``, ``0``, every empty container) is missing — gated before
+    any attribute is touched. A value starting with ``+`` or ``-`` (two
+    ``startswith`` calls, short-circuited) is relative and parsed with
+    ``float()``; a value containing ``:`` is a clock — split on ``:``
+    and parsed as ``mm:ss`` (2 parts) or ``hh:mm:ss`` (3 parts) with
+    ``int()`` parts combined by the reference's ``*``/``+`` arithmetic
+    — and everything else is absolute seconds parsed with ``float()``.
+    A ``ValueError`` from the numeric parses maps to the matching
+    invalid verdict; every other error keeps its own shape and
+    propagates (a non-str value's ``AttributeError`` from
+    ``startswith``, a bytes value's ``TypeError``, the ``OverflowError``
+    from ``float(total)`` on a clock too large for one).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ipc_seek_offset``) when it is built; this
+    pure-Python transcription is the fallback otherwise. Returns a
+    fresh ``{"kind": str, …}`` map — ``"missing"``,
+    ``"relative"``/``"clock"``/``"absolute"`` with the parsed
+    ``seconds`` float, or ``"invalid_offset"``/``"invalid_time"``
+    carrying the raw ``offset`` — and never mutates *offset*.
+    """
+    if not offset:
+        return {"kind": "missing"}
+    if offset.startswith("+") or offset.startswith("-"):
+        try:
+            return {"kind": "relative", "seconds": float(offset)}
+        except ValueError:
+            return {"kind": "invalid_offset", "offset": offset}
+    if ":" in offset:
+        parts = offset.split(":")
+        try:
+            if len(parts) == 2:
+                total = int(parts[0]) * 60 + int(parts[1])
+            elif len(parts) == 3:
+                total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            else:
+                return {"kind": "invalid_time", "offset": offset}
+        except ValueError:
+            return {"kind": "invalid_time", "offset": offset}
+        return {"kind": "clock", "seconds": float(total)}
+    try:
+        return {"kind": "absolute", "seconds": float(offset)}
+    except ValueError:
+        return {"kind": "invalid_offset", "offset": offset}
 
 
 class IPCMixin(YTMHostBase):
@@ -157,39 +213,30 @@ class IPCMixin(YTMHostBase):
         return {"ok": False, "error": result}
 
     async def _ipc_seek(self, args: dict) -> dict:
-        """Handle seek IPC command. Accepts relative (+10, -10) or absolute (1:30)."""
+        """Handle seek IPC command. Accepts relative (+10, -10) or absolute (1:30).
+
+        The offset parse — the classification of ``args["offset"]``
+        into relative/clock/absolute seconds with its missing/invalid
+        verdicts — is resolved by the ``_ipc_seek_offset`` engine above
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise); this method performs the seek calls
+        the parsed kind names and builds the response messages.
+        """
         if not self.player:
             return {"ok": False, "error": "player not ready"}
 
-        offset_str = args.get("offset", "")
-        if not offset_str:
-            return {"ok": False, "error": "missing offset"}
-
-        if offset_str.startswith("+") or offset_str.startswith("-"):
-            try:
-                seconds = float(offset_str)
-            except ValueError:
-                return {"ok": False, "error": f"invalid offset: {offset_str}"}
-            await self.player.seek(seconds)
-        elif ":" in offset_str:
-            parts = offset_str.split(":")
-            try:
-                if len(parts) == 2:
-                    total = int(parts[0]) * 60 + int(parts[1])
-                elif len(parts) == 3:
-                    total = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                else:
-                    return {"ok": False, "error": f"invalid time format: {offset_str}"}
-            except ValueError:
-                return {"ok": False, "error": f"invalid time format: {offset_str}"}
-            await self.player.seek_absolute(float(total))
-        else:
-            try:
-                seconds = float(offset_str)
-            except ValueError:
-                return {"ok": False, "error": f"invalid offset: {offset_str}"}
-            await self.player.seek_absolute(seconds)
-
+        route = _ipc_seek_offset(args.get("offset", ""))
+        match route["kind"]:
+            case "missing":
+                return {"ok": False, "error": "missing offset"}
+            case "relative":
+                await self.player.seek(route["seconds"])
+            case "clock" | "absolute":
+                await self.player.seek_absolute(route["seconds"])
+            case "invalid_offset":
+                return {"ok": False, "error": f"invalid offset: {route['offset']}"}
+            case _:
+                return {"ok": False, "error": f"invalid time format: {route['offset']}"}
         return {"ok": True}
 
     def _ipc_now_playing(self) -> dict:
@@ -295,7 +342,11 @@ try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ipc_dispatch_route as _native_ipc_dispatch_route,
     )
+    from ytm_player.utils._ytm_player_native import (
+        ipc_seek_offset as _native_ipc_seek_offset,
+    )
 except ImportError:
     pass
 else:
     _ipc_dispatch_route = _native_ipc_dispatch_route  # type: ignore[assignment]
+    _ipc_seek_offset = _native_ipc_seek_offset  # type: ignore[assignment]

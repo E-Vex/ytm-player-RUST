@@ -7,23 +7,27 @@ formats (relative, mm:ss, absolute seconds).
 
 ``_ipc_dispatch_route`` is the engine behind the dispatch: the table
 walk deciding which branch handles each command string, and the rating
-the like/dislike/unlike branches rate with. The pure-Python
-transcription lives in ``app/_ipc.py``; when the Rust extension is
-built the same engine runs natively
-(``_ytm_player_native.ipc_dispatch_route``). The unit tests below
-assert the engine's contract on whichever backend is loaded, plus the
+the like/dislike/unlike branches rate with. ``_ipc_seek_offset`` is
+the engine behind the seek branch: the classification of the offset
+value into relative/clock/absolute seconds with its missing/invalid
+verdicts. The pure-Python transcriptions live in ``app/_ipc.py``; when
+the Rust extension is built the same engines run natively
+(``_ytm_player_native.ipc_dispatch_route`` /
+``_ytm_player_native.ipc_seek_offset``). The unit tests below
+assert each engine's contract on whichever backend is loaded, plus the
 mixin glue (every branch's handler calls, including the rating the
-rate branches pass). When the extension is built, the parity test
-additionally compares the native engine against the pure-Python
-reference (run in a child interpreter with the extension import
-blocked) case for case — including the error shapes, where CPython's
-own messages must surface identically — so the two implementations
-cannot drift apart.
+rate branches pass and the seek calls each parsed kind names). When
+the extension is built, the parity tests additionally compare the
+native engines against the pure-Python references (run in a child
+interpreter with the extension import blocked) case for case —
+including the error shapes, where CPython's own messages must surface
+identically — so the two implementations cannot drift apart.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from typing import Any
@@ -35,6 +39,7 @@ from ytm_player.app._ipc import (
     _IPC_DISPATCH_TABLE,
     IPCMixin,
     _ipc_dispatch_route,
+    _ipc_seek_offset,
 )
 
 try:
@@ -157,6 +162,181 @@ class TestSeekParsing:
         result = await h._ipc_seek({"offset": "1:2:3:4"})
         assert result["ok"] is False
         assert "invalid time format" in result["error"]
+
+
+class TestSeekOffset:
+    """The offset parser behind ``_ipc_seek``."""
+
+    @pytest.mark.parametrize(
+        ("offset", "kind", "seconds"),
+        [
+            ("+15", "relative", 15.0),
+            ("-10", "relative", -10.0),
+            ("+0", "relative", 0.0),
+            ("-0", "relative", -0.0),
+            ("+1e1", "relative", 10.0),
+            ("-1.5e-2", "relative", -0.015),
+            ("1:30", "clock", 90.0),
+            ("0:0", "clock", 0.0),
+            ("01:30", "clock", 90.0),
+            ("90:00", "clock", 5400.0),
+            ("1:00:00", "clock", 3600.0),
+            ("1:30:60", "clock", 5460.0),
+            ("42", "absolute", 42.0),
+            ("42.5", "absolute", 42.5),
+            ("5.", "absolute", 5.0),
+            (".5", "absolute", 0.5),
+            (" 5 ", "absolute", 5.0),
+            ("1_0", "absolute", 10.0),
+        ],
+    )
+    def test_every_format_parses(self, offset, kind, seconds):
+        assert _ipc_seek_offset(offset) == {"kind": kind, "seconds": seconds}
+
+    def test_seconds_is_the_float_object(self):
+        # The parsed value is the float float()/int()-arithmetic produced,
+        # never a re-typed copy.
+        route = _ipc_seek_offset("+10")
+        assert type(route["seconds"]) is float
+        assert route["seconds"] == 10.0
+
+    def test_special_float_spellings(self):
+        assert _ipc_seek_offset("inf") == {"kind": "absolute", "seconds": float("inf")}
+        assert _ipc_seek_offset("-inf") == {"kind": "relative", "seconds": float("-inf")}
+        nan_route = _ipc_seek_offset("nan")
+        assert nan_route["kind"] == "absolute"
+        assert math.isnan(nan_route["seconds"])  # nan != nan — compare by predicate
+
+    def test_unicode_digit_and_underscore_forms(self):
+        # int()/float() are the builtins: Unicode decimal digits and
+        # underscore separators parse exactly like they would at the
+        # call site.
+        assert _ipc_seek_offset("١:٣٠") == {"kind": "clock", "seconds": 90.0}
+        assert _ipc_seek_offset("1_0:30") == {"kind": "clock", "seconds": 630.0}
+        assert _ipc_seek_offset(" 1:30 ") == {"kind": "clock", "seconds": 90.0}
+
+    @pytest.mark.parametrize("offset", [None, "", 0, 0.0, False, [], {}, (), set()])
+    def test_falsy_values_are_missing(self, offset):
+        assert _ipc_seek_offset(offset) == {"kind": "missing"}
+
+    def test_truthiness_gate_precedes_startswith(self):
+        class FalsyWithRaisingStartswith:
+            def __bool__(self):
+                return False
+
+            def startswith(self, *args):
+                raise AssertionError("unreachable")
+
+        assert _ipc_seek_offset(FalsyWithRaisingStartswith()) == {"kind": "missing"}
+
+    @pytest.mark.parametrize(
+        ("offset", "kind"),
+        [
+            ("+notanumber", "invalid_offset"),
+            ("notanumber", "invalid_offset"),
+            ("-1:30", "invalid_offset"),  # signed values never reach the clock branch
+            ("1:2:3:4", "invalid_time"),
+            ("1:", "invalid_time"),
+            (":30", "invalid_time"),
+            (":", "invalid_time"),
+            ("::", "invalid_time"),
+            ("a:b", "invalid_time"),
+            ("1:30:", "invalid_time"),
+        ],
+    )
+    def test_invalid_verdicts(self, offset, kind):
+        assert _ipc_seek_offset(offset) == {"kind": kind, "offset": offset}
+
+    def test_offset_object_passes_through(self):
+        # The invalid rows carry the raw offset for the response message.
+        marker = "+nope"
+        route = _ipc_seek_offset(marker)
+        assert route["offset"] is marker
+
+    def test_non_str_raises_attribute_error(self):
+        # A truthy non-str dies on its own startswith lookup, exactly
+        # where the reference's first call would.
+        with pytest.raises(AttributeError, match="'int' object has no attribute 'startswith'"):
+            _ipc_seek_offset(15)
+
+    def test_bytes_raises_type_error(self):
+        with pytest.raises(TypeError, match="startswith first arg must be bytes"):
+            _ipc_seek_offset(b"+10")
+
+    def test_startswith_short_circuit(self):
+        # A value claiming "+" never probes "-" — the reference or's
+        # short-circuit.
+        class PlusOnly:
+            def startswith(self, prefix):
+                if prefix == "+":
+                    return True
+                raise RuntimeError("minus probe must not run")
+
+            def __float__(self):
+                return 1.5
+
+        assert _ipc_seek_offset(PlusOnly()) == {"kind": "relative", "seconds": 1.5}
+
+    def test_str_subclass_drives_split(self):
+        class S(str):
+            def split(self, sep=None, maxsplit=-1):
+                return ["1", "30"]
+
+        # The inherited containment still reads the content ("1:30" has
+        # the colon); the overridden split drives the parse.
+        assert _ipc_seek_offset(S("1:30")) == {"kind": "clock", "seconds": 90.0}
+
+    def test_split_error_propagates(self):
+        class S(str):
+            def split(self, sep=None, maxsplit=-1):
+                raise RuntimeError("split boom")
+
+        with pytest.raises(RuntimeError, match="split boom"):
+            _ipc_seek_offset(S("1:30"))
+
+    def test_len_error_inside_the_try(self):
+        # len(parts) sits inside the reference's try — a ValueError from
+        # it maps to the invalid-time verdict.
+        class BadLenParts:
+            def __len__(self):
+                raise ValueError("len boom")
+
+        class S(str):
+            def split(self, sep=None, maxsplit=-1):
+                return BadLenParts()
+
+        assert _ipc_seek_offset(S("1:30")) == {
+            "kind": "invalid_time",
+            "offset": S("1:30"),
+        }
+
+    def test_getitem_type_error_propagates(self):
+        class BadGetItemParts:
+            def __len__(self):
+                return 2
+
+            def __getitem__(self, index):
+                raise TypeError("getitem boom")
+
+        class S(str):
+            def split(self, sep=None, maxsplit=-1):
+                return BadGetItemParts()
+
+        with pytest.raises(TypeError, match="getitem boom"):
+            _ipc_seek_offset(S("1:30"))
+
+    def test_huge_clock_overflows_in_float(self):
+        # float(total) is outside the reference's try — a total too
+        # large for a float keeps its OverflowError (a 400-digit minute
+        # count times 3600 overflows; a mere 10^29 would not).
+        with pytest.raises(OverflowError, match="int too large to convert to float"):
+            _ipc_seek_offset("1" + "0" * 400 + ":0")
+
+    def test_fresh_map_every_call(self):
+        first = _ipc_seek_offset("+10")
+        second = _ipc_seek_offset("+10")
+        assert first is not second
+        assert first == second
 
 
 class TestQueueAdd:
@@ -666,3 +846,257 @@ class TestNativeParity:
                 f"native:   {n!r}\n"
                 f"fallback: {f!r}"
             )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_ipc_seek_offset_matches_fallback(self):
+        result = subprocess.run(
+            [sys.executable, "-c", _SEEK_CHILD_PROG],
+            input=json.dumps(_SEEK_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [_seek_outcome(spec) for spec in _SEEK_PARITY_CASES]
+        for spec, n, f in zip(_SEEK_PARITY_CASES, native, fallback):
+            # Both sides re-serialized before comparison so nan/inf
+            # outcomes compare by their JSON spellings (nan != nan).
+            assert json.dumps(n) == json.dumps(f), (
+                f"native and fallback seek outcomes differ for {spec!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+
+# ── Seek-offset native vs fallback parity ──────────────────────────────
+
+# The matrix below is shared with the child interpreter as JSON, so
+# every value must be JSON-round-trippable: offset strings and JSON
+# scalars, plus the stub shapes spelled out as specs both sides build
+# identically.
+_SEEK_PARITY_CASES = [
+    # The three accepted formats, in their spellings.
+    {"t": "str", "v": "+15"},
+    {"t": "str", "v": "-10"},
+    {"t": "str", "v": "+0"},
+    {"t": "str", "v": "-0"},
+    {"t": "str", "v": "+1e1"},
+    {"t": "str", "v": "-1.5e-2"},
+    {"t": "str", "v": "1:30"},
+    {"t": "str", "v": "0:0"},
+    {"t": "str", "v": "01:30"},
+    {"t": "str", "v": "90:00"},
+    {"t": "str", "v": "1:00:00"},
+    {"t": "str", "v": "1:30:60"},
+    {"t": "str", "v": "42"},
+    {"t": "str", "v": "42.5"},
+    {"t": "str", "v": ".5"},
+    {"t": "str", "v": " 5 "},
+    {"t": "str", "v": "1_0"},
+    {"t": "str", "v": "1_0:30"},
+    {"t": "str", "v": " 1:30 "},
+    {"t": "str", "v": "١:٣٠"},
+    {"t": "str", "v": "inf"},
+    {"t": "str", "v": "-inf"},
+    {"t": "str", "v": "nan"},
+    # The verdicts.
+    {"t": "str", "v": "+notanumber"},
+    {"t": "str", "v": "notanumber"},
+    {"t": "str", "v": "-1:30"},  # signed values never reach the clock branch
+    {"t": "str", "v": "1:2:3:4"},
+    {"t": "str", "v": "1:"},
+    {"t": "str", "v": ":30"},
+    {"t": "str", "v": ":"},
+    {"t": "str", "v": "::"},
+    {"t": "str", "v": "a:b"},
+    {"t": "str", "v": "9999999999999999999999999999:0"},  # float(total) overflows
+    # Falsy values are missing, before any attribute is touched.
+    {"t": "str", "v": ""},
+    {"t": "json", "v": None},
+    {"t": "json", "v": 0},
+    {"t": "json", "v": 0.0},
+    {"t": "json", "v": False},
+    {"t": "json", "v": []},
+    {"t": "json", "v": {}},
+    # Truthy non-str values die on their own startswith lookup.
+    {"t": "json", "v": 15},
+    {"t": "json", "v": 1.5},
+    {"t": "json", "v": True},
+    {"t": "bytes", "v": "KzEw"},  # b"+10" — the str-prefixed startswith TypeError
+    # Stubs driving the protocol: the short-circuit, the contains gate,
+    # the split-driven clock, and the raising edges.
+    {"t": "plus_only"},
+    {"t": "no_sign"},
+    {"t": "clock_stub"},
+    {"t": "raising_startswith"},
+    {"t": "raising_contains"},
+]
+
+
+class _PlusOnly:
+    def startswith(self, prefix):
+        if prefix == "+":
+            return True
+        raise RuntimeError("minus probe must not run")
+
+    def __float__(self):
+        return 1.5
+
+
+class _NoSign:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        return False
+
+    def __float__(self):
+        return 42.5
+
+
+class _ClockStub:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        return True
+
+    def split(self, sep=None, maxsplit=-1):
+        return ["1", "30"]
+
+
+class _RaisingStartswith:
+    def startswith(self, prefix):
+        raise RuntimeError("sw boom")
+
+
+class _RaisingContains:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        raise RuntimeError("contains boom")
+
+
+def _build_seek_offset(spec: dict) -> Any:
+    kind = spec["t"]
+    if kind == "str":
+        return spec["v"]
+    if kind == "json":
+        return spec["v"]
+    if kind == "bytes":
+        return spec["v"].encode("latin-1")
+    if kind == "plus_only":
+        return _PlusOnly()
+    if kind == "no_sign":
+        return _NoSign()
+    if kind == "clock_stub":
+        return _ClockStub()
+    if kind == "raising_startswith":
+        return _RaisingStartswith()
+    if kind == "raising_contains":
+        return _RaisingContains()
+    raise AssertionError(kind)
+
+
+def _seek_outcome(spec: dict) -> dict:
+    try:
+        route = _ipc_seek_offset(_build_seek_offset(spec))
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if "offset" in route and not isinstance(route["offset"], str):
+        # A stub's offset object is not JSON-transportable — its type
+        # name is (the object pass-through itself is pinned by the unit
+        # tests above).
+        route = {**route, "offset": f"<{type(route['offset']).__name__}>"}
+    return {"ok": route}
+
+
+_SEEK_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.app._ipc import _ipc_seek_offset
+
+
+class PlusOnly:
+    def startswith(self, prefix):
+        if prefix == '+':
+            return True
+        raise RuntimeError('minus probe must not run')
+
+    def __float__(self):
+        return 1.5
+
+
+class NoSign:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        return False
+
+    def __float__(self):
+        return 42.5
+
+
+class ClockStub:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        return True
+
+    def split(self, sep=None, maxsplit=-1):
+        return ['1', '30']
+
+
+class RaisingStartswith:
+    def startswith(self, prefix):
+        raise RuntimeError('sw boom')
+
+
+class RaisingContains:
+    def startswith(self, prefix):
+        return False
+
+    def __contains__(self, item):
+        raise RuntimeError('contains boom')
+
+
+def build(spec):
+    kind = spec['t']
+    if kind == 'str':
+        return spec['v']
+    if kind == 'json':
+        return spec['v']
+    if kind == 'bytes':
+        return spec['v'].encode('latin-1')
+    if kind == 'plus_only':
+        return PlusOnly()
+    if kind == 'no_sign':
+        return NoSign()
+    if kind == 'clock_stub':
+        return ClockStub()
+    if kind == 'raising_startswith':
+        return RaisingStartswith()
+    if kind == 'raising_contains':
+        return RaisingContains()
+    raise AssertionError(kind)
+
+
+def outcome(spec):
+    try:
+        route = _ipc_seek_offset(build(spec))
+    except Exception as exc:
+        return {'error': '%s: %s' % (type(exc).__name__, exc)}
+    if 'offset' in route and not isinstance(route['offset'], str):
+        route = dict(route, offset='<%s>' % type(route['offset']).__name__)
+    return {'ok': route}
+
+
+payload = json.load(sys.stdin)
+json.dump([outcome(spec) for spec in payload], sys.stdout)
+"""
