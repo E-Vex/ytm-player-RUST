@@ -306,6 +306,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // float/int reprs, the indent-aware layout, the key coercion and
     // the circular-reference guard.
     module.add_function(pyo3::wrap_pyfunction!(json_dumps, module)?)?;
+
+    // Doctor report assembly (utils/doctor.py gather_diagnostics
+    // equivalent): the multi-section `ytm doctor` text — the banners,
+    // the aligned identity and paths labels, the crash-file section,
+    // the final join and the redaction pass — from the probes'
+    // results.
+    module.add_function(pyo3::wrap_pyfunction!(doctor_report, module)?)?;
     Ok(())
 }
 
@@ -6422,14 +6429,14 @@ fn write_dict_key_into(out: &mut String, py: Python<'_>, key: &Bound<'_, PyAny>)
     Ok(())
 }
 
-/// Unpack one `items()` pair — `key, value = item` with CPython's own
+/// Unpack one two-item iterable — `a, b = item` with CPython's own
 /// unpack errors: the not-enough/too-many counts are the items actually
 /// yielded, and the "cannot unpack non-iterable" rewrite only applies
 /// to a type with no iteration support at all (an `__iter__` that
 /// itself raises keeps its own error, like CPython's `tp_iter` check).
-fn unpack_json_pair<'py>(
-    pair: &Bound<'py, PyAny>,
-) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+/// Serves the JSON encoder's `items()` pairs and the doctor report's
+/// crash-file `(path, content)` pair alike.
+fn unpack_two<'py>(pair: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
     let py = pair.py();
     let mut items = match pair.try_iter() {
         Ok(items) => items,
@@ -6669,7 +6676,7 @@ fn json_dumps<'py>(
             },
             Some(JsonFrame::Dict { iter, first, id }) => match iter.next() {
                 Some(Ok(pair)) => {
-                    let (key, value) = unpack_json_pair(&pair)?;
+                    let (key, value) = unpack_two(&pair)?;
                     if !*first {
                         if pretty {
                             out.push(',');
@@ -6711,4 +6718,137 @@ fn json_dumps<'py>(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Doctor report assembly (utils/doctor.py)
+// ---------------------------------------------------------------------------
+
+/// The report assembly behind `gather_diagnostics` from
+/// `utils/doctor.py` — the `ytm doctor` text users paste into issues.
+///
+/// Mirrors the pure-Python reference (`_doctor_report`): the
+/// multi-section report built from the probes' results — the banner
+/// and the aligned identity labels (`Version:` / `Python:  ` /
+/// `OS:      ` / `Machine:`), the paths block with its own alignment
+/// (`config:` through `crashes:`), the probe lines appended raw, the
+/// empty-log placeholder (a falsy *recent_errors* — the reference's
+/// `filtered if filtered else` — substitutes `(no warnings or errors
+/// logged)`), the crash-file section (`None` is the no-crash-files
+/// marker; a `(path, content)` pair unpacks into the `From:` line, the
+/// content, and the staleness note when *crash_note* is not `None` —
+/// an empty-string note still lands, `is not None` is not a truthiness
+/// gate), the hooks section with its trailing note paragraph, and the
+/// final `"\n"` join run through the redaction pass (the same `redact`
+/// engine the Python side binds to).
+///
+/// Every interpolation runs through `str()` exactly like the
+/// reference's f-strings — `Path` objects render as their path text,
+/// the version triple as its numbers, and anything with a `__str__`
+/// through its own. The inputs are never mutated.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)] // the report's 22 slots — one parameter per line the reference appends
+#[pyo3(signature = (version, py_major, py_minor, py_micro, system, release, machine, mpv_status, libmpv_status, config_path, theme_path, session_path, log_path, crash_dir, process_status, mpris_status, recent_errors, recent_mpv, faulthandler, crash, crash_note, hooks))]
+fn doctor_report<'py>(
+    version: &Bound<'py, PyAny>,
+    py_major: &Bound<'py, PyAny>,
+    py_minor: &Bound<'py, PyAny>,
+    py_micro: &Bound<'py, PyAny>,
+    system: &Bound<'py, PyAny>,
+    release: &Bound<'py, PyAny>,
+    machine: &Bound<'py, PyAny>,
+    mpv_status: &Bound<'py, PyAny>,
+    libmpv_status: &Bound<'py, PyAny>,
+    config_path: &Bound<'py, PyAny>,
+    theme_path: &Bound<'py, PyAny>,
+    session_path: &Bound<'py, PyAny>,
+    log_path: &Bound<'py, PyAny>,
+    crash_dir: &Bound<'py, PyAny>,
+    process_status: &Bound<'py, PyAny>,
+    mpris_status: &Bound<'py, PyAny>,
+    recent_errors: &Bound<'py, PyAny>,
+    recent_mpv: &Bound<'py, PyAny>,
+    faulthandler: &Bound<'py, PyAny>,
+    crash: &Bound<'py, PyAny>,
+    crash_note: &Bound<'py, PyAny>,
+    hooks: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    let mut sections: Vec<String> = Vec::with_capacity(40);
+
+    sections.push("=== ytm-player diagnostics ===".to_string());
+    sections.push(format!("Version: {}", py_str(version)?));
+    sections.push(format!(
+        "Python:  {}.{}.{}",
+        py_str(py_major)?,
+        py_str(py_minor)?,
+        py_str(py_micro)?
+    ));
+    sections.push(format!("OS:      {} {}", py_str(system)?, py_str(release)?));
+    sections.push(format!("Machine: {}", py_str(machine)?));
+    sections.push(py_str(mpv_status)?);
+    sections.push(py_str(libmpv_status)?);
+
+    sections.push(String::new());
+    sections.push("=== Paths ===".to_string());
+    sections.push(format!("config:   {}", py_str(config_path)?));
+    sections.push(format!("theme:    {}", py_str(theme_path)?));
+    sections.push(format!("session:  {}", py_str(session_path)?));
+    sections.push(format!("log:      {}", py_str(log_path)?));
+    sections.push(format!("crashes:  {}", py_str(crash_dir)?));
+
+    sections.push(String::new());
+    sections.push("=== Process status ===".to_string());
+    sections.push(py_str(process_status)?);
+
+    sections.push(String::new());
+    sections.push("=== MPRIS / media keys ===".to_string());
+    sections.push(py_str(mpris_status)?);
+
+    sections.push(String::new());
+    sections.push("=== Recent ERROR/WARNING (last 20) ===".to_string());
+    // filtered if filtered else "(no warnings or errors logged)" —
+    // truthiness, not a None check.
+    let errors_line = if recent_errors.is_truthy()? {
+        py_str(recent_errors)?
+    } else {
+        "(no warnings or errors logged)".to_string()
+    };
+    sections.push(errors_line);
+
+    sections.push(String::new());
+    sections.push("=== Recent mpv warnings/errors ===".to_string());
+    sections.push(py_str(recent_mpv)?);
+
+    sections.push(String::new());
+    sections.push("=== Most recent faulthandler trace ===".to_string());
+    sections.push(py_str(faulthandler)?);
+
+    sections.push(String::new());
+    sections.push("=== Most recent crash file ===".to_string());
+    if crash.is_none() {
+        sections.push("(no crash files found)".to_string());
+    } else {
+        // path, content = crash — the reference's tuple unpacking.
+        let (path, content) = unpack_two(crash)?;
+        sections.push(format!("From: {}", py_str(&path)?));
+        sections.push(py_str(&content)?);
+        // if note is not None — not a truthiness gate: an empty-string
+        // note still lands.
+        if !crash_note.is_none() {
+            sections.push(py_str(crash_note)?);
+        }
+    }
+
+    sections.push(String::new());
+    sections.push("=== Active hooks ===".to_string());
+    sections.push(py_str(hooks)?);
+    sections.push(String::new());
+    let note = "Note: this section reflects the doctor subcommand's own process. ".to_string()
+        + "Hooks are installed inside the long-running ytm TUI process — "
+        + "their effect is visible above (crashes/, faulthandler.log).";
+    sections.push(note);
+
+    // "\n".join(sections) — then the redaction pass, the same engine
+    // the Python side's _redact binds to.
+    Ok(redact(&sections.join("\n")))
 }

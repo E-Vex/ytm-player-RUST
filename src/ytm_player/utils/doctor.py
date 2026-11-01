@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
@@ -264,8 +265,121 @@ def _crash_staleness_note(content: str, current_version: str) -> str | None:
     return None
 
 
+def _doctor_report(
+    version: Any,
+    py_major: Any,
+    py_minor: Any,
+    py_micro: Any,
+    system: Any,
+    release: Any,
+    machine: Any,
+    mpv_status: Any,
+    libmpv_status: Any,
+    config_path: Any,
+    theme_path: Any,
+    session_path: Any,
+    log_path: Any,
+    crash_dir: Any,
+    process_status: Any,
+    mpris_status: Any,
+    recent_errors: Any,
+    recent_mpv: Any,
+    faulthandler: Any,
+    crash: Any,
+    crash_note: Any,
+    hooks: Any,
+) -> str:
+    """The report assembly behind ``gather_diagnostics``.
+
+    The pure half of ``ytm doctor``: the multi-section report text
+    from the probes' results — the section banners in their order,
+    the aligned identity labels (``Version:``/``Python:``/``OS:``/
+    ``Machine:``) and the paths block, the probes' own lines appended
+    raw, the empty-log placeholder, the crash-file section (``None``
+    is the no-crash-files marker; a ``(path, content)`` pair unpacks
+    into the ``From:`` line, the content and the optional staleness
+    note), the trailing hooks note, the final ``"\\n"`` join, and
+    the redaction pass.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.doctor_report``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The
+    interpolations run through ``str()`` exactly like the reference's
+    f-strings (``Path`` objects render as their path text, the
+    version triple as its numbers). Never mutates its inputs.
+    """
+    sections: list[str] = []
+
+    sections.append("=== ytm-player diagnostics ===")
+    sections.append(f"Version: {version}")
+    sections.append(f"Python:  {py_major}.{py_minor}.{py_micro}")
+    sections.append(f"OS:      {system} {release}")
+    sections.append(f"Machine: {machine}")
+    sections.append(mpv_status)
+    sections.append(libmpv_status)
+
+    sections.append("")
+    sections.append("=== Paths ===")
+    sections.append(f"config:   {config_path}")
+    sections.append(f"theme:    {theme_path}")
+    sections.append(f"session:  {session_path}")
+    sections.append(f"log:      {log_path}")
+    sections.append(f"crashes:  {crash_dir}")
+
+    sections.append("")
+    sections.append("=== Process status ===")
+    sections.append(process_status)
+
+    sections.append("")
+    sections.append("=== MPRIS / media keys ===")
+    sections.append(mpris_status)
+
+    sections.append("")
+    sections.append("=== Recent ERROR/WARNING (last 20) ===")
+    sections.append(recent_errors if recent_errors else "(no warnings or errors logged)")
+
+    sections.append("")
+    sections.append("=== Recent mpv warnings/errors ===")
+    sections.append(recent_mpv)
+
+    sections.append("")
+    sections.append("=== Most recent faulthandler trace ===")
+    sections.append(faulthandler)
+
+    sections.append("")
+    sections.append("=== Most recent crash file ===")
+    if crash is None:
+        sections.append("(no crash files found)")
+    else:
+        path, content = crash
+        sections.append(f"From: {path}")
+        sections.append(content)
+        if crash_note is not None:
+            sections.append(crash_note)
+
+    sections.append("")
+    sections.append("=== Active hooks ===")
+    sections.append(hooks)
+    sections.append("")
+    sections.append(
+        "Note: this section reflects the doctor subcommand's own process. "
+        "Hooks are installed inside the long-running ytm TUI process — "
+        "their effect is visible above (crashes/, faulthandler.log)."
+    )
+
+    return _redact("\n".join(sections))
+
+
 def gather_diagnostics() -> str:
-    """Return a multi-section text report describing the install."""
+    """Return a multi-section text report describing the install.
+
+    The report assembly — the banners, the aligned labels, the
+    crash-file section, the final join and the redaction pass — is
+    resolved by the ``_doctor_report`` engine above (native when the
+    Rust extension is built, the pure-Python transcription otherwise);
+    this function gathers the probes' results, in the reference's
+    order, and hands them over.
+    """
     from ytm_player import __version__
     from ytm_player.config.paths import (
         CONFIG_FILE,
@@ -280,73 +394,60 @@ def gather_diagnostics() -> str:
         list_active_hooks,
     )
 
-    sections: list[str] = []
-
-    sections.append("=== ytm-player diagnostics ===")
-    sections.append(f"Version: {__version__}")
-    sections.append(
-        f"Python:  {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    )
-    sections.append(f"OS:      {platform.system()} {platform.release()}")
-    sections.append(f"Machine: {platform.machine()}")
-    sections.append(_mpv_version())
-    sections.append(_libmpv_status())
-
-    sections.append("")
-    sections.append("=== Paths ===")
-    sections.append(f"config:   {CONFIG_FILE}")
-    sections.append(f"theme:    {THEME_FILE}")
-    sections.append(f"session:  {SESSION_STATE_FILE}")
-    sections.append(f"log:      {LOG_FILE}")
-    sections.append(f"crashes:  {CRASH_DIR}")
-
-    sections.append("")
-    sections.append("=== Process status ===")
-    sections.append(_running_status())
-
-    sections.append("")
-    sections.append("=== MPRIS / media keys ===")
-    sections.append(_mpris_status())
-
-    sections.append("")
-    sections.append("=== Recent ERROR/WARNING (last 20) ===")
-    filtered = get_recent_log_lines(LOG_FILE, n=20, min_level="WARNING")
-    sections.append(filtered if filtered else "(no warnings or errors logged)")
-
-    sections.append("")
-    sections.append("=== Recent mpv warnings/errors ===")
-    sections.append(_recent_mpv_lines(LOG_FILE))
-
-    sections.append("")
-    sections.append("=== Most recent faulthandler trace ===")
-    sections.append(_recent_faulthandler(CRASH_DIR))
-
-    sections.append("")
-    sections.append("=== Most recent crash file ===")
+    system = platform.system()
+    release = platform.release()
+    machine = platform.machine()
+    mpv_status = _mpv_version()
+    libmpv_status = _libmpv_status()
+    process_status = _running_status()
+    mpris_status = _mpris_status()
+    recent_errors = get_recent_log_lines(LOG_FILE, n=20, min_level="WARNING")
+    recent_mpv = _recent_mpv_lines(LOG_FILE)
+    faulthandler = _recent_faulthandler(CRASH_DIR)
     crash = get_recent_crash(CRASH_DIR)
-    if crash is None:
-        sections.append("(no crash files found)")
-    else:
-        path, content = crash
-        sections.append(f"From: {path}")
-        sections.append(content)
-        note = _crash_staleness_note(content, __version__)
-        if note is not None:
-            sections.append(note)
+    crash_note = None
+    if crash is not None:
+        crash_note = _crash_staleness_note(crash[1], __version__)
+    hooks = list_active_hooks()
 
-    sections.append("")
-    sections.append("=== Active hooks ===")
-    sections.append(list_active_hooks())
-    # `ytm doctor` is a short-lived subcommand running in its own Python
-    # process — it doesn't go through the TUI startup path in cli.py, so
-    # the hooks above always read as default/disabled here. The TUI process
-    # has them installed; the proof is the artifacts above (faulthandler.log
-    # gets created on TUI startup, crashes/ contains files when hooks fired).
-    sections.append("")
-    sections.append(
-        "Note: this section reflects the doctor subcommand's own process. "
-        "Hooks are installed inside the long-running ytm TUI process — "
-        "their effect is visible above (crashes/, faulthandler.log)."
+    return _doctor_report(
+        __version__,
+        sys.version_info.major,
+        sys.version_info.minor,
+        sys.version_info.micro,
+        system,
+        release,
+        machine,
+        mpv_status,
+        libmpv_status,
+        CONFIG_FILE,
+        THEME_FILE,
+        SESSION_STATE_FILE,
+        LOG_FILE,
+        CRASH_DIR,
+        process_status,
+        mpris_status,
+        recent_errors,
+        recent_mpv,
+        faulthandler,
+        crash,
+        crash_note,
+        hooks,
     )
 
-    return _redact("\n".join(sections))
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python transcriptions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements (the
+# lesson that produced formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        doctor_report as _native_doctor_report,
+    )
+except ImportError:
+    pass
+else:
+    _doctor_report = _native_doctor_report  # type: ignore[assignment]

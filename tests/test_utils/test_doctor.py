@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -437,3 +439,304 @@ class TestNativeParity:
         monkeypatch.setattr(doctor, "_native_argv_is_ytm", None)
         fallback = doctor._argv_is_ytm(argv)
         assert native == fallback
+
+
+class TestDoctorReport:
+    """The report assembly engine behind ``gather_diagnostics``."""
+
+    @staticmethod
+    def _fields(**overrides):
+        base = {
+            "version": "2.1.0",
+            "py_major": 3,
+            "py_minor": 12,
+            "py_micro": 16,
+            "system": "Linux",
+            "release": "6.1.0-arch1",
+            "machine": "x86_64",
+            "mpv_status": "mpv 0.38.0",
+            "libmpv_status": "libmpv: OK",
+            "config_path": "/home/u/.config/ytm-player/config.toml",
+            "theme_path": "/home/u/.config/ytm-player/theme.toml",
+            "session_path": "/home/u/.config/ytm-player/session.json",
+            "log_path": "/home/u/.config/ytm-player/logs/ytm.log",
+            "crash_dir": "/home/u/.config/ytm-player/crashes",
+            "process_status": "ytm not running",
+            "mpris_status": "MPRIS: available (dbus-fast OK; registers as org.mpris.MediaPlayer2.ytm)",
+            "recent_errors": "(none logged)",
+            "recent_mpv": "(no mpv warnings/errors logged)",
+            "faulthandler": "(no faulthandler trace — file does not exist)",
+            "crash": None,
+            "crash_note": None,
+            "hooks": "sys.excepthook: installed",
+        }
+        base.update(overrides)
+        return base
+
+    def test_full_report_layout(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(**self._fields())
+        expected = "\n".join(
+            [
+                "=== ytm-player diagnostics ===",
+                "Version: 2.1.0",
+                "Python:  3.12.16",
+                "OS:      Linux 6.1.0-arch1",
+                "Machine: x86_64",
+                "mpv 0.38.0",
+                "libmpv: OK",
+                "",
+                "=== Paths ===",
+                "config:   /home/u/.config/ytm-player/config.toml",
+                "theme:    /home/u/.config/ytm-player/theme.toml",
+                "session:  /home/u/.config/ytm-player/session.json",
+                "log:      /home/u/.config/ytm-player/logs/ytm.log",
+                "crashes:  /home/u/.config/ytm-player/crashes",
+                "",
+                "=== Process status ===",
+                "ytm not running",
+                "",
+                "=== MPRIS / media keys ===",
+                "MPRIS: available (dbus-fast OK; registers as org.mpris.MediaPlayer2.ytm)",
+                "",
+                "=== Recent ERROR/WARNING (last 20) ===",
+                "(none logged)",
+                "",
+                "=== Recent mpv warnings/errors ===",
+                "(no mpv warnings/errors logged)",
+                "",
+                "=== Most recent faulthandler trace ===",
+                "(no faulthandler trace — file does not exist)",
+                "",
+                "=== Most recent crash file ===",
+                "(no crash files found)",
+                "",
+                "=== Active hooks ===",
+                "sys.excepthook: installed",
+                "",
+                "Note: this section reflects the doctor subcommand's own process. "
+                "Hooks are installed inside the long-running ytm TUI process — "
+                "their effect is visible above (crashes/, faulthandler.log).",
+            ]
+        )
+        assert report == expected
+
+    def test_crash_section_unpacks_the_pair(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(
+            **self._fields(
+                crash=("/crashes/c.log", "=== Crash ===\ntraceback body"),
+                crash_note="⚠ stale note",
+            )
+        )
+        start = report.index("=== Most recent crash file ===")
+        end = report.index("=== Active hooks ===")
+        assert report[start:end] == (
+            "=== Most recent crash file ===\n"
+            "From: /crashes/c.log\n"
+            "=== Crash ===\n"
+            "traceback body\n"
+            "⚠ stale note\n"
+            "\n"
+        )
+
+    def test_crash_note_none_omits_the_line(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(**self._fields(crash=("/crashes/c.log", "body"), crash_note=None))
+        assert "From: /crashes/c.log\nbody\n\n=== Active hooks ===" in report
+
+    def test_empty_string_crash_note_still_lands(self):
+        # `if note is not None` — not a truthiness gate.
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(**self._fields(crash=("/c.log", "body"), crash_note=""))
+        assert "From: /c.log\nbody\n\n\n=== Active hooks ===" in report
+
+    def test_bad_crash_shape_raises_unpack_error(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        with pytest.raises(ValueError, match="too many values to unpack"):
+            _doctor_report(**self._fields(crash=("a", "b", "c")))
+        with pytest.raises(ValueError, match="not enough values to unpack"):
+            _doctor_report(**self._fields(crash=("a",)))
+
+    @pytest.mark.parametrize("falsy", [None, "", 0, 0.0, False, [], {}])
+    def test_falsy_recent_errors_get_the_placeholder(self, falsy):
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(**self._fields(recent_errors=falsy))
+        assert "(no warnings or errors logged)" in report
+
+    def test_multiline_probe_values_are_appended_raw(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(
+            **self._fields(
+                recent_errors="2026-01-01 [ERROR] one\n2026-01-01 [WARNING] two",
+                recent_mpv="mpv[ao]: line\nmpv[file]: another",
+            )
+        )
+        assert (
+            "=== Recent ERROR/WARNING (last 20) ===\n2026-01-01 [ERROR] one\n2026-01-01 [WARNING] two"
+            in report
+        )
+        assert "=== Recent mpv warnings/errors ===\nmpv[ao]: line\nmpv[file]: another" in report
+
+    def test_path_objects_render_through_str(self):
+        from pathlib import Path
+
+        from ytm_player.utils.doctor import _doctor_report
+
+        report = _doctor_report(
+            **self._fields(config_path=Path("/x/config.toml"), crash_dir=Path("/x/crashes"))
+        )
+        assert "config:   /x/config.toml" in report
+        assert "crashes:  /x/crashes" in report
+
+    def test_report_is_redacted(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        url = "https://media.invalid/play?ip=192.0.2.42&sig=fake-signature"
+        report = _doctor_report(
+            **self._fields(
+                recent_mpv=f"[WARNING] mpv[file]: HTTP 403 opening '{url}' failed",
+                crash=("/c.log", f"Authorization: Bearer fake-token\n{url}"),
+            )
+        )
+        assert "[URL REDACTED]" in report
+        assert "Authorization: [REDACTED]" in report
+        for private in ("192.0.2.42", "fake-signature", "fake-token", "media.invalid"):
+            assert private not in report
+
+    def test_inputs_never_mutated(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        crash = ("/c.log", "body")
+        fields = self._fields(crash=crash, crash_note="note")
+        _doctor_report(**fields)
+        assert crash == ("/c.log", "body")
+        assert fields["version"] == "2.1.0"
+
+
+# ── Doctor-report native vs fallback parity ────────────────────────────
+
+# The matrix below is shared with the child interpreter as JSON, so
+# every value must be JSON-round-trippable (the crash pair travels as a
+# two-item list — the reference's unpacking is shape-agnostic).
+_DOCTOR_PARITY_CASES = [
+    {
+        "version": "2.1.0",
+        "py_major": 3,
+        "py_minor": 12,
+        "py_micro": 16,
+        "system": "Linux",
+        "release": "6.1.0",
+        "machine": "x86_64",
+        "mpv_status": "mpv 0.38.0",
+        "libmpv_status": "libmpv: OK",
+        "config_path": "/home/u/.config/ytm-player/config.toml",
+        "theme_path": "/home/u/.config/ytm-player/theme.toml",
+        "session_path": "/home/u/.config/ytm-player/session.json",
+        "log_path": "/home/u/.config/ytm-player/logs/ytm.log",
+        "crash_dir": "/home/u/.config/ytm-player/crashes",
+        "process_status": "ytm not running",
+        "mpris_status": "MPRIS: available",
+        "recent_errors": "(none logged)",
+        "recent_mpv": "(no mpv warnings/errors logged)",
+        "faulthandler": "(no faulthandler trace)",
+        "crash": None,
+        "crash_note": None,
+        "hooks": "sys.excepthook: installed",
+    },
+    # The crash section with and without a note.
+    {
+        "version": "2.1.0",
+        "py_major": 3,
+        "py_minor": 10,
+        "py_micro": 1,
+        "system": "Darwin",
+        "release": "23.1.0",
+        "machine": "arm64",
+        "mpv_status": "mpv: NOT FOUND in PATH",
+        "libmpv_status": "libmpv: NOT LOADABLE (first line)",
+        "config_path": "/Users/u/.config/ytm-player/config.toml",
+        "theme_path": "/Users/u/.config/ytm-player/theme.toml",
+        "session_path": "/Users/u/.config/ytm-player/session.json",
+        "log_path": "/Users/u/.config/ytm-player/logs/ytm.log",
+        "crash_dir": "/Users/u/.config/ytm-player/crashes",
+        "process_status": "ytm running: PID 42 (RSS 120 MB)",
+        "mpris_status": "MPRIS: n/a (Darwin uses its native media integration)",
+        "recent_errors": "line one\nline two",
+        "recent_mpv": "mpv[ao]: format mismatch",
+        "faulthandler": "Fatal Python error: Segmentation fault",
+        "crash": ["/crashes/ytm-crash-x.log", "=== Crash ===\nversion: 1.0.0\ntrace"],
+        "crash_note": "⚠ This crash was recorded by ytm-player 1.0.0, older than the installed 2.1.0",
+        "hooks": "sys.excepthook: installed\nfaulthandler: enabled",
+    },
+    # A falsy recent_errors substitution and an empty-string note.
+    {
+        "version": "9.9.9",
+        "py_major": 3,
+        "py_minor": 14,
+        "py_micro": 0,
+        "system": "Windows",
+        "release": "11",
+        "machine": "AMD64",
+        "mpv_status": "mpv 0.37",
+        "libmpv_status": "libmpv: OK",
+        "config_path": "C:\\Users\\u\\config.toml",
+        "theme_path": "C:\\Users\\u\\theme.toml",
+        "session_path": "C:\\Users\\u\\session.json",
+        "log_path": "C:\\Users\\u\\ytm.log",
+        "crash_dir": "C:\\Users\\u\\crashes",
+        "process_status": "(cannot determine — /proc not available on this OS)",
+        "mpris_status": "MPRIS: n/a",
+        "recent_errors": "",
+        "recent_mpv": "",
+        "faulthandler": "",
+        "crash": ["/c.log", "body with unicode ✓ and\nnewlines"],
+        "crash_note": "",
+        "hooks": "",
+    },
+]
+
+_DOCTOR_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _doctor_report
+
+payload = json.load(sys.stdin)
+json.dump([_doctor_report(**fields) for fields in payload], sys.stdout)
+"""
+
+
+class TestDoctorReportNativeParity:
+    """The report-assembly engine, on the same child-interpreter pattern
+    the redact / argv_is_ytm parity tests above use."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_doctor_report_matches_fallback(self):
+        from ytm_player.utils.doctor import _doctor_report
+
+        result = subprocess.run(
+            [sys.executable, "-c", _DOCTOR_CHILD_PROG],
+            input=json.dumps(_DOCTOR_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [_doctor_report(**fields) for fields in _DOCTOR_PARITY_CASES]
+        for fields, n, f in zip(_DOCTOR_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback reports differ for {fields['system']} "
+                f"crash={fields['crash']!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
