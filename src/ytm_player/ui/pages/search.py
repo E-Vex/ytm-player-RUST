@@ -1,4 +1,12 @@
-"""Search page — query YouTube Music and display categorized results."""
+"""Search page — query YouTube Music and display categorized results.
+
+The search-result label engine — ``_format_search_result``, the item-to-
+label composer behind the Albums/Artists/Playlists panels of the results
+area — is implemented by the Rust extension (``_ytm_player_native``) when
+it is built and by the pure-Python transcription in this module otherwise;
+the bottom-of-module seam rebinds the engine to the native function when
+the extension is importable. The widgets below only do I/O and rendering.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +43,48 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Search result panel (for Albums, Artists, Playlists)
 # ---------------------------------------------------------------------------
+
+
+def _format_search_result(item: dict[str, Any]) -> str:
+    """Build a human-readable label for a search-result *item*.
+
+    The type tag — ``resultType``, falling back to ``category`` — picks the
+    branch: album rows append ``" - <artist>"`` (via the shared
+    ``extract_artist``) and ``" (<year>)"``; artist rows append
+    ``"  [<subscribers>]"``; playlist rows append ``" by <author>"`` and
+    ``" (<count> tracks)"`` (``itemCount`` falling back to ``count``);
+    everything else is the bare title. The title itself is the first truthy
+    of ``title``/``name``/``artist`` (``"Unknown"`` when all are falsy), and
+    every branch truncates to 60 characters.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.format_search_result``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    result_type = item.get("resultType", item.get("category", ""))
+    title = item.get("title") or item.get("name") or item.get("artist") or "Unknown"
+
+    if result_type in ("album", "albums"):
+        artist = extract_artist(item)
+        year = item.get("year", "")
+        suffix = f" - {artist}" if artist else ""
+        suffix += f" ({year})" if year else ""
+        return truncate(f"{title}{suffix}", 60)
+
+    if result_type in ("artist", "artists"):
+        subs = item.get("subscribers", "")
+        suffix = f"  [{subs}]" if subs else ""
+        return truncate(f"{title}{suffix}", 60)
+
+    if result_type in ("playlist", "playlists"):
+        author = item.get("author", "")
+        count = item.get("itemCount", item.get("count", ""))
+        suffix = f" by {author}" if author else ""
+        suffix += f" ({count} tracks)" if count else ""
+        return truncate(f"{title}{suffix}", 60)
+
+    # Fallback
+    return truncate(title, 60)
 
 
 class SearchResultPanel(Widget):
@@ -130,31 +180,8 @@ class SearchResultPanel(Widget):
         count_label.update(f"{len(self._items)} result{'s' if len(self._items) != 1 else ''}")
 
     def _format_item(self, item: dict[str, Any]) -> str:
-        """Build a human-readable label for a result item."""
-        result_type = item.get("resultType", item.get("category", ""))
-        title = item.get("title") or item.get("name") or item.get("artist") or "Unknown"
-
-        if result_type in ("album", "albums"):
-            artist = extract_artist(item)
-            year = item.get("year", "")
-            suffix = f" - {artist}" if artist else ""
-            suffix += f" ({year})" if year else ""
-            return truncate(f"{title}{suffix}", 60)
-
-        if result_type in ("artist", "artists"):
-            subs = item.get("subscribers", "")
-            suffix = f"  [{subs}]" if subs else ""
-            return truncate(f"{title}{suffix}", 60)
-
-        if result_type in ("playlist", "playlists"):
-            author = item.get("author", "")
-            count = item.get("itemCount", item.get("count", ""))
-            suffix = f" by {author}" if author else ""
-            suffix += f" ({count} tracks)" if count else ""
-            return truncate(f"{title}{suffix}", 60)
-
-        # Fallback
-        return truncate(title, 60)
+        """Build a human-readable label for a result item (shared engine)."""
+        return _format_search_result(item)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Forward item activation to parent."""
@@ -1049,3 +1076,24 @@ class SearchPage(Widget):
             case Action.SEARCH:
                 search_input = self.query_one("#search-input", Input)
                 search_input.focus()
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same label engine; this binding
+# replaces the pure-Python transcription above when the extension is
+# importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        format_search_result as _native_format_search_result,
+    )
+except ImportError:
+    pass
+else:
+
+    def _format_search_result(item: dict[str, Any]) -> str:  # noqa: F811
+        """Search-result label formatting (native Rust engine)."""
+        return _native_format_search_result(item)

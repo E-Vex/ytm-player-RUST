@@ -181,6 +181,11 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(split_events_and_charts, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(is_playlist_row, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(playlist_rows, module)?)?;
+
+    // Search-result label formatting (ui/pages/search.py equivalent):
+    // the item-to-label composer behind the Albums/Artists/Playlists
+    // panels of the search results area.
+    module.add_function(pyo3::wrap_pyfunction!(format_search_result, module)?)?;
     Ok(())
 }
 
@@ -239,6 +244,12 @@ fn format_duration(seconds: i64) -> String {
 /// Truncate *text* to *max_len* characters, appending `…` on overflow.
 #[pyfunction]
 fn truncate(text: &str, max_len: isize) -> String {
+    truncate_str(text, max_len)
+}
+
+/// The `truncate` body, shared with `format_search_result` so the label
+/// composer truncates through exactly one definition.
+fn truncate_str(text: &str, max_len: isize) -> String {
     if max_len < 1 {
         return String::new();
     }
@@ -3721,4 +3732,180 @@ fn playlist_rows<'py>(
         }
     }
     PyList::new(py, rows)
+}
+
+// ---------------------------------------------------------------------------
+// Search-result label formatting (mirrors ui/pages/search.py)
+// ---------------------------------------------------------------------------
+
+/// `item.get(key, default)`, exactly like the reference reads it.
+///
+/// Two indistinguishable fast/slow paths: an exact `dict` goes through the
+/// C-level lookup (where `dict.get` and `PyDict_GetItemWithError` are the
+/// same operation, minus the method dispatch the boundary would otherwise
+/// pay per field), while anything else — a dict subclass overriding
+/// `get`, or a mapping-like object — dispatches the real `get` method so
+/// overrides steer the engine exactly like they steer the reference. A
+/// `.get`-less item (where the reference would raise `AttributeError`)
+/// reads as the default — the engine stays total. *default* `None` means
+/// the reference's one-argument `item.get(key)`.
+fn field_get<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    key: &str,
+    default: Option<Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if item.is_exact_instance_of::<PyDict>() {
+        let dict = item.downcast::<PyDict>().unwrap();
+        return Ok(match dict.get_item(key)? {
+            Some(value) => value,
+            None => default.unwrap_or_else(|| py.None().into_bound(py)),
+        });
+    }
+    let default = default.unwrap_or_else(|| py.None().into_bound(py));
+    match item.call_method1("get", (key, default.clone())) {
+        Ok(value) => Ok(value),
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => Ok(default),
+        Err(err) => Err(err),
+    }
+}
+
+/// The first truthy `item.get(key)` across *keys* (Python truthiness),
+/// or `None` when every value is missing or falsy — the reference's
+/// `item.get("title") or item.get("name") or …` chain.
+fn first_truthy_get<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    keys: &[&str],
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    for key in keys {
+        let value = field_get(py, item, key, None)?;
+        if value.is_truthy()? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+/// Python's `value in ("a", "b")`: left-to-right `==` comparisons against
+/// the strings, with the result taken by truthiness — so str subclasses
+/// and `__eq__`-overriding objects classify exactly like the reference.
+/// An exact `str` takes the contents fast path (`str.__eq__` is C-level
+/// equality, no dispatch).
+fn eq_any_str<'py>(value: &Bound<'py, PyAny>, options: &[&str]) -> PyResult<bool> {
+    if value.is_exact_instance_of::<PyString>() {
+        let s = value.downcast::<PyString>().unwrap();
+        if let Ok(contents) = s.to_str() {
+            return Ok(options.contains(&contents));
+        }
+    }
+    for option in options {
+        if value.eq(*option)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `str(obj)` for label interpolation — the f-string conversion the
+/// reference applies to title/year/subscribers/author/count values.
+fn py_str(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    Ok(obj.str()?.to_string_lossy().into_owned())
+}
+
+/// Build the human-readable label for one search-result item.
+///
+/// Mirrors `SearchResultPanel._format_item` from `ui/pages/search.py`:
+/// the type tag — `resultType`, falling back to `category` (the nested
+/// default is evaluated before the outer lookup, exactly like the
+/// reference's eager argument evaluation) — picks the branch; the title
+/// is the first truthy of `title`/`name`/`artist` (`"Unknown"` when all
+/// are falsy or missing); album rows append `" - <artist>"` (through the
+/// shared, already-ported `extract_artist`) and `" (<year>)"` for a
+/// truthy `year`; artist rows append `"  [<subscribers>]"`; playlist
+/// rows append `" by <author>"` and `" (<count> tracks)"` (`itemCount`
+/// falling back to `count`, again with the eager default); everything
+/// else is the bare title. Every branch truncates to 60 characters with
+/// the shared `truncate` semantics.
+///
+/// Field reads resolve exactly like the reference's `.get` calls and
+/// truthiness is Python's, so dict subclasses and exotic-but-truthy
+/// values behave like the reference (see `field_get`). Where the reference
+/// would raise — a `.get`-less item, or a non-string bare title hitting
+/// `len()` — the engine stays total: the item reads as field-less and the
+/// bare title is stringified before truncation, exactly like the other
+/// branches' f-string interpolation already does.
+#[pyfunction]
+fn format_search_result(py: Python, item: &Bound<'_, PyAny>) -> PyResult<String> {
+    // result_type = item.get("resultType", item.get("category", ""))
+    let empty = PyString::new(py, "").into_any();
+    let category = field_get(py, item, "category", Some(empty))?;
+    let result_type = field_get(py, item, "resultType", Some(category))?;
+
+    // title = item.get("title") or item.get("name") or item.get("artist")
+    //         or "Unknown"
+    let title = match first_truthy_get(py, item, &["title", "name", "artist"])? {
+        Some(value) => value,
+        None => PyString::new(py, "Unknown").into_any(),
+    };
+
+    if eq_any_str(&result_type, &["album", "albums"])? {
+        // extract_artist(item) — the shared native engine; it reads
+        // C-level dict fields, so a non-dict mapping that classified
+        // itself as an album through its `get` degrades to Unknown.
+        let artist = match item.downcast::<PyDict>() {
+            Ok(dict) => extract_artist(py, dict),
+            Err(_) => "Unknown".to_string(),
+        };
+        let year = field_get(py, item, "year", Some(PyString::new(py, "").into_any()))?;
+        let mut label = py_str(&title)?;
+        if !artist.is_empty() {
+            label.push_str(" - ");
+            label.push_str(&artist);
+        }
+        if year.is_truthy()? {
+            label.push_str(" (");
+            label.push_str(&py_str(&year)?);
+            label.push(')');
+        }
+        return Ok(truncate_str(&label, 60));
+    }
+
+    if eq_any_str(&result_type, &["artist", "artists"])? {
+        let subs = field_get(
+            py,
+            item,
+            "subscribers",
+            Some(PyString::new(py, "").into_any()),
+        )?;
+        let mut label = py_str(&title)?;
+        if subs.is_truthy()? {
+            label.push_str("  [");
+            label.push_str(&py_str(&subs)?);
+            label.push(']');
+        }
+        return Ok(truncate_str(&label, 60));
+    }
+
+    if eq_any_str(&result_type, &["playlist", "playlists"])? {
+        let author = field_get(py, item, "author", Some(PyString::new(py, "").into_any()))?;
+        // count = item.get("itemCount", item.get("count", "")) — the
+        // inner default is evaluated first, like the reference.
+        let count_default = field_get(py, item, "count", Some(PyString::new(py, "").into_any()))?;
+        let count = field_get(py, item, "itemCount", Some(count_default))?;
+        let mut label = py_str(&title)?;
+        if author.is_truthy()? {
+            label.push_str(" by ");
+            label.push_str(&py_str(&author)?);
+        }
+        if count.is_truthy()? {
+            label.push_str(" (");
+            label.push_str(&py_str(&count)?);
+            label.push_str(" tracks)");
+        }
+        return Ok(truncate_str(&label, 60));
+    }
+
+    // Fallback: the bare title, truncated.
+    Ok(truncate_str(&py_str(&title)?, 60))
 }
