@@ -206,6 +206,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(next_pane_left, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(next_pane_right, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(next_pane_cycle, module)?)?;
+
+    // Playlist panel view engine (ui/sidebars/playlist_sidebar.py
+    // equivalent): the label/count view model behind the sidebar's
+    // LibraryPanel — the row label and footer count label, the `/`-filter
+    // pass, the playlist-id matching behind the optimistic sidebar
+    // mutations (removal / count updates / auto-select / the Liked Music
+    // exclusion), the count arithmetic, and the info-bar title read.
+    module.add_function(pyo3::wrap_pyfunction!(format_panel_item, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(panel_count_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(filter_panel_items, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(matches_removal, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(matches_count_update, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(bump_playlist_count, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(selection_title, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(is_liked_music_playlist, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(matches_auto_select, module)?)?;
     Ok(())
 }
 
@@ -4322,4 +4338,301 @@ fn next_pane_cycle<'py>(
         .position(|pane| *pane == current)
         .expect("content pane is always visible");
     Ok(panes[(idx + 1) % panes.len()].to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Playlist panel view engine (mirrors ui/sidebars/playlist_sidebar.py)
+// ---------------------------------------------------------------------------
+
+/// Python's `str.lower()`: the Unicode section-3.13 default lowercase
+/// mapping, which lowercases the Greek capital sigma contextually — a
+/// word-final `Σ` becomes `ς`, a mid-word one `σ`. Rust's
+/// `str::to_lowercase` implements the same mapping (including the final
+/// sigma special case), so it agrees with CPython case for case; the
+/// per-code-point `char::to_lowercase` does not (it never applies the
+/// context rule) and must not be used here.
+fn python_lower(s: &str) -> String {
+    s.to_lowercase()
+}
+
+/// Python's `str.strip()`: trims the CPython `isspace` set (see
+/// `py_isspace`) from both ends.
+fn python_strip(s: &str) -> &str {
+    s.trim_matches(py_isspace)
+}
+
+/// `item.get("playlistId") or item.get("browseId", *browse_default*)` —
+/// the shared left half of the panel's three playlist-id reads. A truthy
+/// `playlistId` wins outright; otherwise the `browseId` read flows on raw
+/// (its default substituting only when the key is missing — a present
+/// `None` passes through), so each predicate sees exactly the value the
+/// reference's `or`-chain leaves it.
+fn pid_or_browse<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    browse_default: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let playlist_id = field_get(py, item, "playlistId", None)?;
+    if playlist_id.is_truthy()? {
+        return Ok(playlist_id);
+    }
+    let default = browse_default.map(|d| PyString::new(py, d).into_any());
+    field_get(py, item, "browseId", default)
+}
+
+/// The row label for one panel item.
+///
+/// Mirrors `LibraryPanel._format_item` from
+/// `ui/sidebars/playlist_sidebar.py`: the title is `title` falling back
+/// to `name` (`"Unknown"` when both keys are missing — the inner default
+/// is evaluated before the outer lookup, exactly like the reference's
+/// eager argument evaluation, and a present-but-`None` title reads as
+/// `None`), and a count that is present and not `None` — `0` included,
+/// `is not None` is not a truthiness gate — appends
+/// `" (<count> tracks)"` with both values interpolated via `str()`.
+/// Without a count the title is returned **raw**, whatever object it is,
+/// exactly like the reference's bare `return title`.
+///
+/// Field reads resolve exactly like the reference's `.get` calls (see
+/// `field_get`); a `.get`-less item reads as field-less where the
+/// reference would raise — the engine stays total.
+#[pyfunction]
+fn format_panel_item(py: Python, item: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let unknown = PyString::new(py, "Unknown").into_any();
+    let name = field_get(py, item, "name", Some(unknown))?;
+    let title = field_get(py, item, "title", Some(name))?;
+    let count = field_get(py, item, "count", None)?;
+    if !count.is_none() {
+        let label = format!("{} ({} tracks)", py_str(&title)?, py_str(&count)?);
+        return Ok(PyString::new(py, &label).into_any().unbind());
+    }
+    Ok(title.unbind())
+}
+
+/// The footer count label: `"N item(s)"` when every item is shown,
+/// `"shown/total"` once the filter hides some.
+#[pyfunction]
+fn panel_count_label(shown: i64, total: i64) -> String {
+    if shown == total {
+        let plural = if total == 1 { "" } else { "s" };
+        format!("{total} item{plural}")
+    } else {
+        format!("{shown}/{total}")
+    }
+}
+
+/// The `/`-filter pass: the query stripped and lowercased, then the items
+/// (a fresh list of the same objects) whose lowercased row label contains
+/// it; an empty query resets the view to a fresh copy of every item.
+///
+/// Mirrors `LibraryPanel.on_input_changed` from
+/// `ui/sidebars/playlist_sidebar.py`. Lowercasing is Python's
+/// per-code-point mapping on both sides of the comparison (see
+/// `python_lower`), and containment is code-point substring, so the two
+/// backends agree on every label/query pair. Where the reference would
+/// raise — a non-dict item's `.get`, or a non-string raw title hitting
+/// `.lower()` — the engine stays total and simply never matches the row.
+#[pyfunction]
+fn filter_panel_items(
+    py: Python,
+    items: &Bound<'_, PyList>,
+    raw_query: &str,
+) -> PyResult<Py<PyList>> {
+    // query = raw_query.strip().lower()
+    let query = python_lower(python_strip(raw_query));
+    let kept: Vec<Bound<'_, PyAny>> = if query.is_empty() {
+        items.iter().collect()
+    } else {
+        let mut kept: Vec<Bound<'_, PyAny>> = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            // The reference calls `.get` on every item; a non-dict row
+            // would raise there, so the engine never matches it (the
+            // `filter_sort_tracks` precedent). Dict subclasses keep going
+            // and steer through their own `get`.
+            if item.downcast::<PyDict>().is_err() {
+                continue;
+            }
+            let label = format_panel_item(py, &item)?;
+            let label_bound = label.into_bound(py);
+            // A raw non-string title (no count) would raise on `.lower()`;
+            // it never matches, like the reference's AttributeError.
+            if let Ok(label_str) = label_bound.extract::<String>() {
+                if python_lower(&label_str).contains(&query) {
+                    kept.push(item);
+                }
+            }
+        }
+        kept
+    };
+    Ok(PyList::new(py, kept)?.unbind())
+}
+
+/// `LibraryPanel.remove_item`'s predicate: the item's playlist id
+/// (`playlistId` or `browseId`, `""` when both read falsy/missing)
+/// equals the target or its `VL`-prefixed form.
+#[pyfunction]
+fn matches_removal(py: Python, item: &Bound<'_, PyAny>, playlist_id: &str) -> PyResult<bool> {
+    let pid = pid_or_browse(py, item, Some(""))?;
+    let vl = format!("VL{playlist_id}");
+    eq_any_str(&pid, &[playlist_id, vl.as_str()])
+}
+
+/// `LibraryPanel.update_item_count`'s predicate: the item's playlist id
+/// (`playlistId` or `browseId` or `""`) equals the target, its
+/// `VL`-prefixed form, its `VL`-stripped form, or prefixes the target —
+/// tolerant in **both** `VL` directions, unlike the removal predicate.
+#[pyfunction]
+fn matches_count_update(py: Python, item: &Bound<'_, PyAny>, playlist_id: &str) -> PyResult<bool> {
+    let empty = PyString::new(py, "").into_any();
+    let raw = pid_or_browse(py, item, Some(""))?;
+    // … or "" — the trailing operand maps a falsy read to "".
+    let pid = if raw.is_truthy()? { raw } else { empty };
+    // pid == target or pid == f"VL{target}" — Python `==`, so exotic pid
+    // objects steer like the reference.
+    let vl_target = format!("VL{playlist_id}");
+    if eq_any_str(&pid, &[playlist_id, vl_target.as_str()])? {
+        return Ok(true);
+    }
+    // f"VL{pid}" == playlist_id — the f-string is always a plain str.
+    if format!("VL{}", py_str(&pid)?) == playlist_id {
+        return Ok(true);
+    }
+    // pid == playlist_id.removeprefix("VL")
+    let stripped = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
+    eq_any_str(&pid, &[stripped])
+}
+
+/// `int(x)` for the shapes a cached count can take: bools map to 0/1,
+/// ints pass through (a Python int beyond i64 clamps by sign, exactly
+/// like the ported volume clamp), floats truncate toward zero, and a str
+/// parses as a decimal integer (sign, digits, underscores between digits,
+/// surrounding whitespace — see `parse_python_decimal_int`). Where
+/// `int()` would raise — NaN/inf floats, non-numeric strings, other
+/// types — the coercion reads as None and the caller no-ops (the engine
+/// stays total; the loader only ever stores int-or-None counts, and both
+/// `update_item_count` call sites wrap the call in `except Exception`).
+fn python_int_coerce(value: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+    // bool is checked first: it passes the int extraction but maps to
+    // 0/1, like int(True) == 1.
+    if let Ok(b) = value.downcast::<PyBool>() {
+        return Ok(Some(i64::from(b.is_true())));
+    }
+    if let Ok(i) = value.extract::<i64>() {
+        return Ok(Some(i));
+    }
+    if value.is_instance_of::<PyInt>() {
+        // A Python int beyond i64: clamps by sign, like CPython's
+        // comparison-based max(0, huge + delta) staying huge.
+        let negative = value.str()?.to_str()?.starts_with('-');
+        return Ok(Some(if negative { i64::MIN } else { i64::MAX }));
+    }
+    if let Ok(f) = value.extract::<f64>() {
+        // int(float) truncates toward zero; at or beyond the i64 range
+        // (where Python's int() is exact and ours is not) the count
+        // no-ops.
+        if f.is_finite() && f.abs() < 9.223_372_036_854_776e18 {
+            return Ok(Some(f.trunc() as i64));
+        }
+        return Ok(None);
+    }
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(parse_python_decimal_int(&s));
+    }
+    Ok(None)
+}
+
+/// `int(str)` for the decimal spellings a hand-stored count string can
+/// take: surrounding whitespace, an optional sign, digits with
+/// underscores only between them. Python also accepts non-ASCII digits
+/// and other `int()` spellings; those (like every string `int()` would
+/// reject) read as None so the caller no-ops where the fallback would
+/// raise.
+fn parse_python_decimal_int(s: &str) -> Option<i64> {
+    let trimmed = python_strip(s);
+    let mut chars = trimmed.chars().peekable();
+    let mut digits = String::with_capacity(trimmed.len());
+    if matches!(chars.peek(), Some('+')) {
+        chars.next();
+    } else if matches!(chars.peek(), Some('-')) {
+        digits.push('-');
+        chars.next();
+    }
+    let mut last_was_digit = false;
+    let mut any_digit = false;
+    for c in chars {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            last_was_digit = true;
+            any_digit = true;
+        } else if c == '_' && last_was_digit {
+            // An underscore must sit between digits ("1_0" is 10,
+            // "1__0" and "1_" are rejected, like int()).
+            last_was_digit = false;
+        } else {
+            return None;
+        }
+    }
+    if !any_digit || !last_was_digit {
+        return None;
+    }
+    match digits.parse::<i128>() {
+        Ok(v) => Some(v.clamp(i64::MIN as i128, i64::MAX as i128) as i64),
+        // A digit string beyond i128 clamps by sign, like the huge-int
+        // branch of python_int_coerce.
+        Err(_) => Some(if digits.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        }),
+    }
+}
+
+/// The optimistic count arithmetic: `None` (unknown, or a missing count
+/// that reads as `None`) stays `None` so the caller leaves the count for
+/// the next library reload; otherwise `max(0, int(current) + delta)` —
+/// never negative, saturating so a near-i64 count clamps instead of
+/// wrapping. An `int()`-proof current (see `python_int_coerce`) also
+/// reads as `None`: the engine no-ops where the fallback would raise.
+#[pyfunction]
+fn bump_playlist_count(py: Python, current: &Bound<'_, PyAny>, delta: i64) -> PyResult<Py<PyAny>> {
+    if current.is_none() {
+        return Ok(py.None());
+    }
+    match python_int_coerce(current)? {
+        Some(v) => {
+            let bumped = (v as i128 + delta as i128).max(0).min(i64::MAX as i128) as i64;
+            Ok(bumped.into_pyobject(py)?.into_any().unbind())
+        }
+        None => Ok(py.None()),
+    }
+}
+
+/// The info-bar read behind `SelectionChanged`: `title` falling back to
+/// `name`, `""` when both keys are missing — *not* the label composer's
+/// `"Unknown"` — and returned raw. The inner default is evaluated before
+/// the outer lookup, like the reference's eager argument evaluation.
+#[pyfunction]
+fn selection_title(py: Python, item: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let empty = PyString::new(py, "").into_any();
+    let name = field_get(py, item, "name", Some(empty))?;
+    Ok(field_get(py, item, "title", Some(name))?.unbind())
+}
+
+/// Whether the item is the account's auto-generated Liked Music playlist
+/// (id `LM`) — the row `ensure_loaded` filters out because it is already
+/// a pinned nav item.
+#[pyfunction]
+fn is_liked_music_playlist(py: Python, item: &Bound<'_, PyAny>) -> PyResult<bool> {
+    // (item.get("playlistId") or item.get("browseId", "")) == "LM"
+    let pid = pid_or_browse(py, item, Some(""))?;
+    eq_any_str(&pid, &["LM"])
+}
+
+/// `PlaylistSidebar.auto_select_playlist`'s predicate: the item's playlist
+/// id (`playlistId` or `browseId`, no `""` default — a missing `browseId`
+/// reads as `None`) equals the target exactly, with no `VL` tolerance.
+#[pyfunction]
+fn matches_auto_select(py: Python, item: &Bound<'_, PyAny>, playlist_id: &str) -> PyResult<bool> {
+    let pid = pid_or_browse(py, item, None)?;
+    eq_any_str(&pid, &[playlist_id])
 }

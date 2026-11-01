@@ -1,4 +1,18 @@
-"""Persistent playlist sidebar — visible across all views."""
+"""Persistent playlist sidebar — visible across all views.
+
+The panel view engine — the label/count view model behind every row and
+footer of the sidebar's ``LibraryPanel`` — is implemented by the Rust
+extension (``_ytm_player_native``) when it is built and by the pure-Python
+transcriptions in this module otherwise; the bottom-of-module seam rebinds
+the engine to the native functions when the extension is importable. The
+engine covers the whole pure core: the row label (``format_panel_item``),
+the footer count label (``panel_count_label``), the ``/``-filter pass
+(``filter_panel_items``), the playlist-id matching behind the optimistic
+sidebar mutations (``matches_removal`` / ``matches_count_update`` /
+``matches_auto_select`` / ``is_liked_music_playlist``), the count
+arithmetic (``bump_playlist_count``) and the info-bar title read
+(``selection_title``). The widgets below only do I/O and rendering.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +33,145 @@ from ytm_player.ui.selection_info_bar import SelectionChanged
 from ytm_player.utils.formatting import copy_to_clipboard, truncate
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Panel view engine
+# ---------------------------------------------------------------------------
+
+
+def format_panel_item(item: dict[str, Any]) -> Any:
+    """The row label for one panel *item*.
+
+    The title is ``title`` falling back to ``name`` (``"Unknown"`` when
+    both keys are missing — a present-but-``None`` title reads as ``None``),
+    and a non-``None`` ``count`` appends ``" (<count> tracks)"``. Without a
+    count the title is returned **raw** — whatever object it is — exactly
+    like the reference's bare ``return title``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.format_panel_item``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = item.get("title", item.get("name", "Unknown"))
+    count = item.get("count")
+    if count is not None:
+        return f"{title} ({count} tracks)"
+    return title
+
+
+def panel_count_label(shown: int, total: int) -> str:
+    """The footer count label: ``"N item(s)"`` when every item is shown,
+    ``"shown/total"`` once the filter hides some.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.panel_count_label``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if shown == total:
+        return f"{total} item{'s' if total != 1 else ''}"
+    return f"{shown}/{total}"
+
+
+def filter_panel_items(items: list[dict[str, Any]], raw_query: str) -> list[dict[str, Any]]:
+    """The ``/``-filter pass: *raw_query* stripped and lowercased, then
+    kept as a fresh list of the *items* (same objects) whose lowercased
+    row label contains it. An empty query resets the view to a fresh copy
+    of every item.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.filter_panel_items``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    query = raw_query.strip().lower()
+    if not query:
+        return list(items)
+    return [item for item in items if query in format_panel_item(item).lower()]
+
+
+def matches_removal(item: dict[str, Any], playlist_id: str) -> bool:
+    """``LibraryPanel.remove_item``'s predicate: the item's playlist id
+    (``playlistId`` or ``browseId``, ``""`` when both read falsy/missing)
+    equals *playlist_id* or its ``VL``-prefixed form.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.matches_removal``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    pid = item.get("playlistId") or item.get("browseId", "")
+    return pid == playlist_id or pid == f"VL{playlist_id}"
+
+
+def matches_count_update(item: dict[str, Any], playlist_id: str) -> bool:
+    """``LibraryPanel.update_item_count``'s predicate: the item's playlist
+    id (``playlistId`` or ``browseId`` or ``""``) equals *playlist_id*,
+    its ``VL``-prefixed form, its ``VL``-stripped form, or prefixes the
+    target — tolerant in **both** ``VL`` directions, unlike the removal
+    predicate.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.matches_count_update``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    pid = item.get("playlistId") or item.get("browseId", "") or ""
+    return (
+        pid == playlist_id
+        or pid == f"VL{playlist_id}"
+        or f"VL{pid}" == playlist_id
+        or pid == playlist_id.removeprefix("VL")
+    )
+
+
+def bump_playlist_count(current: Any, delta: int) -> Any:
+    """The optimistic count arithmetic: ``None`` (unknown) stays ``None``
+    so the caller leaves the count for the next library reload; otherwise
+    ``max(0, int(current) + delta)`` — never negative.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.bump_playlist_count``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if current is None:
+        return None
+    return max(0, int(current) + delta)
+
+
+def selection_title(item: dict[str, Any]) -> Any:
+    """The info-bar read behind ``SelectionChanged``: ``title`` falling
+    back to ``name``, ``""`` when both keys are missing — *not* the label
+    composer's ``"Unknown"`` — and returned raw.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.selection_title``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return item.get("title", item.get("name", ""))
+
+
+def is_liked_music_playlist(item: dict[str, Any]) -> bool:
+    """Whether *item* is the account's auto-generated Liked Music
+    playlist (id ``LM``) — the row ``ensure_loaded`` filters out because
+    it is already a pinned nav item.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.is_liked_music_playlist``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return (item.get("playlistId") or item.get("browseId", "")) == "LM"
+
+
+def matches_auto_select(item: dict[str, Any], playlist_id: str) -> bool:
+    """``PlaylistSidebar.auto_select_playlist``'s predicate: the item's
+    playlist id (``playlistId`` or ``browseId``, no ``""`` default — a
+    missing ``browseId`` reads as ``None``) equals *playlist_id* exactly,
+    with no ``VL`` tolerance.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.matches_auto_select``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    pid = item.get("playlistId") or item.get("browseId")
+    return pid == playlist_id
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +321,9 @@ class LibraryPanel(Widget):
     def load_items(self, items: list[dict[str, Any]]) -> None:
         """Replace panel contents with *items* and hide loading indicator."""
         self._items = list(items)
-        self._filtered_items = list(items)
+        # The unfiltered view is the filter pass's empty-query reset — one
+        # definition of "every item, fresh list" on both backends.
+        self._filtered_items = filter_panel_items(self._items, "")
         self._rebuild_list(self._filtered_items)
         self._set_loading_visible(False)
         self.is_loading = False
@@ -177,27 +332,19 @@ class LibraryPanel(Widget):
         """Optimistically insert *item* at the top of the panel."""
         self._items.insert(0, item)
         self._filtered_items.insert(0, item)
-        full_text = self._format_item(item)
+        full_text = format_panel_item(item)
         lbl = Static(self._render_text(full_text))
         list_view = self.query_one(ListView)
         list_view.insert(0, [ListItem(lbl)])
         count_label = self.query_one(".panel-count", Static)
-        total = len(self._items)
-        shown = len(self._filtered_items)
-        if shown == total:
-            count_label.update(f"{total} item{'s' if total != 1 else ''}")
-        else:
-            count_label.update(f"{shown}/{total}")
+        count_label.update(panel_count_label(len(self._filtered_items), len(self._items)))
 
     def remove_item(self, playlist_id: str) -> None:
         """Optimistically remove the item with *playlist_id* from the panel."""
-
-        def matches(item: dict[str, Any]) -> bool:
-            pid = item.get("playlistId") or item.get("browseId", "")
-            return pid == playlist_id or pid == f"VL{playlist_id}"
-
-        self._items = [i for i in self._items if not matches(i)]
-        self._filtered_items = [i for i in self._filtered_items if not matches(i)]
+        self._items = [i for i in self._items if not matches_removal(i, playlist_id)]
+        self._filtered_items = [
+            i for i in self._filtered_items if not matches_removal(i, playlist_id)
+        ]
         self._rebuild_list(self._filtered_items)
 
     def update_item_count(self, playlist_id: str, delta: int) -> None:
@@ -207,25 +354,14 @@ class LibraryPanel(Widget):
         VL-prefix mismatch in either direction. If the cached count is None
         (unknown), leaves it None — never fabricates.
         """
-
-        def matches(item: dict[str, Any]) -> bool:
-            pid = item.get("playlistId") or item.get("browseId", "") or ""
-            target = playlist_id
-            return (
-                pid == target
-                or pid == f"VL{target}"
-                or f"VL{pid}" == target
-                or pid == target.removeprefix("VL")
-            )
-
-        target_item = next((i for i in self._items if matches(i)), None)
+        target_item = next((i for i in self._items if matches_count_update(i, playlist_id)), None)
         if target_item is None:
             return
 
-        current = target_item.get("count")
-        if current is None:
+        new_count = bump_playlist_count(target_item.get("count"), delta)
+        if new_count is None:
             return  # unknown count — wait for next library reload
-        target_item["count"] = max(0, int(current) + delta)
+        target_item["count"] = new_count
 
         # Rebuild the list so the visible label reflects the new count.
         # Wrapped in try/except because tests instantiate via __new__ without
@@ -239,23 +375,11 @@ class LibraryPanel(Widget):
         list_view = self.query_one(ListView)
         list_view.clear()
         for item in items:
-            full_text = self._format_item(item)
+            full_text = format_panel_item(item)
             lbl = Static(self._render_text(full_text))
             list_view.append(ListItem(lbl))
         count_label = self.query_one(".panel-count", Static)
-        total = len(self._items)
-        shown = len(items)
-        if shown == total:
-            count_label.update(f"{total} item{'s' if total != 1 else ''}")
-        else:
-            count_label.update(f"{shown}/{total}")
-
-    def _format_item(self, item: dict[str, Any]) -> str:
-        title = item.get("title", item.get("name", "Unknown"))
-        count = item.get("count")
-        if count is not None:
-            return f"{title} ({count} tracks)"
-        return title
+        count_label.update(panel_count_label(len(items), len(self._items)))
 
     def _render_text(self, full_text: str) -> str:
         """Apply the configured overflow rule to *full_text*.
@@ -293,7 +417,7 @@ class LibraryPanel(Widget):
             filter_input = self.query_one(f"#{self.id}-filter", Input)
             filter_input.remove_class("visible")
             self.filter_visible = False
-            self._filtered_items = list(self._items)
+            self._filtered_items = filter_panel_items(self._items, "")
             self._rebuild_list(self._filtered_items)
         except Exception:
             logger.debug("Failed to hide filter input in library panel", exc_info=True)
@@ -301,13 +425,7 @@ class LibraryPanel(Widget):
     def on_input_changed(self, event: Input.Changed) -> None:
         if not event.input.id or not event.input.id.endswith("-filter"):
             return
-        query = event.value.strip().lower()
-        if not query:
-            self._filtered_items = list(self._items)
-        else:
-            self._filtered_items = [
-                item for item in self._items if query in self._format_item(item).lower()
-            ]
+        self._filtered_items = filter_panel_items(self._items, event.value)
         self._rebuild_list(self._filtered_items)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -333,9 +451,7 @@ class LibraryPanel(Widget):
                 return
             sel_idx = list_view.index
             if sel_idx is not None and 0 <= sel_idx < len(self._filtered_items):
-                item = self._filtered_items[sel_idx]
-                title = item.get("title", item.get("name", ""))
-                self.post_message(SelectionChanged(title))
+                self.post_message(SelectionChanged(selection_title(self._filtered_items[sel_idx])))
             else:
                 self.post_message(SelectionChanged(""))
         except Exception:
@@ -347,9 +463,7 @@ class LibraryPanel(Widget):
             list_view = self.query_one(ListView)
             sel_idx = list_view.index
             if sel_idx is not None and 0 <= sel_idx < len(self._filtered_items):
-                item = self._filtered_items[sel_idx]
-                title = item.get("title", item.get("name", ""))
-                self.post_message(SelectionChanged(title))
+                self.post_message(SelectionChanged(selection_title(self._filtered_items[sel_idx])))
             else:
                 self.post_message(SelectionChanged(""))
         except Exception:
@@ -540,9 +654,7 @@ class PlaylistSidebar(Widget):
             panel = self.query_one("#ps-playlists", LibraryPanel)
             if isinstance(playlists, list):
                 # Filter out "Liked Music" — it's already a pinned nav item.
-                playlists = [
-                    p for p in playlists if (p.get("playlistId") or p.get("browseId", "")) != "LM"
-                ]
+                playlists = [p for p in playlists if not is_liked_music_playlist(p)]
                 panel.load_items(playlists)
             else:
                 logger.error("Failed to load playlists: %s", playlists)
@@ -559,8 +671,7 @@ class PlaylistSidebar(Widget):
         """Highlight a specific playlist in the panel."""
         panel = self.query_one("#ps-playlists", LibraryPanel)
         for item in panel._items:
-            pid = item.get("playlistId") or item.get("browseId")
-            if pid == playlist_id:
+            if matches_auto_select(item, playlist_id):
                 self.post_message(self.PlaylistSelected(item))
                 break
 
@@ -651,3 +762,53 @@ class PlaylistSidebar(Widget):
             self.app.notify("Link copied", timeout=2)
         else:
             self.app.notify(link, timeout=5)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same panel view engine; these bindings
+# replace the pure-Python transcriptions above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        bump_playlist_count as _native_bump_playlist_count,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        filter_panel_items as _native_filter_panel_items,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        format_panel_item as _native_format_panel_item,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        is_liked_music_playlist as _native_is_liked_music_playlist,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        matches_auto_select as _native_matches_auto_select,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        matches_count_update as _native_matches_count_update,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        matches_removal as _native_matches_removal,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        panel_count_label as _native_panel_count_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        selection_title as _native_selection_title,
+    )
+except ImportError:
+    pass
+else:
+    format_panel_item = _native_format_panel_item  # type: ignore[assignment]
+    panel_count_label = _native_panel_count_label  # type: ignore[assignment]
+    filter_panel_items = _native_filter_panel_items  # type: ignore[assignment]
+    matches_removal = _native_matches_removal  # type: ignore[assignment]
+    matches_count_update = _native_matches_count_update  # type: ignore[assignment]
+    bump_playlist_count = _native_bump_playlist_count  # type: ignore[assignment]
+    selection_title = _native_selection_title  # type: ignore[assignment]
+    is_liked_music_playlist = _native_is_liked_music_playlist  # type: ignore[assignment]
+    matches_auto_select = _native_matches_auto_select  # type: ignore[assignment]
