@@ -1,4 +1,15 @@
-"""Browse page — recommendations, charts, new releases, playlists, subscriptions."""
+"""Browse page — recommendations, charts, new releases, playlists, subscriptions.
+
+The page's pure home-feed classification engine — ``_is_event_shelf`` /
+``_chart_sort_key`` / ``_split_events_and_charts`` (the event-vs-chart
+partition and priority pill ordering behind the Charts tab) and
+``_is_playlist_row`` / ``_playlist_rows`` (the playlist-row extraction
+with per-id dedup behind the Playlists tab) — is implemented by the Rust
+extension (``_ytm_player_native``) when it is built and by the pure-Python
+transcriptions in this module otherwise; the bottom-of-module seam rebinds
+the engine to the native functions when the extension is importable. The
+widgets below only do I/O and rendering.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +30,7 @@ from ytm_player.config.keymap import Action
 from ytm_player.config.settings import get_settings
 from ytm_player.ui.widgets.track_table import TrackTable
 from ytm_player.utils.formatting import (
+    clean_shelf_title,
     extract_artist,
     get_video_id,
     normalize_tracks,
@@ -65,46 +77,11 @@ _TABS = ("For You", "Charts", "Releases", "Playlists", "Subs")
 # Chart shelf title normalisation
 # ---------------------------------------------------------------------------
 
-
-def _clean_shelf_title(raw: str) -> str:
-    """Normalise a YouTube chart shelf title for compact pill display.
-
-    YouTube returns titles like:
-      "Coachella 2026: Daily Top 100 Songs"
-      "Trending 20 United Kingdom"
-      "Daily Top Music Videos - United Kingdom"
-      "Daily Top Songs on Shorts - United Kingdom"
-      "Daily Top 100 Songs (Live)"   (hypothetical YouTube variant)
-
-    We strip brand prefixes, country suffixes, and apply preferred short
-    labels: "Daily Top 100", "Trending 20", "Daily Top Videos",
-    "Daily Top Songs (Shorts)". Patterns are regex-anchored so a future
-    title like "Daily Top 100 Songs (Live)" rewrites to
-    "Daily Top 100 (Live)" rather than failing the rewrite chain.
-    """
-    import re
-
-    from ytm_player.services.regions import CHART_REGIONS
-
-    s = raw.strip()
-    # Strip " - <country>" suffix
-    if " - " in s:
-        head, tail = s.rsplit(" - ", 1)
-        if any(tail.strip() == name for _, name in CHART_REGIONS):
-            s = head.strip()
-    # Strip trailing " <country>" without hyphen (e.g. "Trending 20 United Kingdom")
-    for _, name in CHART_REGIONS:
-        suffix = " " + name
-        if s.endswith(suffix):
-            s = s[: -len(suffix)].strip()
-            break
-    # Apply canonical short-label rewrites. Each pattern matches against the
-    # core token only — trailing decorations like " (Live)" / " (Acoustic)"
-    # / extra suffixes are preserved verbatim.
-    s = re.sub(r"\bDaily Top 100 Songs\b", "Daily Top 100", s)
-    s = re.sub(r"\bDaily Top Music Videos\b", "Daily Top Videos", s)
-    s = re.sub(r"\bDaily Top Songs on Shorts\b", "Daily Top Songs (Shorts)", s)
-    return s
+# Pill titles are normalised by ``utils.formatting.clean_shelf_title`` —
+# the same country-suffix strip and short-label rewrites for every chart
+# pill (it runs natively when the Rust extension is built). This page used
+# to carry a verbatim duplicate of that function; it now shares the one
+# definition.
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +94,10 @@ def _is_event_shelf(shelf: dict) -> bool:
     prefix — YouTube formats events as ``"<Brand>: <Generic Title>"`` (e.g.
     ``"Coachella 2026: Daily Top 100 Songs"``). Country chart shelves never
     use the colon-space form.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.is_event_shelf``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     title = str(shelf.get("title", ""))
     return ": " in title
@@ -132,6 +113,15 @@ _CHART_PRIORITY: tuple[tuple[str, int], ...] = (
 
 
 def _chart_sort_key(shelf: dict) -> tuple[int, str]:
+    """The ``(rank, title)`` sort key behind the country-chart pill order.
+
+    A title starting with a ``_CHART_PRIORITY`` prefix gets that prefix's
+    rank; everything else ranks 99 and sorts alphabetically by title.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.chart_sort_key``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     title = str(shelf.get("title", ""))
     for prefix, rank in _CHART_PRIORITY:
         if title.startswith(prefix):
@@ -146,6 +136,12 @@ def _split_events_and_charts(
     canonical priority. Events keep their original order — there are
     rarely more than one, and YouTube's ordering reflects editorial
     intent.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.split_events_and_charts``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The sort is
+    stable on both backends (Python's ``sorted`` and Rust's stable sort
+    alike), so equal ``(rank, title)`` keys keep input order.
     """
     events = [s for s in shelves if _is_event_shelf(s)]
     charts = sorted(
@@ -170,6 +166,10 @@ def _is_playlist_row(item: object) -> bool:
     ``playlistId`` too — albums carry ``audioPlaylistId`` and never
     ``playlistId``, artists and podcasts carry neither. Malformed rows
     (``None``, non-dicts, missing or non-string ids) are rejected.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.is_playlist_row``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     if not isinstance(item, dict):
         return False
@@ -178,7 +178,14 @@ def _is_playlist_row(item: object) -> bool:
 
 
 def _playlist_rows(shelves: list[Any]) -> list[dict[str, Any]]:
-    """The playlist rows across *shelves*, in feed order, one per playlist id."""
+    """The playlist rows across *shelves*, in feed order, one per playlist id.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The first
+    occurrence of a playlist id wins and the row objects themselves are
+    returned (no copies) on both backends.
+    """
     seen: set[str] = set()
     rows: list[dict[str, Any]] = []
     for shelf in shelves:
@@ -838,7 +845,7 @@ class ChartsSection(Widget):
             raw_title = (
                 shelf.get("title") if isinstance(shelf, dict) else None
             ) or f"Shelf {i + 1}"
-            title = _clean_shelf_title(str(raw_title))
+            title = clean_shelf_title(str(raw_title))
             is_event = i < self._event_count
             classes = "shelf-pill event" if is_event else "shelf-pill"
             if i == self._active_daily:
@@ -1900,3 +1907,54 @@ class BrowsePage(Widget):
         except Exception:
             logger.exception("Failed to persist new region setting")
         self._load_charts(country=code)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same classification engine; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        chart_sort_key as _native_chart_sort_key,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        is_event_shelf as _native_is_event_shelf,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        is_playlist_row as _native_is_playlist_row,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_rows as _native_playlist_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        split_events_and_charts as _native_split_events_and_charts,
+    )
+except ImportError:
+    pass
+else:
+
+    def _is_event_shelf(shelf: dict) -> bool:  # noqa: F811
+        """Event-shelf classification (native Rust engine)."""
+        return _native_is_event_shelf(shelf)
+
+    def _chart_sort_key(shelf: dict) -> tuple[int, str]:  # noqa: F811
+        """Chart-pill sort key (native Rust engine)."""
+        return _native_chart_sort_key(shelf)
+
+    def _split_events_and_charts(  # noqa: F811
+        shelves: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        """Event/chart partition + priority sort (native Rust engine)."""
+        return _native_split_events_and_charts(shelves)
+
+    def _is_playlist_row(item: object) -> bool:  # noqa: F811
+        """Playlist-row classification (native Rust engine)."""
+        return _native_is_playlist_row(item)
+
+    def _playlist_rows(shelves: list[Any]) -> list[dict[str, Any]]:  # noqa: F811
+        """Playlist-row extraction + dedup (native Rust engine)."""
+        return _native_playlist_rows(shelves)

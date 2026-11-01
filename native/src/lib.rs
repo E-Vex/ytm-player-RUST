@@ -171,6 +171,16 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // purge that drops every stack/cache reference to deleted playlists.
     module.add_function(pyo3::wrap_pyfunction!(resolve_navigation, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(purge_dead_playlist_refs, module)?)?;
+
+    // Browse home-feed shelf classification (ui/pages/browse.py
+    // equivalent): the event-vs-chart partition with priority pill
+    // ordering behind the Charts tab, and the playlist-row extraction
+    // with per-id dedup behind the Playlists tab.
+    module.add_function(pyo3::wrap_pyfunction!(is_event_shelf, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(chart_sort_key, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(split_events_and_charts, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(is_playlist_row, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(playlist_rows, module)?)?;
     Ok(())
 }
 
@@ -3536,4 +3546,179 @@ fn purge_dead_playlist_refs<'py>(
     out.set_item("forward_stack", PyList::new(py, forward)?)?;
     out.set_item("page_state_cache", cache)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Browse home-feed shelf classification (mirrors ui/pages/browse.py)
+// ---------------------------------------------------------------------------
+
+/// Chart-pill priority prefixes — the `_CHART_PRIORITY` table in
+/// `ui/pages/browse.py`: the canonical "what's hot in country X" shelves
+/// sort first, in this order; every other title shares rank 99 and sorts
+/// alphabetically. Lower rank = earlier.
+const CHART_PRIORITY: [&str; 3] = ["Top 100 Songs", "Weekly Top Songs on Shorts", "Trending 20"];
+const CHART_UNRANKED: i64 = 99;
+
+/// `str(shelf.get("title", ""))` — the shelf title as Python's `str()` sees
+/// it: a missing title is the `""` default, `None` becomes `"None"`, a
+/// number its decimal form, any other object its `__str__`. The `.get` goes
+/// through the method (so a dict subclass overriding `get` behaves exactly
+/// like the fallback), and an object without a `.get` — where the fallback
+/// would raise `AttributeError` — reads as `""`, keeping the engine total;
+/// the charts caller pre-filters its raw shelf list to dicts, so that path
+/// is defensive only.
+fn shelf_title(py: Python, shelf: &Bound<'_, PyAny>) -> PyResult<String> {
+    let title = match shelf.call_method1("get", ("title", "")) {
+        Ok(title) => title,
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+            return Ok(String::new());
+        }
+        Err(err) => return Err(err),
+    };
+    Ok(title.str()?.to_string_lossy().into_owned())
+}
+
+/// The `_chart_sort_key` pair for a title: the rank of the first priority
+/// prefix the title starts with, else 99; the title itself breaks ties.
+/// String comparison is byte order, which for UTF-8 equals Python's
+/// code-point order, so the tie-break matches the fallback's exactly.
+fn chart_key_for(title: &str) -> (i64, &str) {
+    for (rank, prefix) in CHART_PRIORITY.iter().enumerate() {
+        if title.starts_with(prefix) {
+            return (rank as i64, title);
+        }
+    }
+    (CHART_UNRANKED, title)
+}
+
+/// A shelf is a global event playlist iff its title carries a brand prefix
+/// — YouTube formats events as `"<Brand>: <Generic Title>"` (e.g.
+/// `"Coachella 2026: Daily Top 100 Songs"`). Country chart shelves never
+/// use the colon-space form.
+///
+/// Mirrors `_is_event_shelf` from `ui/pages/browse.py`; a non-dict shelf
+/// (see `shelf_title`) reads as title-less and classifies as a chart.
+#[pyfunction]
+fn is_event_shelf(py: Python, shelf: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(shelf_title(py, shelf)?.contains(": "))
+}
+
+/// The sort key behind the country-chart pill order: a tuple
+/// `(rank, title)` where *rank* is the index of the first `_CHART_PRIORITY`
+/// prefix the title starts with (99 for none of them) and *title* is the
+/// `str()`-ified shelf title that breaks ties.
+///
+/// Mirrors `_chart_sort_key` from `ui/pages/browse.py`.
+#[pyfunction]
+fn chart_sort_key(py: Python, shelf: &Bound<'_, PyAny>) -> PyResult<(i64, String)> {
+    let title = shelf_title(py, shelf)?;
+    let (rank, title) = chart_key_for(&title);
+    Ok((rank, title.to_string()))
+}
+
+/// Partition shelves into `(events, charts)`, with the charts pre-sorted by
+/// canonical priority. Events keep their original order — there are rarely
+/// more than one, and YouTube's ordering reflects editorial intent.
+///
+/// Mirrors `_split_events_and_charts` from `ui/pages/browse.py`: the charts
+/// sort is Python's `sorted(..., key=_chart_sort_key)` — stable, so equal
+/// `(rank, title)` keys keep input order — which Rust's stable `sort_by`
+/// over the same comparator reproduces. The returned lists hold the input
+/// shelf objects themselves (no copies), and the input list is never
+/// mutated.
+#[pyfunction]
+fn split_events_and_charts<'py>(
+    py: Python<'py>,
+    shelves: &Bound<'py, PyList>,
+) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+    let mut events: Vec<Bound<'py, PyAny>> = Vec::new();
+    let mut charts: Vec<(i64, String, Bound<'py, PyAny>)> = Vec::new();
+    for shelf in shelves.iter() {
+        let title = shelf_title(py, &shelf)?;
+        if title.contains(": ") {
+            events.push(shelf);
+        } else {
+            let (rank, _) = chart_key_for(&title);
+            charts.push((rank, title, shelf));
+        }
+    }
+    charts.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let chart_row: Vec<Bound<'py, PyAny>> = charts.into_iter().map(|(_, _, s)| s).collect();
+    Ok((PyList::new(py, events)?, PyList::new(py, chart_row)?))
+}
+
+/// True for a home-feed row that is a playlist: a mix, a curated or a user
+/// playlist, a recap, Liked Music.
+///
+/// Mirrors `_is_playlist_row` from `ui/pages/browse.py` exactly: the row
+/// must be a dict (a subclass counts, like the fallback's `isinstance`),
+/// its `playlistId` must be a non-empty `str` (`bool()` truthiness, so a
+/// str subclass's `__bool__`/`__len__` governs emptiness), and its
+/// `videoId` must be falsy — Python truthiness, so `None`, `""`, `0`, `[]`
+/// and `{}` all count as absent. Songs always carry `videoId` (some with a
+/// `playlistId` too); albums carry `audioPlaylistId` and never
+/// `playlistId`; artists and podcasts carry neither.
+#[pyfunction]
+fn is_playlist_row(item: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if !item.is_instance_of::<PyDict>() {
+        return Ok(false);
+    }
+    let dict = item.downcast::<PyDict>().unwrap();
+    match dict.get_item("playlistId")? {
+        Some(v) if v.is_instance_of::<PyString>() && v.is_truthy()? => {}
+        _ => return Ok(false),
+    }
+    match dict.get_item("videoId")? {
+        Some(v) => Ok(!v.is_truthy()?),
+        None => Ok(true),
+    }
+}
+
+/// The playlist rows across *shelves*, in feed order, one per playlist id.
+///
+/// Mirrors `_playlist_rows` from `ui/pages/browse.py`: walk the shelves in
+/// order (non-dict shelves and shelves whose `contents` is not a list are
+/// skipped — subclass dicts and lists count, matching the fallback's
+/// `isinstance` gates), keep every `is_playlist_row` item whose
+/// `playlistId` has not been seen yet, and return the row objects
+/// themselves (the first occurrence wins, no copies). Inputs are never
+/// mutated.
+#[pyfunction]
+fn playlist_rows<'py>(
+    py: Python<'py>,
+    shelves: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rows: Vec<Bound<'py, PyAny>> = Vec::new();
+    for shelf in shelves.iter() {
+        if !shelf.is_instance_of::<PyDict>() {
+            continue;
+        }
+        let dict = shelf.downcast::<PyDict>().unwrap();
+        let contents = match dict.get_item("contents")? {
+            Some(v) if v.is_instance_of::<PyList>() => v,
+            _ => continue,
+        };
+        let contents = contents.downcast::<PyList>().unwrap();
+        for item in contents.iter() {
+            if !is_playlist_row(&item)? {
+                continue;
+            }
+            // `item["playlistId"]` — a non-empty str by the gate above.
+            let playlist_id = item.downcast::<PyDict>().unwrap().get_item("playlistId")?;
+            let pid = match playlist_id {
+                Some(v) => v
+                    .downcast::<PyString>()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                None => continue, // unreachable through the gate; stays total
+            };
+            if !seen.insert(pid) {
+                continue;
+            }
+            rows.push(item);
+        }
+    }
+    PyList::new(py, rows)
 }
