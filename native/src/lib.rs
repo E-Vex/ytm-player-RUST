@@ -313,6 +313,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // the final join and the redaction pass — from the probes'
     // results.
     module.add_function(pyo3::wrap_pyfunction!(doctor_report, module)?)?;
+
+    // Doctor probe engines (utils/doctor.py equivalents): the
+    // mpv-warning tail behind the Recent mpv warnings/errors probe, and
+    // the crash-staleness verdict behind the Most recent crash file
+    // section — the metadata-header scan, the PEP 440 comparison of the
+    // recorded version against the installed one, and the note assembly.
+    module.add_function(pyo3::wrap_pyfunction!(recent_mpv_lines, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(crash_staleness_note, module)?)?;
     Ok(())
 }
 
@@ -1243,6 +1251,21 @@ fn argv_is_ytm(argv: Vec<String>) -> bool {
     head_names.iter().any(|name| name == "ytm") || argv.iter().any(|a| a == "ytm_player")
 }
 
+/// The start index of Python's `seq[-n:]` tail slice: a positive *n*
+/// keeps the last n, zero keeps everything (`seq[-0:]` is `seq[0:]`),
+/// and a negative n drops the leading -n entries (empty when that
+/// exceeds the length).
+fn py_tail_start(len: usize, n: i64) -> usize {
+    if n > 0 {
+        len.saturating_sub(n as usize)
+    } else if n == 0 {
+        0
+    } else {
+        // unsigned_abs rather than -n: negating i64::MIN overflows.
+        (n.unsigned_abs() as i128).min(len as i128) as usize
+    }
+}
+
 /// Filter already-read log lines down to those at or above *min_level* and
 /// return the last *n* joined together. Mirrors the pure filtering core of
 /// `ytm_player.utils.logging.get_recent_log_lines` (file I/O stays in
@@ -1262,18 +1285,8 @@ fn filter_log_lines(lines: Vec<String>, n: i64, min_level: Option<&str>) -> Stri
             kept.retain(|line| wanted.iter().any(|w| line.contains(w.as_str())));
         }
     }
-    // Mirror Python's `lines[-n:]`: positive n keeps the last n, zero keeps
-    // everything (`lines[-0:]` is `lines[0:]`), negative n drops the leading
-    // -n entries (empty when -n exceeds the length).
-    let len = kept.len();
-    let start = if n > 0 {
-        len.saturating_sub(n as usize)
-    } else if n == 0 {
-        0
-    } else {
-        ((-n) as i128).min(len as i128) as usize
-    };
-    kept[start..].concat()
+    // Python's `lines[-n:]` (see py_tail_start).
+    kept[py_tail_start(kept.len(), n)..].concat()
 }
 
 // ---------------------------------------------------------------------------
@@ -6851,4 +6864,371 @@ fn doctor_report<'py>(
     // "\n".join(sections) — then the redaction pass, the same engine
     // the Python side's _redact binds to.
     Ok(redact(&sections.join("\n")))
+}
+
+// ---------------------------------------------------------------------------
+// Doctor probe engines (mirror ytm_player/utils/doctor.py)
+// ---------------------------------------------------------------------------
+
+/// The last *n* lines containing `mpv[`, joined together. Mirrors the pure
+/// filtering core of `ytm_player.utils.doctor._recent_mpv_lines` (the
+/// existence check and the file read stay in Python): the `mpv[` match is
+/// a substring test, not a prefix one; lines keep their trailing newlines
+/// so the join reproduces them; the empty match list returns the
+/// no-warnings marker before any slice is taken; and the tail follows
+/// Python's `matches[-n:]` semantics (see `py_tail_start`).
+#[pyfunction]
+fn recent_mpv_lines(lines: Vec<String>, n: i64) -> String {
+    let matches: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|ln| ln.contains("mpv["))
+        .collect();
+    if matches.is_empty() {
+        return "(no mpv warnings/errors logged)".to_string();
+    }
+    matches[py_tail_start(matches.len(), n)..].concat()
+}
+
+/// The metadata keys `write_crash_file()` stamps at the top of every crash
+/// file (`logging._crash_metadata_header`). Only these count as header
+/// lines — a traceback line that happens to be `Word: value` shaped (e.g.
+/// `ValueError: x`) must not be mistaken for crash metadata. Mirrors
+/// `doctor._CRASH_META_KEYS` (case-sensitive membership).
+const CRASH_META_KEYS: [&str; 4] = ["version", "time", "python", "platform"];
+
+/// The `(\w+):\s+(\S+)` line shape of the crash-metadata header, with
+/// CPython's `\s`/`\S` set spelled out (`\s` is the str.isspace set —
+/// White_Space plus `\x1c`–`\x1f`, which the crate's own `\s` disagrees
+/// on; `\S` is its exact complement). The key class stays `\w`: where
+/// Python's and the crate's word-char sets differ the divergence provably
+/// cannot change the verdict — a key in `CRASH_META_KEYS` is pure ASCII,
+/// where both sets agree, and any divergent word run is left without its
+/// colon on one side, ending the header scan on both.
+static CRASH_META_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(\w+):[\s\x{1c}-\x{1f}]+([^\s\x{1c}-\x{1f}]+)").expect("valid crash meta regex")
+});
+
+/// The PEP 440 version grammar from `packaging`, ASCII-scoped and
+/// case-insensitive exactly like its `(?a:...)` groups under
+/// `re.IGNORECASE`: every word spelling is per-character cased (`AlPhA` is
+/// a valid pre-release marker), the local alphabet is `[a-zA-Z0-9]` — the
+/// `(?a:)` scoping rejects the Unicode folds (`ſ` U+017F, the Kelvin sign
+/// U+212A) the crate's own case-insensitive mode would admit — and the
+/// wrapping whitespace is CPython's `\s` (see `CRASH_META_RE`). Anchored at
+/// both ends like the reference's `fullmatch`, with group names mirroring
+/// packaging's own.
+static PEP440_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^[\s\x{1c}-\x{1f}]*[vV]?",
+        r"(?:",
+        r"(?:(?P<epoch>[0-9]+)!)?",
+        r"(?P<release>[0-9]+(?:\.[0-9]+)*)",
+        r"(?:[._-]?(?P<pre_l>[aA][lL][pP][hH][aA]|[aA]|[bB][eE][tT][aA]|[bB]",
+        r"|[pP][rR][eE][vV][iI][eE][wW]|[pP][rR][eE]|[cC]|[rR][cC])",
+        r"[._-]?(?P<pre_n>[0-9]+)?)?",
+        r"(?:-(?P<post_n1>[0-9]+)|[._-]?(?P<post_l>[pP][oO][sS][tT]|[rR][eE][vV]|[rR])",
+        r"[._-]?(?P<post_n2>[0-9]+)?)?",
+        r"(?:[._-]?(?P<dev_l>[dD][eE][vV])[._-]?(?P<dev_n>[0-9]+)?)?",
+        r")",
+        r"(?:\+(?P<local>[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*))?",
+        r"[\s\x{1c}-\x{1f}]*$",
+    ))
+    .expect("valid pep440 regex")
+});
+
+/// CPython's default `sys.int_max_str_digits`: the length above which the
+/// int(str) conversion raises a plain ValueError. `packaging` parses
+/// version components through int(), so a numeric component longer than
+/// this is a version the reference cannot compare — the engine enforces
+/// the same default limit so both backends agree on the no-verdict
+/// outcome for such strings.
+const INT_MAX_STR_DIGITS: usize = 4300;
+
+/// A non-negative integer of unbounded width, held as its normalized
+/// decimal digits (leading zeros stripped; the empty string is zero).
+/// PEP 440 epochs and release segments can exceed every fixed-width
+/// integer, so the comparison is numeric on the digit run itself: the
+/// longer run is the larger number, equal lengths compare digit by digit.
+#[derive(PartialEq, Eq)]
+struct BigNum(String);
+
+impl BigNum {
+    fn zero() -> Self {
+        BigNum(String::new())
+    }
+
+    /// Normalize a matched digit run, or None when it exceeds CPython's
+    /// int-conversion digit limit (see `INT_MAX_STR_DIGITS`).
+    fn from_digits(digits: &str) -> Option<Self> {
+        if digits.len() > INT_MAX_STR_DIGITS {
+            return None;
+        }
+        Some(BigNum(digits.trim_start_matches('0').to_string()))
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Ord for BigNum {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.0.is_empty(), other.0.is_empty()) {
+            // Both zero.
+            (true, true) => std::cmp::Ordering::Equal,
+            // Zero is smaller than any other number.
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => self
+                .0
+                .len()
+                .cmp(&other.0.len())
+                .then_with(|| self.0.cmp(&other.0)),
+        }
+    }
+}
+
+impl PartialOrd for BigNum {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The pre-release rank from packaging's `_PRE_RANK`: a=0, b=1, rc=2 (the
+/// marker spellings alpha/beta/c/pre/preview all normalise onto these).
+fn pep440_pre_rank(letter: &str) -> i8 {
+    match letter.to_lowercase().as_str() {
+        "a" => 0,
+        "b" => 1,
+        _ => 2,
+    }
+}
+
+/// The flat pre/post/dev comparison suffix from packaging's `_cmpkey`,
+/// compared as the tuple it is: (pre_rank, pre_n, post_rank, post_n,
+/// dev_rank, dev_n).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Pep440Suffix {
+    pre_rank: i8,
+    pre_n: BigNum,
+    post_rank: u8,
+    post_n: BigNum,
+    dev_rank: u8,
+    dev_n: BigNum,
+}
+
+/// One local-version segment. Mirrors packaging's `(n, "")` /
+/// `(NegativeInfinity, s)` segment pairs: a string segment sorts before
+/// every numeric segment, strings compare lexicographically and numbers
+/// numerically.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440LocalSeg {
+    Str(String),
+    Num(BigNum),
+}
+
+/// The PEP 440 comparison key, in packaging's `_cmpkey` order: epoch,
+/// release (trailing zeros stripped, so `1.0.0 == 1`), the pre/post/dev
+/// suffix, then the local segments — absent sorting before present, and
+/// the segment list comparing as the tuple it is.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct Pep440Key {
+    epoch: BigNum,
+    release: Vec<BigNum>,
+    suffix: Pep440Suffix,
+    local: Option<Vec<Pep440LocalSeg>>,
+}
+
+/// Parse a version string into its PEP 440 comparison key, or None when
+/// the string is not a valid version — or one of its numbers exceeds
+/// CPython's int-conversion digit limit (see `INT_MAX_STR_DIGITS`).
+fn parse_pep440(text: &str) -> Option<Pep440Key> {
+    let caps = PEP440_RE.captures(text)?;
+
+    let epoch = BigNum::from_digits(caps.name("epoch").map(|m| m.as_str()).unwrap_or("0"))?;
+    let mut release: Vec<BigNum> = caps
+        .name("release")?
+        .as_str()
+        .split('.')
+        .map(BigNum::from_digits)
+        .collect::<Option<Vec<_>>>()?;
+    // Strip trailing zeros: 1.0.0 compares equal to 1.
+    while release.last().is_some_and(BigNum::is_zero) {
+        release.pop();
+    }
+
+    // Each numeric group is Option<Option<BigNum>>: the outer Option is
+    // "did the group match", the inner is the digit-limit-checked number.
+    // A matched group whose digits exceed the limit invalidates the whole
+    // version (the reference's int() raises through), an unmatched one
+    // simply carries no number.
+    let pre_l = caps.name("pre_l").map(|m| m.as_str());
+    let pre_n = caps.name("pre_n").map(|m| BigNum::from_digits(m.as_str()));
+    let post_n1 = caps
+        .name("post_n1")
+        .map(|m| BigNum::from_digits(m.as_str()));
+    let post_l = caps.name("post_l").map(|m| m.as_str());
+    let post_n2 = caps
+        .name("post_n2")
+        .map(|m| BigNum::from_digits(m.as_str()));
+    let dev_l = caps.name("dev_l").map(|m| m.as_str());
+    let dev_n = caps.name("dev_n").map(|m| BigNum::from_digits(m.as_str()));
+
+    let post_matched = post_n1.is_some() || post_l.is_some();
+    let dev_matched = dev_l.is_some();
+
+    // The pre rank: a dev-only release (no pre, no post, dev present)
+    // sorts before every alpha; a release without a pre sorts after every
+    // rc; otherwise the marker's rank with its number (an implicit 0
+    // when the digits are absent).
+    let (pre_rank, pre_num) = if let Some(letter) = pre_l {
+        let number = match pre_n {
+            Some(number) => number?,
+            None => BigNum::zero(),
+        };
+        (pep440_pre_rank(letter), number)
+    } else if !post_matched && dev_matched {
+        (-1, BigNum::zero())
+    } else {
+        (3, BigNum::zero())
+    };
+
+    // post: `-N` (post_n1) and `postN`/`post`/`rev`/`r` (post_l+post_n2)
+    // both normalise to a number, again with the implicit 0.
+    let post_num = if post_matched {
+        match post_n1.or(post_n2) {
+            Some(number) => number?,
+            None => BigNum::zero(),
+        }
+    } else {
+        BigNum::zero()
+    };
+
+    let dev_num = match dev_n {
+        Some(number) => number?,
+        None => BigNum::zero(),
+    };
+
+    let suffix = Pep440Suffix {
+        pre_rank,
+        pre_n: pre_num,
+        post_rank: u8::from(post_matched),
+        post_n: post_num,
+        dev_rank: u8::from(!dev_matched),
+        dev_n: dev_num,
+    };
+
+    let local = match caps.name("local") {
+        None => None,
+        Some(m) => Some(
+            m.as_str()
+                .split(['.', '_', '-'])
+                .map(|part| {
+                    if part.bytes().all(|b| b.is_ascii_digit()) {
+                        // int(part): a digit run beyond the int-conversion
+                        // limit invalidates the version.
+                        BigNum::from_digits(part).map(Pep440LocalSeg::Num)
+                    } else {
+                        Some(Pep440LocalSeg::Str(part.to_lowercase()))
+                    }
+                })
+                .collect::<Option<Vec<Pep440LocalSeg>>>()?,
+        ),
+    };
+
+    Some(Pep440Key {
+        epoch,
+        release,
+        suffix,
+        local,
+    })
+}
+
+/// Split exactly like CPython's `str.splitlines`: on every line boundary
+/// it accepts (`\n`, `\r\n` as one, `\r`, `\v`, `\f`, `\x1c`, `\x1d`,
+/// `\x1e`, `\x85`, `\u{2028}`, `\u{2029}`) — a wider set than the
+/// crate's own `str::splitlines` — with a trailing boundary producing no
+/// trailing empty line, and an empty string producing no lines at all.
+fn py_splitlines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' | '\u{0b}' | '\u{0c}' | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{85}' | '\u{2028}'
+            | '\u{2029}' => lines.push(std::mem::take(&mut current)),
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                lines.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Warn when the most recent crash predates the running build. Mirrors
+/// `ytm_player.utils.doctor._crash_staleness_note`: only the contiguous
+/// known `key: value` metadata header just after the `=== label ===`
+/// banner is parsed (a blank line ends it; an unknown or non-key-shaped
+/// line ends it — so a traceback's `ValueError: x` is never mistaken for
+/// metadata, and a `version:` line buried in the body is never read); a
+/// missing version line earns the predates-stamping note; the `unknown`
+/// sentinel earns none; and otherwise a PEP 440 comparison decides
+/// between the stale-build note and no note. Any version that fails to
+/// parse — including a numeric component longer than CPython's
+/// int-conversion digit limit — earns no note.
+#[pyfunction]
+fn crash_staleness_note(content: &str, current_version: &str) -> Option<String> {
+    let lines = py_splitlines(content);
+    let start = usize::from(lines.first().is_some_and(|l| l.starts_with("===")));
+    let mut crash_version: Option<&str> = None;
+    for line in &lines[start..] {
+        // A blank line (nothing but CPython whitespace) ends the header.
+        if line.chars().all(py_isspace) {
+            break;
+        }
+        let meta = CRASH_META_RE.captures(line).and_then(|caps| {
+            let key = caps.get(1)?.as_str();
+            let value = caps.get(2)?.as_str();
+            Some((key, value))
+        });
+        let Some((key, value)) = meta else {
+            break; // not a key: value line -> the header is over
+        };
+        if !CRASH_META_KEYS.contains(&key) {
+            break; // not a known header key (e.g. a traceback line)
+        }
+        if key == "version" {
+            crash_version = Some(value);
+            break;
+        }
+    }
+
+    let Some(crash_version) = crash_version else {
+        return Some(
+            "⚠ This crash file predates crash-version stamping (no version recorded). If it's \
+             from an older build it may already be fixed — reproduce on the current version \
+             before reporting."
+                .to_string(),
+        );
+    };
+    if crash_version == "unknown" {
+        return None;
+    }
+    let (crash_key, current_key) = (parse_pep440(crash_version), parse_pep440(current_version));
+    if crash_key? < current_key? {
+        return Some(format!(
+            "⚠ This crash was recorded by ytm-player {crash_version}, older than the installed \
+             {current_version} — it may already be fixed. Reproduce on the current version \
+             before reporting."
+        ));
+    }
+    None
 }

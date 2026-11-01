@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from packaging.version import InvalidVersion, Version
+from packaging.version import Version
 
 # Try to load the native Rust implementation via PyO3.  If the compiled
 # extension is unavailable (e.g. during development without a Rust toolchain),
@@ -178,8 +178,37 @@ def _running_status() -> str:
     return "ytm running: " + ", ".join(parts)
 
 
+def _mpv_lines(lines: list[str], n: int) -> str:
+    """The mpv-warning tail behind ``_recent_mpv_lines``.
+
+    The pure half of the Recent mpv warnings/errors probe: the log
+    lines containing ``mpv[`` (our log_handler prefix — a substring
+    test, not a prefix one), the empty-match substitution of the
+    no-warnings marker (decided before any slice is taken), the last
+    *n* of the matches under Python's ``[-n:]`` tail semantics (zero
+    keeps everything — ``[-0:]`` is ``[0:]`` — and a negative n drops
+    the leading entries), and the separator-less join, the line endings
+    coming along inside the lines themselves. The input lines are
+    never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.recent_mpv_lines``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    matches = [ln for ln in lines if "mpv[" in ln]
+    if not matches:
+        return "(no mpv warnings/errors logged)"
+    return "".join(matches[-n:])
+
+
 def _recent_mpv_lines(log_file: Path, n: int = 20) -> str:
-    """Return the last *n* log lines that contain 'mpv[' (our log_handler prefix)."""
+    """Return the last *n* log lines that contain 'mpv[' (our log_handler prefix).
+
+    The mpv-warning tail — the ``mpv[`` filter, the last-n slice and
+    the join — is resolved by the ``_mpv_lines`` engine above (native
+    when the Rust extension is built, the pure-Python transcription
+    otherwise); this helper performs the reads.
+    """
     if not log_file.exists():
         return "(log file is empty or missing)"
     try:
@@ -187,10 +216,7 @@ def _recent_mpv_lines(log_file: Path, n: int = 20) -> str:
             lines = f.readlines()
     except OSError:
         return "(could not read log file)"
-    matches = [ln for ln in lines if "mpv[" in ln]
-    if not matches:
-        return "(no mpv warnings/errors logged)"
-    return "".join(matches[-n:])
+    return _mpv_lines(lines, n)
 
 
 def _recent_faulthandler(crash_dir: Path) -> str:
@@ -232,6 +258,10 @@ def _crash_staleness_note(content: str, current_version: str) -> str | None:
     after the ``=== label ===`` banner — is parsed. Scanning the whole body, or
     accepting any key-shaped line, would let an exception line (``ValueError:
     x``) or a ``version:``-shaped traceback line produce a bogus verdict.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.crash_staleness_note``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
     lines = content.splitlines()
     start = 1 if lines and lines[0].startswith("===") else 0
@@ -253,6 +283,11 @@ def _crash_staleness_note(content: str, current_version: str) -> str | None:
         )
     if crash_version == "unknown":
         return None
+    # InvalidVersion is a ValueError subclass; the wider catch also covers
+    # the plain ValueError CPython's int(str) raises for numeric components
+    # beyond the ~4300-digit conversion limit, so an absurd version in a
+    # corrupted crash file is a no-verdict instead of a doctor crash (the
+    # native engine enforces the same limit and never raises either).
     try:
         if Version(crash_version) < Version(current_version):
             return (
@@ -260,7 +295,7 @@ def _crash_staleness_note(content: str, current_version: str) -> str | None:
                 f"older than the installed {current_version} — it may already be "
                 "fixed. Reproduce on the current version before reporting."
             )
-    except InvalidVersion:
+    except ValueError:
         return None
     return None
 
@@ -442,6 +477,24 @@ def gather_diagnostics() -> str:
 # rebinding must happen AFTER the definitions above — assigning the native
 # functions any earlier would be clobbered by the ``def`` statements (the
 # lesson that produced formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        crash_staleness_note as _native_crash_staleness_note,
+    )
+except ImportError:
+    pass
+else:
+    _crash_staleness_note = _native_crash_staleness_note  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        recent_mpv_lines as _native_recent_mpv_lines,
+    )
+except ImportError:
+    pass
+else:
+    _mpv_lines = _native_recent_mpv_lines  # type: ignore[assignment]
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]

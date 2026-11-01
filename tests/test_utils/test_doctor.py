@@ -349,6 +349,174 @@ class TestMprisStatus:
         assert "may already be fixed" in report
 
 
+class TestRecentMpvLines:
+    """The mpv-warning tail behind the Recent mpv warnings/errors section."""
+
+    def test_keeps_matching_lines_joined_in_order(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text(
+            "2026-01-01 [WARNING] ytm_player: regular warning\n"
+            "2026-01-01 [WARNING] ytm_player.services.player: mpv[ao]: format mismatch\n"
+            "2026-01-01 [ERROR] ytm_player.services.player: mpv[file]: cannot open\n"
+        )
+
+        assert _recent_mpv_lines(log) == (
+            "2026-01-01 [WARNING] ytm_player.services.player: mpv[ao]: format mismatch\n"
+            "2026-01-01 [ERROR] ytm_player.services.player: mpv[file]: cannot open\n"
+        )
+
+    def test_missing_file_marker(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        assert _recent_mpv_lines(tmp_path / "nope.log") == "(log file is empty or missing)"
+
+    def test_unreadable_file_marker(self, tmp_path):
+        # A directory passes .exists() but open() raises OSError.
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        assert _recent_mpv_lines(tmp_path) == "(could not read log file)"
+
+    def test_no_matches_marker(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text("only regular warnings\nand errors here\n")
+
+        assert _recent_mpv_lines(log) == "(no mpv warnings/errors logged)"
+
+    def test_tail_slice_keeps_last_n(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text("".join(f"mpv[{name}]: line {i}\n" for i, name in enumerate("abcde")))
+
+        assert _recent_mpv_lines(log, n=2) == "mpv[d]: line 3\nmpv[e]: line 4\n"
+
+    def test_zero_n_keeps_everything(self, tmp_path):
+        # `matches[-0:]` is `matches[0:]` — a zero count is not an empty tail.
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text("mpv[a]: 1\nmpv[b]: 2\n")
+
+        assert _recent_mpv_lines(log, n=0) == "mpv[a]: 1\nmpv[b]: 2\n"
+
+    def test_last_line_without_trailing_newline_is_kept(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_mpv_lines
+
+        log = tmp_path / "ytm.log"
+        log.write_text("mpv[a]: 1\nmpv[b]: no newline")
+
+        assert _recent_mpv_lines(log) == "mpv[a]: 1\nmpv[b]: no newline"
+
+    def test_substring_match_not_prefix(self):
+        from ytm_player.utils.doctor import _mpv_lines
+
+        assert _mpv_lines(["player warning mpv[ao]: mid-line\n"], 20) == (
+            "player warning mpv[ao]: mid-line\n"
+        )
+
+    def test_negative_n_drops_leading_matches(self):
+        from ytm_player.utils.doctor import _mpv_lines
+
+        lines = ["mpv[a]: 1\n", "mpv[b]: 2\n", "mpv[c]: 3\n"]
+        assert _mpv_lines(lines, -1) == "mpv[b]: 2\nmpv[c]: 3\n"
+        # Beyond the length: the slice is empty (not the no-warnings marker).
+        assert _mpv_lines(lines, -99) == ""
+
+    def test_engine_never_mutates_input(self):
+        from ytm_player.utils.doctor import _mpv_lines
+
+        lines = ["mpv[a]: 1\n", "plain\n"]
+        _mpv_lines(lines, 5)
+        assert lines == ["mpv[a]: 1\n", "plain\n"]
+
+
+class TestCrashStalenessPep440:
+    """The PEP 440 ordering behind the staleness verdict — the same
+    comparison packaging's ``Version`` performs, on both backends."""
+
+    @staticmethod
+    def note(content, current):
+        from ytm_player.utils.doctor import _crash_staleness_note
+
+        return _crash_staleness_note(content, current)
+
+    def test_exact_note_wording(self):
+        note = self.note("=== Crash ===\nversion: 1.9.4\n\nTraceback", "2.1.0")
+        assert note == (
+            "⚠ This crash was recorded by ytm-player 1.9.4, older than the "
+            "installed 2.1.0 — it may already be fixed. Reproduce on the "
+            "current version before reporting."
+        )
+
+    def test_pre_release_counts_as_older(self):
+        assert self.note("version: 2.1.0rc1\n", "2.1.0") is not None
+        assert self.note("version: 2.1.0alpha2\n", "2.1.0") is not None
+        assert self.note("version: 2.1.0AlPhA1\n", "2.1.0") is not None
+
+    def test_dev_release_counts_as_older(self):
+        # A dev-only release sorts before every pre-release.
+        assert self.note("version: 2.1.0.dev1\n", "2.1.0") is not None
+        assert self.note("version: 2.1.0.dev1\n", "2.1.0a1") is not None
+
+    def test_post_release_is_not_older(self):
+        assert self.note("version: 2.1.0.post1\n", "2.1.0") is None
+        assert self.note("version: 1.0.0-1\n", "1.0.0") is None
+
+    def test_epoch_dominates(self):
+        assert self.note("version: 1!2.0\n", "2!1.0") is not None
+        assert self.note("version: 1!1.0\n", "2.0") is None  # epoch 1 beats 0
+        assert self.note("version: 2.0\n", "1!1.0") is not None
+
+    def test_trailing_zeros_compare_equal(self):
+        assert self.note("version: 2.1\n", "2.1.0") is None
+        assert self.note("version: 2.1.0.0.0\n", "2.1") is None
+
+    def test_local_version_ordering(self):
+        # No local sorts before any local; strings sort before numbers.
+        assert self.note("version: 2.1.0\n", "2.1.0+local") is not None
+        assert self.note("version: 2.1.0+build.1\n", "2.1.0+build.2") is not None
+        assert self.note("version: 2.1.0+9\n", "2.1.0+10") is not None
+        assert self.note("version: 2.1.0+abc\n", "2.1.0+2") is not None
+        assert self.note("version: 2.1.0+local\n", "2.1.0") is None
+
+    def test_v_prefix_and_padding(self):
+        assert self.note("version: v1.9.4\n", "2.1.0") is not None
+        assert self.note("version: v2.1.0\n", "2.1.0") is None
+
+    def test_write_crash_file_header_shape_is_read(self):
+        # The exact header logging._crash_metadata_header stamps.
+        content = (
+            "=== Main thread crash ===\n"
+            "version:   2.0.1\n"
+            "time:      2026-01-01T00:00:00\n"
+            "python:    3.12.0\n"
+            "platform:  Linux 6.1.0-arch1 (x86_64)\n"
+            "\n"
+            "Traceback body\n"
+        )
+        note = self.note(content, "2.1.0")
+        assert note is not None
+        assert "2.0.1" in note
+
+    def test_giant_digit_version_is_a_no_verdict(self):
+        # CPython's int(str) refuses >4300-digit numbers with a plain
+        # ValueError; both backends treat such a version as unparseable
+        # instead of crashing the doctor.
+        assert self.note("version: " + "9" * 5000 + "\n", "2.1.0") is None
+        assert self.note("version: 1.0+" + "9" * 5000 + "\n", "2.1.0") is None
+
+    def test_unicode_folds_are_rejected(self):
+        # packaging's (?a:) ASCII scoping: the long s and the Kelvin sign
+        # are not ASCII letters.
+        assert self.note("version: 1.0+\u017f\n", "2.1.0") is None  # ſ (long s)
+        assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is None
+        assert self.note("version: 1.0+\u212a\n", "2.1.0") is None  # K (Kelvin sign)
+
+
 class TestArgvIsYtm:
     """The running-instance matcher must see real entry points and skip
     bystanders (an editor with the repo open, say)."""
@@ -739,4 +907,197 @@ class TestDoctorReportNativeParity:
                 f"crash={fields['crash']!r}:\n"
                 f"native:   {n!r}\n"
                 f"fallback: {f!r}"
+            )
+
+
+# ── mpv-tail native vs fallback parity ────────────────────────────────
+
+# Shared with the child interpreter as JSON, so every value must be
+# JSON-round-trippable. (lines, n) pairs; n covers Python's whole [-n:]
+# slice range — positive tails, the zero-keeps-everything quirk, and
+# negative counts dropping leading matches.
+_MPV_PARITY_CASES = [
+    ([], 20),
+    (["plain line\n"], 20),
+    (["mpv[ao]: one\n"], 20),
+    (["plain\n", "mpv[a]: 1\n", "plain\n", "mpv[b]: 2\n"], 20),
+    (["mpv[a]: 1\n", "mpv[b]: 2\n", "mpv[c]: 3\n"], 1),
+    (["mpv[a]: 1\n", "mpv[b]: 2\n"], 0),
+    (["mpv[a]: 1\n", "mpv[b]: 2\n", "mpv[c]: 3\n"], -1),
+    (["mpv[a]: 1\n", "mpv[b]: 2\n"], -99),
+    (["mpv[a]: 1\n"], 99),
+    (["mpv[a]: no trailing newline"], 20),
+    (["mpv[a]: 1\r\n", "mpv[b]: 2\r\n"], 20),
+    (["warning mpv[x]: mid-line match\n"], 20),
+    (["", "mpv[a]: between empties\n", ""], 20),
+    (["mpv[]: bare bracket pair\n"], 20),
+    (["unicode ✓ mpv[ao]: ünïcode ✗\n"], 20),
+]
+
+_MPV_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _mpv_lines
+
+payload = json.load(sys.stdin)
+json.dump([_mpv_lines(lines, n) for lines, n in payload], sys.stdout)
+"""
+
+
+class TestRecentMpvLinesNativeParity:
+    """The mpv-warning tail engine, on the same child-interpreter pattern
+    the doctor-report parity test above uses."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_recent_mpv_lines_matches_fallback(self):
+        from ytm_player.utils.doctor import _mpv_lines
+
+        result = subprocess.run(
+            [sys.executable, "-c", _MPV_CHILD_PROG],
+            input=json.dumps(_MPV_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [_mpv_lines(lines, n) for lines, n in _MPV_PARITY_CASES]
+        for (lines, n), nv, fb in zip(_MPV_PARITY_CASES, native, fallback):
+            assert nv == fb, (
+                f"native and fallback mpv tails differ for n={n} lines={lines!r}:\n"
+                f"native:   {nv!r}\n"
+                f"fallback: {fb!r}"
+            )
+
+
+# ── Crash-staleness native vs fallback parity ─────────────────────────
+
+# (content, current_version) pairs, JSON-round-trippable. The matrix
+# covers the header scan (banners, known/unknown/unicode keys, blanks,
+# exotic separators and line boundaries, values-with-trailing-text) and
+# the PEP 440 comparison space (epochs, pre/post/dev ranks, trailing
+# zeros, local segments, case-insensitive spellings, invalid and
+# digit-limit-overflowing versions).
+_CRASH_PARITY_CASES = [
+    # Header-scan shapes.
+    ("", "2.1.0"),
+    ("=== Main thread crash ===", "2.1.0"),
+    ("=== Crash ===\nversion:   2.0.0\n\nTraceback body", "2.1.0"),
+    ("version: 2.0.0\nno banner at all", "2.1.0"),
+    (
+        "=== Crash ===\ntime:      2026-01-01T00:00:00\npython:    3.12.0\n"
+        "platform:  Linux 6.1.0-arch1 (x86_64)\nversion:   2.0.0\n\nbody",
+        "2.1.0",
+    ),
+    ("=== Crash ===\ntime: 2026-01-01\n\nversion: 2.0.0\nbody", "2.1.0"),
+    ("=== Crash ===\nValueError: bad config\nversion: 0.0.1\n", "1.9.4"),
+    ("=== Crash ===\nTraceback (most recent call last):\n  version: 0.0.1\n", "1.9.4"),
+    ("version:1.0\n", "2.1.0"),  # no whitespace after the colon -> not a header line
+    ("Version: 2.0.0\n", "2.1.0"),  # key membership is case-sensitive
+    ("versión: 2.0.0\n", "2.1.0"),  # unicode key is not in the metadata set
+    ("version:   2.0.0 trailing words here\n", "2.1.0"),  # \S+ takes the first token only
+    ("version: \n", "2.1.0"),  # blank value -> not a header line
+    ("version:\t2.0.0\n", "2.1.0"),  # tab separator
+    ("version:  2.0.0 \n", "2.1.0"),  # trailing whitespace stays out of the value
+    ("version:\x1c1.0\n", "2.1.0"),  # \x1c is a splitlines boundary, not a separator
+    ("=== Crash ===\r\nversion: 2.0.0\r\n", "2.1.0"),  # CRLF content
+    ("=== Crash ===\u2028version: 2.0.0\u2029", "2.1.0"),  # exotic line boundaries
+    ("version: 1.0:2\n", "2.1.0"),  # the value may contain colons
+    # The unknown sentinel and the missing version.
+    ("=== Crash ===\nversion: unknown\ntrace", "2.1.0"),
+    ("=== Crash ===\ntrace only, no version line", "1.9.4"),
+    # Older versions -> the stale note.
+    ("version: 1.0.0\n", "2.1.0"),
+    ("version: 2.0.9\n", "2.1.0"),
+    ("version: 2.1.0rc1\n", "2.1.0"),
+    ("version: 2.1.0a1\n", "2.1.0"),
+    ("version: 2.1.0alpha2\n", "2.1.0"),
+    ("version: 2.1.0AlPhA1\n", "2.1.0"),
+    ("version: 2.1.0b2\n", "2.1.0"),
+    ("version: 2.1.0preview3\n", "2.1.0"),
+    ("version: 2.1.0.pre1\n", "2.1.0"),
+    ("version: 2.1.0_c3\n", "2.1.0"),
+    ("version: 2.1.0.dev1\n", "2.1.0"),
+    ("version: 2.1.0dev\n", "2.1.0"),
+    ("version: v1.9.4\n", "2.1.0"),
+    ("version: 1!2.0\n", "2!1.0"),
+    ("version: 1.0.0-1\n", "2.0.0"),
+    ("version: 1.0a2.post2.dev3\n", "1.0"),
+    ("version: 2.1.0+build.1\n", "2.1.0+build.2"),
+    ("version: 2.1.0+9\n", "2.1.0+10"),
+    ("version: 2.1.0+abc\n", "2.1.0+2"),
+    ("version: 2.1.0\n", "2.1.0+local"),
+    ("version:  2.0.0  \n", "2.1.0"),
+    ("version: 007.0002\n", "7.3"),
+    # Equal / newer -> no note.
+    ("version: 2.1.0\n", "2.1.0"),
+    ("version: 2.1\n", "2.1.0"),
+    ("version: 2.1.0.0.0\n", "2.1"),
+    ("version: v2.1.0\n", "2.1.0"),
+    ("version: 2.1.0.post1\n", "2.1.0"),
+    ("version: 2.1.0.post1.dev1\n", "2.1.0.post1"),
+    ("version: 3.0\n", "2.1.0"),
+    ("version: 2.1.1\n", "2.1.0"),
+    ("version: 2.1.0+local\n", "2.1.0"),
+    ("version: 1!1.0\n", "2.0"),
+    ("version: 2!0.1\n", "2.1.0"),
+    # Invalid versions -> no note.
+    ("version: not-a-version\n", "2.1.0"),
+    ("version: 1..0\n", "2.1.0"),
+    ("version: 1.0+\n", "2.1.0"),
+    ("version: 1.0++local\n", "2.1.0"),
+    ("version: 1.0+\u017f\n", "2.1.0"),  # long s — outside packaging's ASCII local alphabet
+    ("version: 1.0po\u017ft1\n", "2.1.0"),
+    ("version: 1.0+\u212a\n", "2.1.0"),  # Kelvin sign U+212A
+    ("version: ²1.0\n", "2.1.0"),
+    ("version: 1.0-4-5\n", "2.1.0"),
+    ("version: 2.1.0-c4\n", "2.1.0"),  # implicit post needs digits after the hyphen
+    # The int-conversion digit limit (>4300 digits) on either side.
+    ("version: " + "9" * 5000 + "\n", "2.1.0"),
+    ("version: 1.0+" + "9" * 5000 + "\n", "2.1.0"),
+    ("version: 1.0a" + "9" * 5000 + "\n", "2.1.0"),
+    ("version: 1.0\n", "2.1.0rc1"),  # a valid current version with a pre-release
+    ("version: 1.0\n", "  2.1.0  "),  # whitespace-padded current version
+]
+
+_CRASH_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _crash_staleness_note
+
+payload = json.load(sys.stdin)
+json.dump([_crash_staleness_note(content, current) for content, current in payload], sys.stdout)
+"""
+
+
+class TestCrashStalenessNativeParity:
+    """The crash-staleness verdict engine, on the same child-interpreter
+    pattern the doctor-report parity test above uses."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_crash_staleness_note_matches_fallback(self):
+        from ytm_player.utils.doctor import _crash_staleness_note
+
+        result = subprocess.run(
+            [sys.executable, "-c", _CRASH_CHILD_PROG],
+            input=json.dumps(_CRASH_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [
+            _crash_staleness_note(content, current) for content, current in _CRASH_PARITY_CASES
+        ]
+        for (content, current), nv, fb in zip(_CRASH_PARITY_CASES, native, fallback):
+            assert nv == fb, (
+                f"native and fallback staleness notes differ for "
+                f"content={content!r} current={current!r}:\n"
+                f"native:   {nv!r}\n"
+                f"fallback: {fb!r}"
             )
