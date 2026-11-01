@@ -47,10 +47,36 @@ from ytm_player.utils.logging import install_excepthooks, setup_logging
 # ---------------------------------------------------------------------------
 
 
+def _json_dumps(data: Any, *, indent: int | None = None) -> str:
+    """The JSON serialisation behind ``_json_output``.
+
+    The pure half of every JSON-emitting CLI command: *data* rendered
+    as ``json.dumps(data, indent=indent, default=str)`` — the
+    ``ensure_ascii`` escaping, the insertion-order object layout, the
+    indent-aware pretty mode, the non-serializable fallback through
+    ``str()`` (sets, bytes, datetimes, arbitrary objects), and the
+    circular-reference guard — with every other parameter at its
+    default.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.json_dumps``) when it is built; this
+    pure-Python transcription is the fallback otherwise. Returns the
+    serialisation text (no trailing newline — the caller's ``echo``
+    adds it) and never mutates *data*.
+    """
+    return json.dumps(data, indent=indent, default=str)
+
+
 def _json_output(data: Any, *, compact: bool = False) -> None:
-    """Print *data* as JSON to stdout."""
+    """Print *data* as JSON to stdout.
+
+    The serialisation is resolved by the ``_json_dumps`` engine above
+    (native when the Rust extension is built, the pure-Python
+    transcription otherwise); this helper picks the indent and performs
+    the write.
+    """
     indent = None if compact else 2
-    click.echo(json.dumps(data, indent=indent, default=str))
+    click.echo(_json_dumps(data, indent=indent))
 
 
 def _error(msg: str) -> NoReturn:
@@ -692,3 +718,12 @@ except ImportError:
     pass
 else:
     _cli_stats_payload = _native_cli_stats_payload  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        json_dumps as _native_json_dumps,
+    )
+except ImportError:
+    pass
+else:
+    _json_dumps = _native_json_dumps  # type: ignore[assignment]

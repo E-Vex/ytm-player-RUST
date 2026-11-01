@@ -1,6 +1,8 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PyString, PyTuple,
+};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -297,6 +299,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // relative (+/-seconds), clock (mm:ss / hh:mm:ss) and absolute
     // seconds, with the missing/invalid verdicts the response carries.
     module.add_function(pyo3::wrap_pyfunction!(ipc_seek_offset, module)?)?;
+
+    // CLI JSON serialisation (cli.py _json_output equivalent): the
+    // json.dumps(data, indent=..., default=str) text behind every
+    // JSON-emitting CLI command — the ensure_ascii escaping, the
+    // float/int reprs, the indent-aware layout, the key coercion and
+    // the circular-reference guard.
+    module.add_function(pyo3::wrap_pyfunction!(json_dumps, module)?)?;
     Ok(())
 }
 
@@ -6163,4 +6172,543 @@ fn ipc_seek_offset<'py>(
         }
         Err(err) => Err(err),
     }
+}
+
+// ---------------------------------------------------------------------------
+// CLI JSON serialisation (cli.py)
+// ---------------------------------------------------------------------------
+
+/// Python's `float.__repr__` — the shortest round-trip digits rendered
+/// under CPython's layout rules: fixed notation while the decimal point
+/// sits within `1e-4 <= |v| < 1e16`, exponential outside with a sign
+/// and at least two exponent digits (`1e+16`, `1.5e-07`), `0.0`/`-0.0`
+/// for the zeros, and the specials spelled `NaN` / `Infinity` /
+/// `-Infinity` (the `allow_nan=True` spellings). The shortest digits
+/// come from Rust's own `{:e}` formatting, which produces the same
+/// unique shortest correctly-rounding digit sequence CPython's dtoa
+/// does — except where the exact value sits *exactly* between two
+/// shortest candidates: those ties round away from zero under Rust's
+/// formatter and half-even under CPython's dtoa, and a tie can only
+/// carry when the digit run ends odd (a tied pair's even neighbour is
+/// the run one digit down), so those — and only those — ask the
+/// interpreter's own repr. Every finite double serialises exactly like
+/// `repr()` would render it.
+fn python_float_repr(py: Python<'_>, v: f64) -> PyResult<String> {
+    if v.is_nan() {
+        return Ok("NaN".to_string());
+    }
+    if v.is_infinite() {
+        return Ok(if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string());
+    }
+    if v == 0.0 {
+        return Ok(if v.is_sign_negative() { "-0.0" } else { "0.0" }.to_string());
+    }
+    let neg = v.is_sign_negative();
+    // "d[.ddd]e[-]X" — digits and the base-10 exponent of |v|.
+    let sci = format!("{:e}", v.abs());
+    let (mantissa, exp_part) = sci.split_once('e').expect("exponential spelling");
+    let exp: i32 = exp_part.parse().expect("exponent digits");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // An exact midpoint between two shortest candidates rounds away
+    // from zero here but half-even under CPython's dtoa — a tie only
+    // carries when the digit run ends odd (its even neighbour is the
+    // run one digit down), so those — and only those — ask the
+    // interpreter's own repr.
+    if digits
+        .as_bytes()
+        .last()
+        .is_some_and(|b| (b - b'0') % 2 == 1)
+    {
+        let repr = PyFloat::new(py, v).repr()?;
+        return repr.extract::<String>();
+    }
+    // decpt — the decimal point's position relative to the digit run
+    // (digits "12345", exp 2 -> 123.45, decpt 3).
+    let decpt = exp + 1;
+    let n = digits.len() as i32;
+    let mut out = String::with_capacity(digits.len() + 8);
+    if neg {
+        out.push('-');
+    }
+    if decpt <= -4 || decpt > 16 {
+        // Exponential: d[.ddd]e±XX, at least two exponent digits.
+        out.push_str(&digits[..1]);
+        if n > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        let e = decpt - 1;
+        out.push('e');
+        out.push(if e < 0 { '-' } else { '+' });
+        let ea = e.unsigned_abs();
+        if ea < 10 {
+            out.push('0');
+        }
+        out.push_str(&ea.to_string());
+    } else if decpt <= 0 {
+        // 0.000ddd
+        out.push_str("0.");
+        for _ in 0..(-decpt) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else if decpt >= n {
+        // ddd000.0
+        out.push_str(&digits);
+        for _ in 0..(decpt - n) {
+            out.push('0');
+        }
+        out.push_str(".0");
+    } else {
+        // dd.ddd
+        out.push_str(&digits[..decpt as usize]);
+        out.push('.');
+        out.push_str(&digits[decpt as usize..]);
+    }
+    Ok(out)
+}
+
+/// The four-hex `\uXXXX` escape, lowercase digits — CPython's own
+/// `Py_hexdigits` table.
+fn json_push_u_escape(out: &mut String, c: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push('\\');
+    out.push('u');
+    out.push(HEX[((c >> 12) & 0xf) as usize] as char);
+    out.push(HEX[((c >> 8) & 0xf) as usize] as char);
+    out.push(HEX[((c >> 4) & 0xf) as usize] as char);
+    out.push(HEX[(c & 0xf) as usize] as char);
+}
+
+/// The `ensure_ascii` escaping — CPython's `S_CHAR` rule: the printable
+/// ASCII run 0x20..=0x7e (bar `"` and `\`) passes through, the seven
+/// two-character escapes `\\ \" \b \t \n \f \r` render their short
+/// forms, DEL included in everything else becoming a lowercase
+/// four-hex `\uXXXX`, and an astral code point its UTF-16 surrogate
+/// pair.
+fn json_escape_codepoint_into(out: &mut String, c: u32) {
+    match c {
+        0x22 => out.push_str("\\\""),
+        0x5c => out.push_str("\\\\"),
+        0x08 => out.push_str("\\b"),
+        0x09 => out.push_str("\\t"),
+        0x0a => out.push_str("\\n"),
+        0x0c => out.push_str("\\f"),
+        0x0d => out.push_str("\\r"),
+        0x20..=0x7e => out.push(c as u8 as char),
+        c if c >= 0x10000 => {
+            let v = c - 0x10000;
+            json_push_u_escape(out, 0xd800 + (v >> 10));
+            json_push_u_escape(out, 0xdc00 + (v & 0x3ff));
+        }
+        _ => json_push_u_escape(out, c),
+    }
+}
+
+/// Escape a `&str`'s code points — the fast lane for ASCII runs with
+/// nothing to escape, the per-code-point walk otherwise.
+fn json_escape_str_into(out: &mut String, s: &str) {
+    let plain = s.is_ascii()
+        && !s
+            .bytes()
+            .any(|b| b == b'"' || b == b'\\' || b < 0x20 || b == 0x7f);
+    out.push('"');
+    if plain {
+        out.push_str(s);
+    } else {
+        for c in s.chars() {
+            json_escape_codepoint_into(out, c as u32);
+        }
+    }
+    out.push('"');
+}
+
+/// Escape one Python string value: the fast lane over its UTF-8
+/// content, and — where the string carries lone surrogates, which have
+/// no UTF-8 spelling — the WTF-8 bytes of its `surrogatepass` encoding,
+/// so a `\ud800` in the payload escapes exactly like the reference's
+/// code-point walk would.
+fn json_escape_pystring_into(out: &mut String, value: &Bound<'_, PyString>) -> PyResult<()> {
+    if let Ok(s) = value.to_str() {
+        json_escape_str_into(out, s);
+        return Ok(());
+    }
+    // str.encode("utf-8", "surrogatepass") — the content as WTF-8.
+    let bytes = value.call_method1("encode", ("utf-8", "surrogatepass"))?;
+    let bytes = bytes
+        .downcast::<PyBytes>()
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("encode did not return bytes"))?;
+    let data = bytes.as_bytes();
+    out.push('"');
+    let mut i = 0usize;
+    while i < data.len() {
+        // One WTF-8 sequence — plain UTF-8 shapes plus the surrogate
+        // range encoded as three-byte sequences.
+        let b = data[i];
+        let c = if b < 0x80 {
+            i += 1;
+            b as u32
+        } else if b >> 5 == 0b110 {
+            i += 2;
+            ((b & 0x1f) as u32) << 6 | (data[i - 1] & 0x3f) as u32
+        } else if b >> 4 == 0b1110 {
+            i += 3;
+            ((b & 0x0f) as u32) << 12
+                | ((data[i - 2] & 0x3f) as u32) << 6
+                | (data[i - 1] & 0x3f) as u32
+        } else {
+            i += 4;
+            ((b & 0x07) as u32) << 18
+                | ((data[i - 3] & 0x3f) as u32) << 12
+                | ((data[i - 2] & 0x3f) as u32) << 6
+                | (data[i - 1] & 0x3f) as u32
+        };
+        json_escape_codepoint_into(out, c);
+    }
+    out.push('"');
+    Ok(())
+}
+
+/// `int.__repr__(value)` — the raw-storage digits, never a subclass's
+/// own repr (an IntEnum member renders as its number). i64 covers the
+/// whole range Rust can format directly; anything wider goes through
+/// the interpreter's own repr.
+fn int_repr_string(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    match value.extract::<i64>() {
+        Ok(v) => Ok(v.to_string()),
+        Err(_) => {
+            let repr = py
+                .import("builtins")?
+                .getattr("int")?
+                .getattr("__repr__")?
+                .call1((value,))?;
+            repr.extract::<String>()
+        }
+    }
+}
+
+/// The key coercion + escaping behind one dict key: `str` keys pass
+/// through, `float` keys render through `float.__repr__`, `int` keys
+/// through `int.__repr__` (an IntEnum key renders as its numeric
+/// digits, never its member name), `True`/`False`/`None` as
+/// `true`/`false`/`null`, anything else CPython's own `TypeError`. The
+/// coerced text is then escaped like any other string — the digit and
+/// repr spellings are all plain ASCII, but the walk stays uniform.
+fn write_dict_key_into(out: &mut String, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<()> {
+    if let Ok(s) = key.downcast::<PyString>() {
+        json_escape_pystring_into(out, s)?;
+        return Ok(());
+    }
+    let text = if key.is_instance_of::<PyFloat>() {
+        python_float_repr(py, key.extract::<f64>()?)?
+    } else if key.is_none() {
+        "null".to_string()
+    } else if key.is_instance_of::<PyBool>() {
+        if key.extract::<bool>()? {
+            "true"
+        } else {
+            "false"
+        }
+        .to_string()
+    } else if key.is_instance_of::<PyInt>() {
+        int_repr_string(py, key)?
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "keys must be str, int, float, bool or None, not {}",
+            key.get_type().name()?
+        )));
+    };
+    json_escape_str_into(out, &text);
+    Ok(())
+}
+
+/// Unpack one `items()` pair — `key, value = item` with CPython's own
+/// unpack errors: the not-enough/too-many counts are the items actually
+/// yielded, and the "cannot unpack non-iterable" rewrite only applies
+/// to a type with no iteration support at all (an `__iter__` that
+/// itself raises keeps its own error, like CPython's `tp_iter` check).
+fn unpack_json_pair<'py>(
+    pair: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let py = pair.py();
+    let mut items = match pair.try_iter() {
+        Ok(items) => items,
+        Err(err) => {
+            if err.is_instance_of::<pyo3::exceptions::PyTypeError>(py) {
+                let type_iter = pair
+                    .get_type()
+                    .getattr("__iter__")
+                    .ok()
+                    .filter(|attr| !attr.is_none());
+                if type_iter.is_none() {
+                    let type_name = pair
+                        .get_type()
+                        .name()
+                        .map(|name| name.to_string())
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "cannot unpack non-iterable {type_name} object"
+                    )));
+                }
+            }
+            return Err(err);
+        }
+    };
+    let key = match items.next() {
+        Some(item) => item?,
+        None => {
+            return Err(PyValueError::new_err(
+                "not enough values to unpack (expected 2, got 0)",
+            ))
+        }
+    };
+    let value = match items.next() {
+        Some(item) => item?,
+        None => {
+            return Err(PyValueError::new_err(
+                "not enough values to unpack (expected 2, got 1)",
+            ))
+        }
+    };
+    if items.next().is_some() {
+        return Err(PyValueError::new_err(
+            "too many values to unpack (expected 2)",
+        ));
+    }
+    Ok((key, value))
+}
+
+/// One open frame of the JSON encode — a list/array, a dict/object, or
+/// the default-conversion sentinel that holds a converted object's
+/// marker until its subtree finishes encoding (CPython's own marker
+/// lifetime around the `default()` call). The traversal is iterative,
+/// so no Rust recursion can overflow: a payload nested past CPython's
+/// own recursion budget encodes where the reference would raise
+/// `RecursionError`.
+enum JsonFrame<'py> {
+    List {
+        iter: Bound<'py, PyIterator>,
+        first: bool,
+        id: usize,
+    },
+    Dict {
+        iter: Bound<'py, PyIterator>,
+        first: bool,
+        id: usize,
+    },
+    Default {
+        id: usize,
+    },
+}
+
+/// The `json.dumps(data, indent=..., default=str)` text behind
+/// `cli.py`'s `_json_output` — the serialisation every JSON-emitting
+/// CLI command prints.
+///
+/// Mirrors the pure-Python reference (`_json_dumps`) — which is the
+/// stdlib call itself — with every other parameter at its default:
+/// `ensure_ascii=True` (the `S_CHAR` escaping above), the separators
+/// `(', ', ': ')` compact and `(',', ': ')` with the newline+indent
+/// layout when *indent* is given (a negative indent collapsing to `""`
+/// exactly like the reference's `' ' * n` multiplication; an absurd
+/// width raises `MemoryError` rather than building a multi-gigabyte
+/// pad), `sort_keys=False` (insertion order preserved), `allow_nan=True`
+/// (`NaN`/`Infinity`/`-Infinity`), and `check_circular=True` — the
+/// ancestor-chain guard reporting `Circular reference detected` for a
+/// cycle while shared non-cyclic references encode on both sides.
+///
+/// The value dispatch follows the reference's order — the consts, then
+/// `str`, `int` (through `int.__repr__`, so an IntEnum member renders
+/// as its number and bigints keep their full digits), `float` (through
+/// `float.__repr__`, see `python_float_repr`), `list`/`tuple`, `dict`,
+/// and then the default call: `str(o)` fetched from `builtins` at call
+/// time and invoked exactly like the reference's `default=str` would,
+/// its result re-encoded through the same dispatch with the original
+/// object's marker held for the conversion's lifetime. Lists iterate
+/// through Python's iteration protocol and dicts through their `items`
+/// method — the calls both CPython encoders make — so subclasses steer
+/// both backends identically; the empty containers render `[]`/`{}`
+/// from the truthiness gate before any marker is taken. Dict keys
+/// coerce through the reference's rule (see `write_dict_key_into`)
+/// with CPython's own `TypeError` for anything else; an `items()` pair
+/// that is not a 2-tuple raises the pure-Python fallback's unpack
+/// `ValueError`. The inputs are never mutated, and the traversal holds
+/// no Rust recursion, so deeply nested payloads encode where the
+/// reference's recursive walk would hit the interpreter's recursion
+/// budget.
+#[pyfunction]
+#[pyo3(signature = (data, indent = None))]
+fn json_dumps<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    indent: Option<i64>,
+) -> PyResult<String> {
+    if indent.is_some_and(|n| !(-1_000_000..=1_000_000).contains(&n)) {
+        return Err(pyo3::exceptions::PyMemoryError::new_err(
+            "indent is too large",
+        ));
+    }
+    let indent_pad = " ".repeat(indent.map_or(0, |n| n.max(0) as usize));
+    let pretty = indent.is_some();
+
+    let mut out = String::new();
+    // The ancestor-chain ids behind the circular-reference guard —
+    // inserted when a container opens, removed when it closes.
+    let mut markers: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<JsonFrame<'py>> = Vec::new();
+    let mut current: Option<Bound<'py, PyAny>> = Some(data.clone());
+
+    loop {
+        if let Some(value) = current.take() {
+            // The value dispatch, in the reference's order.
+            if value.is_none() {
+                out.push_str("null");
+            } else if value.is_instance_of::<PyBool>() {
+                out.push_str(if value.extract::<bool>()? {
+                    "true"
+                } else {
+                    "false"
+                });
+            } else if let Ok(s) = value.downcast::<PyString>() {
+                json_escape_pystring_into(&mut out, s)?;
+            } else if value.is_instance_of::<PyInt>() {
+                out.push_str(&int_repr_string(py, &value)?);
+            } else if value.is_instance_of::<PyFloat>() {
+                out.push_str(&python_float_repr(py, value.extract::<f64>()?)?);
+            } else if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+                // if not lst: '[]' — the truthiness gate before any
+                // marker is taken.
+                if !value.is_truthy()? {
+                    out.push_str("[]");
+                } else {
+                    let id = value.as_ptr() as usize;
+                    if markers.contains(&id) {
+                        return Err(PyValueError::new_err("Circular reference detected"));
+                    }
+                    markers.insert(id);
+                    out.push('[');
+                    if pretty {
+                        out.push('\n');
+                        out.push_str(&indent_pad.repeat(stack.len() + 1));
+                    }
+                    stack.push(JsonFrame::List {
+                        iter: value.try_iter()?,
+                        first: true,
+                        id,
+                    });
+                }
+            } else if value.is_instance_of::<PyDict>() {
+                if !value.is_truthy()? {
+                    out.push_str("{}");
+                } else {
+                    let id = value.as_ptr() as usize;
+                    if markers.contains(&id) {
+                        return Err(PyValueError::new_err("Circular reference detected"));
+                    }
+                    markers.insert(id);
+                    out.push('{');
+                    if pretty {
+                        out.push('\n');
+                        out.push_str(&indent_pad.repeat(stack.len() + 1));
+                    }
+                    // items() through the mapping protocol — the method
+                    // call both CPython encoders make.
+                    let items = value.getattr("items")?.call0()?;
+                    stack.push(JsonFrame::Dict {
+                        iter: items.try_iter()?,
+                        first: true,
+                        id,
+                    });
+                }
+            } else {
+                // default(o) — str, fetched from builtins at call time
+                // exactly like the reference's global lookup and called
+                // as its default would call it. The sentinel below pops
+                // the original object's marker off once the converted
+                // value's subtree finishes encoding — CPython's own
+                // marker lifetime around the default call.
+                let id = value.as_ptr() as usize;
+                if markers.contains(&id) {
+                    return Err(PyValueError::new_err("Circular reference detected"));
+                }
+                markers.insert(id);
+                let converted = py.import("builtins")?.getattr("str")?.call1((value,))?;
+                stack.push(JsonFrame::Default { id });
+                current = Some(converted);
+            }
+            continue;
+        }
+        // No pending value — pull the next item from the top frame, or
+        // close the frame when its iteration is exhausted.
+        let depth = stack.len();
+        enum Pull<'py> {
+            Item(Bound<'py, PyAny>),
+            Close { id: usize, closer: Option<u8> },
+        }
+        let pull = match stack.last_mut() {
+            None => break,
+            Some(JsonFrame::List { iter, first, id }) => match iter.next() {
+                Some(Ok(item)) => {
+                    if !*first {
+                        if pretty {
+                            out.push(',');
+                            out.push('\n');
+                            out.push_str(&indent_pad.repeat(depth));
+                        } else {
+                            out.push_str(", ");
+                        }
+                    }
+                    *first = false;
+                    Pull::Item(item)
+                }
+                Some(Err(err)) => return Err(err),
+                None => Pull::Close {
+                    id: *id,
+                    closer: Some(b']'),
+                },
+            },
+            Some(JsonFrame::Dict { iter, first, id }) => match iter.next() {
+                Some(Ok(pair)) => {
+                    let (key, value) = unpack_json_pair(&pair)?;
+                    if !*first {
+                        if pretty {
+                            out.push(',');
+                            out.push('\n');
+                            out.push_str(&indent_pad.repeat(depth));
+                        } else {
+                            out.push_str(", ");
+                        }
+                    }
+                    *first = false;
+                    write_dict_key_into(&mut out, py, &key)?;
+                    out.push_str(": ");
+                    Pull::Item(value)
+                }
+                Some(Err(err)) => return Err(err),
+                None => Pull::Close {
+                    id: *id,
+                    closer: Some(b'}'),
+                },
+            },
+            Some(JsonFrame::Default { id }) => Pull::Close {
+                id: *id,
+                closer: None,
+            },
+        };
+        match pull {
+            Pull::Item(value) => current = Some(value),
+            Pull::Close { id, closer } => {
+                if let Some(closer) = closer {
+                    if pretty {
+                        out.push('\n');
+                        out.push_str(&indent_pad.repeat(depth - 1));
+                    }
+                    out.push(closer as char);
+                }
+                markers.remove(&id);
+                stack.pop();
+            }
+        }
+    }
+    Ok(out)
 }
