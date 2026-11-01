@@ -1,12 +1,14 @@
 """Play and search history tracking using async SQLite.
 
-The two pure cores of the play-history writes are dual-implemented:
+The three pure cores of the play-history surface are dual-implemented:
 ``_play_log_row`` (the skip gate and insert-row assembly behind
-``log_play``) and ``_listened_delta`` (the stored-vs-new
-listened-seconds decision behind ``update_play_listened_seconds``) are
-implemented by the Rust extension
+``log_play``), ``_listened_delta`` (the stored-vs-new
+listened-seconds decision behind ``update_play_listened_seconds``)
+and ``_stats_payload`` (the aggregate payload assembly behind
+``get_stats``) are implemented by the Rust extension
 (``_ytm_player_native.play_log_row`` /
-``_ytm_player_native.listened_delta``) when it is built and by the
+``_ytm_player_native.listened_delta`` /
+``_ytm_player_native.stats_payload``) when it is built and by the
 pure-Python transcriptions below otherwise; the manager's methods only
 perform the reads and writes around them.
 """
@@ -123,6 +125,37 @@ def _listened_delta(old_value: Any, listened_seconds: Any) -> Any:
     if listened_seconds <= old_seconds:
         return None
     return listened_seconds - old_seconds
+
+
+def _stats_payload(
+    total_plays: Any,
+    total_listen_time: Any,
+    unique_tracks: Any,
+    top_tracks: Any,
+    top_artists: Any,
+) -> dict[str, Any]:
+    """The aggregate listening-stats payload ``get_stats`` returns.
+
+    The pure half of ``HistoryManager.get_stats``: the five-key dict
+    assembled from the three scalar aggregates (total plays, total
+    listened seconds, unique tracks) and the two top lists, in this
+    insertion order — the key order the JSON consumers' output
+    preserves. Every value passes through as the object it is — the
+    scalar counts straight from the SQLite rows, the top lists the
+    very list objects the caller fetched — into a fresh map; the
+    inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stats_payload``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return {
+        "total_plays": total_plays,
+        "total_listen_time": total_listen_time,
+        "unique_tracks": unique_tracks,
+        "top_tracks": top_tracks,
+        "top_artists": top_artists,
+    }
 
 
 class HistoryManager:
@@ -447,7 +480,13 @@ class HistoryManager:
     # ------------------------------------------------------------------
 
     async def get_stats(self) -> dict:
-        """Return aggregate listening statistics."""
+        """Return aggregate listening statistics.
+
+        The payload assembly — the five-key aggregate dict — is
+        resolved by the ``_stats_payload`` engine (native when the
+        Rust extension is built, the pure-Python transcription
+        otherwise); this method performs the queries.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
 
@@ -471,13 +510,9 @@ class HistoryManager:
         top_tracks = await self.get_top_tracks(limit=10)
         top_artists = await self.get_top_artists(limit=10)
 
-        return {
-            "total_plays": total_plays,
-            "total_listen_time": total_listen_time,
-            "unique_tracks": unique_tracks,
-            "top_tracks": top_tracks,
-            "top_artists": top_artists,
-        }
+        return _stats_payload(
+            total_plays, total_listen_time, unique_tracks, top_tracks, top_artists
+        )
 
     async def get_top_tracks(self, limit: int = 10) -> list[dict]:
         """Return the most-played tracks."""
@@ -530,8 +565,12 @@ try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         play_log_row as _native_play_log_row,
     )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stats_payload as _native_stats_payload,
+    )
 except ImportError:
     pass
 else:
     _play_log_row = _native_play_log_row  # type: ignore[assignment]
     _listened_delta = _native_listened_delta  # type: ignore[assignment]
+    _stats_payload = _native_stats_payload  # type: ignore[assignment]

@@ -266,6 +266,12 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // per-entry callback resolution staying on the Python side next to
     // the Textual hit machinery.
     module.add_function(pyo3::wrap_pyfunction!(command_catalog, module)?)?;
+
+    // Stats aggregation payload (ytm_player/services/history.py
+    // equivalent): the five-key listening-stats dict assembled behind
+    // HistoryManager.get_stats from the three scalar aggregates and
+    // the two top lists.
+    module.add_function(pyo3::wrap_pyfunction!(stats_payload, module)?)?;
     Ok(())
 }
 
@@ -5814,4 +5820,40 @@ fn command_catalog() -> Vec<(String, String)> {
         "Theme: Set Current as Default".to_string(),
         "Save the active theme to config.toml".to_string(),
     )]
+}
+
+/// The aggregate listening-stats payload behind
+/// `HistoryManager.get_stats` — the pure core of the stats read.
+///
+/// Mirrors the pure-Python reference (`_stats_payload`): the five-key
+/// dict assembled from the three scalar aggregates and the two top
+/// lists. Every value passes through as the object it is — the scalar
+/// counts straight from the SQLite rows, the top lists the very list
+/// objects the caller fetched — into a fresh map, in the reference's
+/// insertion order (the key order the JSON consumers' output
+/// preserves). The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (total_plays, total_listen_time, unique_tracks, top_tracks, top_artists))]
+fn stats_payload<'py>(
+    py: Python<'py>,
+    total_plays: &Bound<'py, PyAny>,
+    total_listen_time: &Bound<'py, PyAny>,
+    unique_tracks: &Bound<'py, PyAny>,
+    top_tracks: &Bound<'py, PyAny>,
+    top_artists: &Bound<'py, PyAny>,
+) -> Bound<'py, PyDict> {
+    let out = PyDict::new(py);
+    // Only str keys are inserted — always hashable, so the store cannot
+    // fail; each value is stored as the object it is, never coerced.
+    out.set_item("total_plays", total_plays)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("total_listen_time", total_listen_time)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("unique_tracks", unique_tracks)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("top_tracks", top_tracks)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("top_artists", top_artists)
+        .expect("dict insertion with a str key cannot fail");
+    out
 }

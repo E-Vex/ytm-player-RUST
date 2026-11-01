@@ -1,4 +1,4 @@
-"""Tests for the play-history row engines.
+"""Tests for the play-history row and stats engines.
 
 ``_play_log_row`` is the engine behind ``HistoryManager.log_play``: the
 skip gate (``listened_seconds <= min_listen_seconds`` — a listen that
@@ -7,10 +7,14 @@ the insert-row assembly (``video_id`` through ``[]``, the ``""``-default
 ``.get`` reads, and the ``duration_seconds`` → ``duration`` → ``length``
 duration chain). ``_listened_delta`` is the engine behind
 ``HistoryManager.update_play_listened_seconds``: the ``int(old or 0)``
-coercion of the stored cell, the no-write gate and the delta. The
+coercion of the stored cell, the no-write gate and the delta.
+``_stats_payload`` is the engine behind ``HistoryManager.get_stats``:
+the five-key aggregate dict assembled from the three scalar aggregates
+and the two top lists, in the JSON consumers' key order. The
 pure-Python transcriptions live in ``services/history.py``; when the
 Rust extension is built the same engines run natively
-(``_ytm_player_native.play_log_row`` / ``listened_delta``).
+(``_ytm_player_native.play_log_row`` / ``listened_delta`` /
+``stats_payload``).
 
 The unit tests below assert the engines' contract on whichever backend
 is loaded. When the extension is built, the parity tests additionally
@@ -28,7 +32,7 @@ import sys
 
 import pytest
 
-from ytm_player.services.history import _listened_delta, _play_log_row
+from ytm_player.services.history import _listened_delta, _play_log_row, _stats_payload
 
 try:
     from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
@@ -311,6 +315,81 @@ class TestListenedDelta:
             _listened_delta(30, "5")
 
 
+class TestStatsPayload:
+    """The five-key aggregate payload behind ``get_stats``."""
+
+    def test_payload_carries_the_five_aggregates(self):
+        top_tracks = [
+            {
+                "video_id": "dQw4w9WgXcQ",
+                "title": "Never Gonna Give You Up",
+                "artist": "Rick Astley",
+                "play_count": 3,
+                "total_listened_seconds": 639,
+                "last_played": "2026-10-31 12:00:00",
+            }
+        ]
+        top_artists = [{"artist": "Rick Astley", "play_count": 3}]
+        payload = _stats_payload(12, 3450, 7, top_tracks, top_artists)
+        assert payload == {
+            "total_plays": 12,
+            "total_listen_time": 3450,
+            "unique_tracks": 7,
+            "top_tracks": top_tracks,
+            "top_artists": top_artists,
+        }
+
+    def test_key_order_is_the_json_output_order(self):
+        # The key order is the contract the JSON consumers' output
+        # preserves — it must never silently reorder.
+        payload = _stats_payload(0, 0, 0, [], [])
+        assert list(payload) == [
+            "total_plays",
+            "total_listen_time",
+            "unique_tracks",
+            "top_tracks",
+            "top_artists",
+        ]
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        top_tracks = [{"video_id": "v1"}]
+        top_artists = []
+        payload = _stats_payload(10**30, 2.5, True, top_tracks, top_artists)
+        assert payload["total_plays"] == 10**30
+        assert type(payload["total_plays"]) is int  # bigint, never truncated
+        assert payload["total_listen_time"] == 2.5
+        assert type(payload["total_listen_time"]) is float
+        assert payload["unique_tracks"] is True  # the bool object, never 1
+        assert payload["top_tracks"] is top_tracks  # the very list object
+        assert payload["top_artists"] is top_artists
+
+    def test_none_aggregate_passes_through(self):
+        # COALESCE keeps the SQL aggregates non-NULL today, but the
+        # engine passes whatever it is given through untouched.
+        payload = _stats_payload(None, None, None, None, None)
+        assert payload == {
+            "total_plays": None,
+            "total_listen_time": None,
+            "unique_tracks": None,
+            "top_tracks": None,
+            "top_artists": None,
+        }
+
+    def test_fresh_map_every_call(self):
+        args = (12, 3450, 7, [], [])
+        first = _stats_payload(*args)
+        second = _stats_payload(*args)
+        assert first is not second
+        assert first == second
+
+    def test_inputs_never_mutated(self):
+        top_tracks = [{"video_id": "v1", "play_count": 1}]
+        top_artists = [{"artist": "A"}]
+        _stats_payload(12, 3450, 7, top_tracks, top_artists)
+        assert top_tracks == [{"video_id": "v1", "play_count": 1}]
+        assert top_artists == [{"artist": "A"}]
+
+
 # ── Native vs fallback parity ──────────────────────────────────────────
 # The matrices below are shared with the child interpreter as JSON, so
 # every value must be JSON-round-trippable: plain dict tracks, JSON
@@ -454,6 +533,43 @@ _DELTA_PARITY_CASES = [
     (30, "5"),  # comparison TypeError
 ]
 
+# Stats payload cases: every value must be JSON-round-trippable (the
+# matrices cross the process boundary as JSON), so the shape zoo lives
+# in the unit tests above and this matrix pins the realistic + edge
+# value combinations.
+_STATS_PARITY_CASES = [
+    (12, 3450, 7, [], []),
+    (0, 0, 0, [], []),  # empty database
+    (
+        12,
+        3450,
+        7,
+        [
+            {
+                "video_id": "dQw4w9WgXcQ",
+                "title": "Never Gonna Give You Up",
+                "artist": "Rick Astley",
+                "play_count": 3,
+                "total_listened_seconds": 639,
+                "last_played": "2026-10-31 12:00:00",
+            }
+        ],
+        [
+            {
+                "artist": "Rick Astley",
+                "play_count": 3,
+                "total_listened_seconds": 639,
+            }
+        ],
+    ),
+    (10**30, 10**30 + 5, 10**18, [], []),  # bigints pass through exactly
+    (True, False, True, [], []),  # bools pass through as the objects they are
+    (None, None, None, None, None),  # a NULL aggregate would pass through raw
+    (1.5, 2.0, 3, [], []),  # floats
+    ("12", "3450", "7", [], []),  # strings
+    (12, 3450, 7, ["nested", {"a": 1}], [None]),  # the lists pass through verbatim
+]
+
 
 def _build_track(spec: dict) -> object:
     """Build the parity-matrix track shapes, identically in both processes."""
@@ -495,7 +611,7 @@ import sys
 
 sys.modules['ytm_player.utils._ytm_player_native'] = None
 
-from ytm_player.services.history import _listened_delta, _play_log_row
+from ytm_player.services.history import _listened_delta, _play_log_row, _stats_payload
 
 
 class DuckGet:
@@ -549,14 +665,17 @@ rows = [
     for spec, listened, source, min_listen in payload["rows"]
 ]
 deltas = [outcome(_listened_delta, old, listened) for old, listened in payload["deltas"]]
-json.dump({"rows": rows, "deltas": deltas}, sys.stdout)
+stats = [outcome(_stats_payload, *case) for case in payload["stats"]]
+json.dump({"rows": rows, "deltas": deltas, "stats": stats}, sys.stdout)
 """
 
 
 def _fallback_outcomes() -> dict:
     """Run the pure-Python reference engines over the parity cases in a
     child interpreter with the native extension import blocked."""
-    payload = json.dumps({"rows": _PLAY_PARITY_CASES, "deltas": _DELTA_PARITY_CASES})
+    payload = json.dumps(
+        {"rows": _PLAY_PARITY_CASES, "deltas": _DELTA_PARITY_CASES, "stats": _STATS_PARITY_CASES}
+    )
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
         input=payload,
@@ -573,7 +692,8 @@ def _native_outcomes() -> dict:
         for spec, listened, source, min_listen in _PLAY_PARITY_CASES
     ]
     deltas = [_outcome(_listened_delta, old, listened) for old, listened in _DELTA_PARITY_CASES]
-    return {"rows": rows, "deltas": deltas}
+    stats = [_outcome(_stats_payload, *case) for case in _STATS_PARITY_CASES]
+    return {"rows": rows, "deltas": deltas, "stats": stats}
 
 
 class TestNativeParity:
@@ -603,4 +723,24 @@ class TestNativeParity:
                 f"native and fallback delta outcomes differ for {case!r}:\n"
                 f"native:   {n!r}\n"
                 f"fallback: {f!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_stats_payload_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(_STATS_PARITY_CASES, native["stats"], fallback["stats"]):
+            assert n == f, (
+                f"native and fallback stats outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # Key order is part of the contract (the JSON consumers'
+        # output preserves it) — compare the serialized payloads too,
+        # which pins the order, not just the mapping.
+        for n, f in zip(native["stats"], fallback["stats"]):
+            assert list(n["ok"]) == list(f["ok"]), (
+                f"native and fallback stats key orders differ:\n"
+                f"native:   {list(n['ok'])!r}\n"
+                f"fallback: {list(f['ok'])!r}"
             )
