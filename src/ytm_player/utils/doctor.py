@@ -58,23 +58,61 @@ def _redact(text: str) -> str:
     return _URL_PATTERN.sub("[URL REDACTED]", text)
 
 
-def _mpv_version() -> str:
-    """Return mpv version string, or a clear missing marker."""
-    mpv_bin = shutil.which("mpv")
+def _mpv_version_text(which_mpv: Any, run_version: Any) -> str:
+    """The mpv version probe text behind ``_mpv_version``.
+
+    The pure half of the ``mpv:`` status line: the *which_mpv* thunk —
+    the reference's ``shutil.which("mpv")`` PATH probe — is invoked
+    exactly once, exactly up front, and a falsy result (an unset
+    ``None`` or an empty string alike, the reference's ``if not
+    mpv_bin:``) is the NOT FOUND marker, the *run_version* thunk never
+    invoked; otherwise the *run_version* thunk — the reference's
+    ``subprocess.run([mpv_bin, "--version"], ...)`` — runs with the
+    resolved binary, and the version line comes from its result: the
+    ``stdout or stderr or ""`` or-chain picks the first truthy output
+    (``stderr`` is read only when ``stdout`` is falsy, exactly like
+    the reference's or-chain, so a result whose ``stderr`` attribute
+    raises never raises when ``stdout`` already satisfied it), the
+    chosen output's own ``splitlines()`` supplies the lines, the
+    ``[0:1]`` slice the first of them, and the ``unknown`` stand-in
+    when no line made it. An ``OSError`` or
+    ``subprocess.SubprocessError`` raised anywhere in the run or the
+    parse is the failed-to-execute marker; anything else propagates.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.mpv_version_text``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    mpv_bin = which_mpv()
     if not mpv_bin:
         return "mpv: NOT FOUND in PATH"
     try:
-        out = subprocess.run(
+        out = run_version(mpv_bin)
+        first_line = (out.stdout or out.stderr or "").splitlines()[0:1]
+        return f"mpv: {first_line[0] if first_line else 'unknown'}"
+    except (OSError, subprocess.SubprocessError):
+        return "mpv: failed to execute"
+
+
+def _mpv_version() -> str:
+    """Return mpv version string, or a clear missing marker.
+
+    The version probe — the PATH lookup, the ``--version`` run, the
+    first-line extraction and the failure markers — is resolved by
+    the ``_mpv_version_text`` engine above (native when the Rust
+    extension is built, the pure-Python transcription otherwise);
+    this helper supplies the probes as thunks.
+    """
+    return _mpv_version_text(
+        lambda: shutil.which("mpv"),
+        lambda mpv_bin: subprocess.run(
             [mpv_bin, "--version"],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
-        )
-        first_line = (out.stdout or out.stderr or "").splitlines()[0:1]
-        return f"mpv: {first_line[0] if first_line else 'unknown'}"
-    except (OSError, subprocess.SubprocessError):
-        return "mpv: failed to execute"
+        ),
+    )
 
 
 def _libmpv_status() -> str:
@@ -135,22 +173,56 @@ def _argv_is_ytm(argv: list[str]) -> bool:
     return "ytm" in head_names or "ytm_player" in argv
 
 
-def _running_status() -> str:
-    """Best-effort check whether a ytm TUI process is currently running.
+def _running_status_text(
+    proc_exists: Any,
+    proc_entries: Any,
+    read_cmdline: Any,
+    read_status: Any,
+    own_pid: Any,
+) -> str:
+    """The process-status text behind ``_running_status``.
 
-    Uses /proc on Linux (no psutil dependency); on other platforms or if
-    /proc is unavailable, returns a 'cannot determine' marker.
+    The pure half of the Process status section: the /proc walk with
+    every side-effecting probe passed in as a callable invoked exactly
+    where the reference performs it — the *proc_exists* thunk (the
+    reference's ``Path("/proc").exists()``), the *proc_entries* thunk
+    (the reference's ``proc_root.iterdir()``), the per-entry
+    *read_cmdline* and *read_status* thunks (the reference's
+    ``(entry / "cmdline").read_bytes()`` and ``(entry / "status")
+    ``.read_text(encoding="utf-8", errors="replace")``), and the
+    *own_pid* thunk (the reference's ``os.getpid()``, evaluated once
+    per collected pid by the reference's list-comprehension filter —
+    so zero times when nothing was collected, once per match when
+    something was).
+
+    The walk itself: a missing /proc is the cannot-determine marker;
+    every entry whose ``name`` attribute's own ``isdigit`` accepts gets
+    its cmdline read (an ``OSError`` skips the entry, exactly the
+    reference's swallow; anything else propagates), the NUL bytes
+    replaced by spaces, the result decoded with ``errors="replace"``
+    and split like ``str.split()``; an empty argv skips the entry, a
+    non-ytm argv skips it through ``_argv_is_ytm``. A match gets its
+    status read (the ``OSError``-only swallow again), the first
+    ``VmRSS:`` line's second split word coerced through ``int()``
+    (the ``(IndexError, ValueError)`` swallow back to 0 included),
+    and the pair ``int(entry.name)`` builds appended. The filter drops
+    the entry whose pid compares equal to the thunk's; no survivors
+    is ``ytm not running``, otherwise the survivors render as
+    ``PID <pid> (RSS <rss // 1024> MB)`` parts joined after
+    ``ytm running: ``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.running_status_text``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
-    proc_root = Path("/proc")
-    if not proc_root.exists():
+    if not proc_exists():
         return "(cannot determine — /proc not available on this OS)"
-    pids: list[tuple[int, int]] = []
-    for entry in proc_root.iterdir():
+    pids: list[tuple[Any, Any]] = []
+    for entry in proc_entries():
         if not entry.name.isdigit():
             continue
-        cmdline_path = entry / "cmdline"
         try:
-            cmdline_raw = cmdline_path.read_bytes()
+            cmdline_raw = read_cmdline(entry)
         except OSError:
             continue
         cmdline = cmdline_raw.replace(b"\x00", b" ").decode("utf-8", errors="replace")
@@ -159,10 +231,10 @@ def _running_status() -> str:
             continue
         if _argv_is_ytm(argv):
             try:
-                status = (entry / "status").read_text(encoding="utf-8", errors="replace")
+                status = read_status(entry)
             except OSError:
                 continue
-            rss_kb = 0
+            rss_kb: Any = 0
             for line in status.splitlines():
                 if line.startswith("VmRSS:"):
                     try:
@@ -171,11 +243,34 @@ def _running_status() -> str:
                         rss_kb = 0
                     break
             pids.append((int(entry.name), rss_kb))
-    pids = [(pid, rss) for pid, rss in pids if pid != os.getpid()]
+    pids = [(pid, rss) for pid, rss in pids if pid != own_pid()]
     if not pids:
         return "ytm not running"
     parts = [f"PID {pid} (RSS {rss // 1024} MB)" for pid, rss in pids]
     return "ytm running: " + ", ".join(parts)
+
+
+def _running_status() -> str:
+    """Best-effort check whether a ytm TUI process is currently running.
+
+    Uses /proc on Linux (no psutil dependency); on other platforms or if
+    /proc is unavailable, returns a 'cannot determine' marker.
+
+    The /proc walk — the digit-name filter, the cmdline decode and
+    argv match, the VmRSS parse, the own-pid exclusion and the
+    running/not-running verdicts — is resolved by the
+    ``_running_status_text`` engine above (native when the Rust
+    extension is built, the pure-Python transcription otherwise);
+    this helper supplies the /proc probes as thunks.
+    """
+    proc_root = Path("/proc")
+    return _running_status_text(
+        proc_root.exists,
+        proc_root.iterdir,
+        lambda entry: (entry / "cmdline").read_bytes(),
+        lambda entry: (entry / "status").read_text(encoding="utf-8", errors="replace"),
+        os.getpid,
+    )
 
 
 def _mpv_lines(lines: list[str], n: int) -> str:
@@ -541,3 +636,21 @@ except ImportError:
     pass
 else:
     _doctor_report = _native_doctor_report  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        running_status_text as _native_running_status_text,
+    )
+except ImportError:
+    pass
+else:
+    _running_status_text = _native_running_status_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        mpv_version_text as _native_mpv_version_text,
+    )
+except ImportError:
+    pass
+else:
+    _mpv_version_text = _native_mpv_version_text  # type: ignore[assignment]

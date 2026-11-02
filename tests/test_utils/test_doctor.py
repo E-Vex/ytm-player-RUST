@@ -1310,3 +1310,1039 @@ class TestCrashStalenessNativeParity:
                 f"native:   {nv!r}\n"
                 f"fallback: {fb!r}"
             )
+
+
+# ── The /proc walk behind the Process status section ───────────────────
+
+
+class _ProcEntry:
+    """One synthetic /proc entry: a name, a cmdline byte string and a
+    status text, with optional OSError markers on either read."""
+
+    def __init__(self, name, cmdline=b"", status="", cmdline_error=None, status_error=None):
+        self.name = name
+        self.cmdline = cmdline
+        self.status = status
+        self.cmdline_error = cmdline_error
+        self.status_error = status_error
+
+
+def _proc_thunks(case):
+    """The five /proc thunks for a synthetic case dict, plus the call log.
+
+    Case shape (JSON-round-trippable for the parity matrix):
+    ``{"exists": bool, "entries": [{"name": str, "cmdline": [int],
+    "status": str, "cmdline_error": "OSError" | None, "status_error":
+    "OSError" | None}], "own_pid": int | str, "exists_error":
+    "RuntimeError" | None}`` — the entry dicts become `_ProcEntry`
+    objects, the shapes the production thunks pass around.
+    """
+    entries = [
+        _ProcEntry(
+            e["name"],
+            bytes(e.get("cmdline") or []),
+            e.get("status") or "",
+            e.get("cmdline_error"),
+            e.get("status_error"),
+        )
+        for e in case["entries"]
+    ]
+    log: list[str] = []
+
+    def proc_exists():
+        log.append("exists")
+        if case.get("exists_error"):
+            raise RuntimeError("proc probe broke")
+        return case["exists"]
+
+    def proc_entries():
+        log.append("iterdir")
+        return iter(entries)
+
+    def read_cmdline(entry):
+        log.append(f"cmdline:{entry.name}")
+        if entry.cmdline_error:
+            raise OSError(f"cmdline gone: {entry.name}")
+        return entry.cmdline
+
+    def read_status(entry):
+        log.append(f"status:{entry.name}")
+        if entry.status_error:
+            raise OSError(f"status gone: {entry.name}")
+        return entry.status
+
+    def own_pid():
+        log.append("getpid")
+        return case["own_pid"]
+
+    return proc_exists, proc_entries, read_cmdline, read_status, own_pid, log
+
+
+_YTM_CONSOLE = [ord(c) for c in "/home/u/.venv/bin/python3"] + [0]
+_YTM_CONSOLE += [ord(c) for c in "/home/u/.venv/bin/ytm"] + [0]
+_YTM_DASH_M = [ord(c) for c in "/usr/bin/python3"] + [0]
+_YTM_DASH_M += [ord(c) for c in "-m"] + [0]
+_YTM_DASH_M += [ord(c) for c in "ytm_player"] + [0]
+_FIREFOX = [ord(c) for c in "/usr/bin/firefox"] + [0]
+
+
+class TestRunningStatusText:
+    """The /proc walk behind the Process status section — on whichever
+    backend is loaded."""
+
+    def _run(self, case):
+        from ytm_player.utils.doctor import _running_status_text
+
+        thunks = _proc_thunks(case)
+        return _running_status_text(*thunks[:5]), thunks[5]
+
+    def test_missing_proc_is_the_cannot_determine_marker(self):
+        text, log = self._run(
+            {"exists": False, "entries": [{"name": "1", "cmdline": _YTM_CONSOLE}], "own_pid": 0}
+        )
+        assert text == "(cannot determine — /proc not available on this OS)"
+        # Nothing else is probed — no listing, no reads, no getpid.
+        assert log == ["exists"]
+
+    def test_proc_probe_error_propagates(self):
+        with pytest.raises(RuntimeError, match="proc probe broke"):
+            self._run(
+                {
+                    "exists": True,
+                    "entries": [],
+                    "own_pid": 0,
+                    "exists_error": "RuntimeError",
+                }
+            )
+
+    def test_no_ytm_processes(self):
+        text, log = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "cpuinfo"},
+                    {"name": "1", "cmdline": _FIREFOX},
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm not running"
+        # getpid is never consulted when nothing was collected.
+        assert "getpid" not in log
+
+    def test_running_ytm_reports_pid_and_rss(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "1234", "cmdline": _YTM_CONSOLE, "status": "VmRSS:\t1536 kB\n"}
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1234 (RSS 1 MB)"
+
+    def test_python_dash_m_matches_too(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "42",
+                        "cmdline": _YTM_DASH_M,
+                        "status": "Name:\tytm\nVmRSS:\t1048576 kB\n",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 42 (RSS 1024 MB)"
+
+    def test_multiple_pids_join_in_entry_order(self):
+        text, log = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "7", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1024 kB"},
+                    {"name": "8", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 2048 kB"},
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 7 (RSS 1 MB), PID 8 (RSS 2 MB)"
+        # One getpid consultation per collected pid — the reference's
+        # comprehension evaluates the filter once per element.
+        assert log.count("getpid") == 2
+
+    def test_own_pid_is_excluded(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "5", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1 kB"}],
+                "own_pid": 5,
+            }
+        )
+        assert text == "ytm not running"
+
+    def test_non_int_own_pid_is_never_equal(self):
+        # pid != own_pid through CPython's != — an int pid is never
+        # equal to a string, so the entry survives the filter.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "5", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1024 kB"}],
+                "own_pid": "5",
+            }
+        )
+        assert text == "ytm running: PID 5 (RSS 1 MB)"
+
+    def test_non_digit_names_never_get_their_cmdline_read(self):
+        _, log = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "self"},
+                    {"name": "cpuinfo"},
+                    {"name": "123abc"},
+                    {"name": ""},
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert "iterdir" in log
+        assert not any(call.startswith("cmdline:") for call in log)
+
+    def test_superscript_digit_name_passes_the_digit_gate(self):
+        # "¹" carries Numeric_Type=Digit — CPython's isdigit accepts it
+        # where a plain ASCII check would stop — so its cmdline is read
+        # like any digit-named entry (here: empty, so the walk skips on
+        # the argv before the name's int() would ever run).
+        _, log = self._run(
+            {"exists": True, "entries": [{"name": "¹", "cmdline": []}], "own_pid": 0}
+        )
+        assert "cmdline:¹" in log
+
+    def test_unrelated_cmdline_never_gets_its_status_read(self):
+        _, log = self._run(
+            {"exists": True, "entries": [{"name": "1", "cmdline": _FIREFOX}], "own_pid": 0}
+        )
+        assert "cmdline:1" in log
+        assert not any(call.startswith("status:") for call in log)
+
+    def test_cmdline_oserror_skips_the_entry(self):
+        text, log = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "1", "cmdline": _YTM_CONSOLE, "cmdline_error": "OSError"},
+                    {"name": "2", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1024 kB"},
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 2 (RSS 1 MB)"
+        assert "status:1" not in log  # the unread entry never reaches the status read
+
+    def test_status_oserror_skips_the_entry(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status_error": "OSError"}],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm not running"
+
+    def test_cmdline_non_oserror_propagates(self):
+        with pytest.raises(RuntimeError, match="cmdline broke"):
+            from ytm_player.utils.doctor import _running_status_text
+
+            _running_status_text(
+                lambda: True,
+                lambda: iter([_ProcEntry("1", b"ytm")]),
+                lambda entry: (_ for _ in ()).throw(RuntimeError("cmdline broke")),
+                lambda entry: "",
+                lambda: 0,
+            )
+
+    def test_empty_cmdline_is_skipped(self):
+        text, log = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "1", "cmdline": []},
+                    {"name": "2", "cmdline": [0, 0, 0]},  # NULs become spaces, then nothing
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm not running"
+        assert log.count("cmdline:1") == 1
+        assert log.count("cmdline:2") == 1
+
+    def test_missing_vmrss_line_is_zero_mb(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {"name": "1", "cmdline": _YTM_CONSOLE, "status": "Name:\tytm\nVmSize: 1 kB"}
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 0 MB)"
+
+    def test_malformed_vmrss_word_is_zero_mb(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 5,368 kB"}],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 0 MB)"
+
+    def test_bare_vmrss_prefix_is_zero_mb(self):
+        # "VmRSS:" alone splits to one word — the IndexError arm.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS:"}],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 0 MB)"
+
+    def test_first_vmrss_line_wins(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "1",
+                        "cmdline": _YTM_CONSOLE,
+                        "status": "VmRSS: 2048 kB\nVmRSS: 999999 kB",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 2 MB)"
+
+    def test_vmrss_underscore_spelling_parses(self):
+        # int("1_024") is 1024 — CPython's int() acceptance set.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1_024 kB"}],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 1 MB)"
+
+    def test_vmrss_beyond_i64_renders_exactly(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "1",
+                        "cmdline": _YTM_CONSOLE,
+                        "status": "VmRSS: 99999999999999999999999 kB",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 97656249999999999999 MB)"
+
+    def test_status_line_boundaries_are_cpythons(self):
+        # \x85 is a str.splitlines boundary — the VmRSS line behind it
+        # is its own line, exactly like the reference's parse.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "1",
+                        "cmdline": _YTM_CONSOLE,
+                        "status": "Name:\tytm\x85VmRSS: 5120 kB",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 5 MB)"
+
+    def test_cmdline_invalid_utf8_decodes_with_replacement(self):
+        # 0xff and a truncated four-byte start both become U+FFFD — the
+        # match still sees the real argv[0] in front of them.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "1",
+                        "cmdline": _YTM_CONSOLE[:1] + [0xFF, 0xEF, 0xF0, 0x9F, 0x98],
+                        "status": "VmRSS: 1024 kB",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm not running"  # argv[0] "/h\uFFFD\uFFFD..." is not a ytm entry point
+
+    def test_cmdline_trailing_garbage_still_matches_the_head(self):
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [
+                    {
+                        "name": "1",
+                        "cmdline": _YTM_CONSOLE + [0xFF, 0xEF, 0xF0, 0x9F, 0x98],
+                        "status": "VmRSS: 1024 kB",
+                    }
+                ],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 1 (RSS 1 MB)"
+
+    def test_unicode_decimal_digit_name_parses(self):
+        # "٣" (Arabic-Indic three) is a digit isdigit accepts and int
+        # parses — the same CPython semantics both backends borrow.
+        text, _ = self._run(
+            {
+                "exists": True,
+                "entries": [{"name": "٣", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 2048 kB"}],
+                "own_pid": 0,
+            }
+        )
+        assert text == "ytm running: PID 3 (RSS 2 MB)"
+
+    def test_superscript_digit_name_raises_like_the_reference(self):
+        # "²" passes isdigit but int rejects it — the reference crashes
+        # here, so the engine must too (both through CPython's own int).
+        with pytest.raises(ValueError):
+            self._run(
+                {
+                    "exists": True,
+                    "entries": [{"name": "²", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1 kB"}],
+                    "own_pid": 0,
+                }
+            )
+
+    def test_entry_without_a_name_attribute_raises(self):
+        from ytm_player.utils.doctor import _running_status_text
+
+        with pytest.raises(AttributeError):
+            _running_status_text(
+                lambda: True,
+                lambda: iter([object()]),
+                lambda entry: b"",
+                lambda entry: "",
+                lambda: 0,
+            )
+
+
+# ── The mpv version probe behind the mpv status line ───────────────────
+
+
+class _Out:
+    """A CompletedProcess-shaped stub whose stdout/stderr attribute reads
+    can be made to raise (the attribute itself, like a property would)."""
+
+    def __init__(self, stdout=None, stderr=None, stdout_error=None, stderr_error=None):
+        self._stdout = stdout
+        self._stderr = stderr
+        self._stdout_error = stdout_error
+        self._stderr_error = stderr_error
+
+    @property
+    def stdout(self):
+        if self._stdout_error:
+            raise {
+                "OSError": OSError,
+                "RuntimeError": RuntimeError,
+                "AttributeError": AttributeError,
+            }[self._stdout_error]("stdout broke")
+        return self._stdout
+
+    @property
+    def stderr(self):
+        if self._stderr_error:
+            raise {
+                "OSError": OSError,
+                "RuntimeError": RuntimeError,
+                "AttributeError": AttributeError,
+            }[self._stderr_error]("stderr broke")
+        return self._stderr
+
+
+def _mpv_thunks(case):
+    """The which + run thunks for a synthetic mpv probe case, plus the log.
+
+    Case shape (JSON-round-trippable for the parity matrix):
+    ``{"which": str | None, "stdout": str | None, "stderr": str | None,
+    "stdout_error" / "stderr_error": str | None, "run_error":
+    [kind, arg] | None}``.
+    """
+    import subprocess as _sp
+
+    log: list[str] = []
+
+    def which_mpv():
+        log.append("which")
+        return case["which"]
+
+    def run_version(mpv_bin):
+        log.append(f"run:{mpv_bin}")
+        err = case.get("run_error")
+        if err is not None:
+            kind, arg = err
+            if kind == "FileNotFoundError":
+                raise FileNotFoundError(arg)
+            if kind == "TimeoutExpired":
+                raise _sp.TimeoutExpired(cmd=arg, timeout=3)
+            if kind == "ValueError":
+                raise ValueError(arg)
+        return _Out(
+            case.get("stdout"),
+            case.get("stderr"),
+            case.get("stdout_error"),
+            case.get("stderr_error"),
+        )
+
+    return which_mpv, run_version, log
+
+
+class TestMpvVersionText:
+    """The mpv version probe — on whichever backend is loaded."""
+
+    def _run(self, case):
+        from ytm_player.utils.doctor import _mpv_version_text
+
+        which_mpv, run_version, log = _mpv_thunks(case)
+        return _mpv_version_text(which_mpv, run_version), log
+
+    def test_missing_mpv_is_not_found(self):
+        text, log = self._run({"which": None, "stdout": "never read"})
+        assert text == "mpv: NOT FOUND in PATH"
+        # The subprocess probe never runs — the PATH scan already decided.
+        assert log == ["which"]
+
+    def test_empty_which_result_is_also_not_found(self):
+        text, log = self._run({"which": "", "stdout": "never read"})
+        assert text == "mpv: NOT FOUND in PATH"
+        assert log == ["which"]
+
+    def test_version_line_comes_from_stdout(self):
+        text, log = self._run(
+            {"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0 (C) 2000-2026\nmore lines\n"}
+        )
+        assert text == "mpv: mpv 0.38.0 (C) 2000-2026"
+        assert log == ["which", "run:/usr/bin/mpv"]
+
+    def test_stdout_without_trailing_newline(self):
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0"})
+        assert text == "mpv: mpv 0.38.0"
+
+    def test_stdout_none_falls_back_to_stderr(self):
+        text, _ = self._run(
+            {"which": "/usr/bin/mpv", "stdout": None, "stderr": "built from source\n"}
+        )
+        assert text == "mpv: built from source"
+
+    def test_stdout_empty_falls_back_to_stderr(self):
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout": "", "stderr": "warning line\n"})
+        assert text == "mpv: warning line"
+
+    def test_both_empty_is_unknown(self):
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout": "", "stderr": ""})
+        assert text == "mpv: unknown"
+
+    def test_both_none_is_unknown(self):
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout": None, "stderr": None})
+        assert text == "mpv: unknown"
+
+    def test_line_boundaries_are_cpythons(self):
+        # \x85 is a str.splitlines boundary — the first line stops there.
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout": "mpv 0.1\u0085hidden tail"})
+        assert text == "mpv: mpv 0.1"
+
+    def test_stderr_is_only_read_when_stdout_is_falsy(self):
+        # A truthy stdout satisfies the or-chain — the stderr attribute
+        # (here: one that raises) is never read.
+        text, _ = self._run(
+            {"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0", "stderr_error": "RuntimeError"}
+        )
+        assert text == "mpv: mpv 0.38.0"
+
+    def test_stderr_attribute_error_propagates(self):
+        with pytest.raises(AttributeError, match="stderr broke"):
+            self._run({"which": "/usr/bin/mpv", "stdout": "", "stderr_error": "AttributeError"})
+
+    def test_stdout_oserror_is_failed_to_execute(self):
+        # The attribute read sits inside the reference's try block, so
+        # its OSError lands in the failed-to-execute arm.
+        text, _ = self._run({"which": "/usr/bin/mpv", "stdout_error": "OSError"})
+        assert text == "mpv: failed to execute"
+
+    def test_missing_stdout_attribute_propagates(self):
+        from ytm_player.utils.doctor import _mpv_version_text
+
+        class _Bare:
+            pass
+
+        with pytest.raises(AttributeError):
+            _mpv_version_text(lambda: "/mpv", lambda b: _Bare())
+
+    def test_oserror_from_the_run_is_failed_to_execute(self):
+        text, _ = self._run({"which": "/mpv", "run_error": ["FileNotFoundError", "/mpv"]})
+        assert text == "mpv: failed to execute"
+
+    def test_subprocess_error_from_the_run_is_failed_to_execute(self):
+        text, _ = self._run({"which": "/mpv", "run_error": ["TimeoutExpired", "/mpv --version"]})
+        assert text == "mpv: failed to execute"
+
+    def test_other_errors_from_the_run_propagate(self):
+        with pytest.raises(ValueError, match="boom"):
+            self._run({"which": "/mpv", "run_error": ["ValueError", "boom"]})
+
+    def test_which_probe_runs_exactly_once(self):
+        _, log = self._run({"which": "/usr/bin/mpv", "stdout": "mpv 1\n"})
+        assert log.count("which") == 1
+
+
+# ── Native vs fallback parity for the two probe engines ────────────────
+
+# Both matrices are shared with the child interpreter as JSON, so every
+# value must be JSON-round-trippable (cmdlines as byte-value lists).
+
+_RUNNING_PARITY_CASES = [
+    # The missing /proc.
+    {"exists": False, "entries": [{"name": "1", "cmdline": _YTM_CONSOLE}], "own_pid": 0},
+    # Nothing running.
+    {"exists": True, "entries": [], "own_pid": 0},
+    {"exists": True, "entries": [{"name": "cpuinfo"}, {"name": "self"}], "own_pid": 0},
+    # Non-matches: non-digit names, unrelated cmdlines, empty cmdlines.
+    {"exists": True, "entries": [{"name": "123abc"}, {"name": "¹"}, {"name": ""}], "own_pid": 0},
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _FIREFOX, "status": "VmRSS: 1 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": []}, {"name": "2", "cmdline": [0, 0]}],
+        "own_pid": 0,
+    },
+    # The own-pid exclusion (and the getpid call count in the log).
+    {
+        "exists": True,
+        "entries": [{"name": "5", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1 kB"}],
+        "own_pid": 5,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "5", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1 kB"}],
+        "own_pid": "5",
+    },
+    # Matches, with the VmRSS zoo.
+    {
+        "exists": True,
+        "entries": [{"name": "1234", "cmdline": _YTM_CONSOLE, "status": "VmRSS:\t1536 kB\n"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "42", "cmdline": _YTM_DASH_M, "status": "VmRSS: 1048576 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "Name:\tytm"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 5,368 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS:"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1_024 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: +2 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: ٩٩٩ kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 99999999999999999999999 kB"}
+        ],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 2048 kB\nVmRSS: 7 kB"}
+        ],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {"name": "1", "cmdline": _YTM_CONSOLE, "status": "Name:\tytm\u0085VmRSS: 5120 kB"}
+        ],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {"name": "1", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 512 kB\u2028VmRSS: 2048 kB"}
+        ],
+        "own_pid": 0,
+    },
+    # Several pids, in order, one excluded.
+    {
+        "exists": True,
+        "entries": [
+            {"name": "7", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1024 kB"},
+            {"name": "8", "cmdline": _FIREFOX, "status": "VmRSS: 1 kB"},
+            {"name": "9", "cmdline": _YTM_DASH_M, "status": "VmRSS: 2048 kB"},
+        ],
+        "own_pid": 9,
+    },
+    # OSError skips — cmdline and status.
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "cmdline_error": "OSError"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status_error": "OSError"}],
+        "own_pid": 0,
+    },
+    # The lossy-decode zoo on the cmdline bytes.
+    {
+        "exists": True,
+        "entries": [
+            {
+                "name": "1",
+                "cmdline": _YTM_CONSOLE + [0xFF, 0xEF, 0xF0, 0x9F, 0x98],
+                "status": "VmRSS: 1024 kB",
+            }
+        ],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {
+                "name": "1",
+                "cmdline": _YTM_CONSOLE + [0xC0, 0xAF, 0xED, 0xA0, 0x80],
+                "status": "VmRSS: 1024 kB",
+            }
+        ],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [
+            {"name": "1", "cmdline": _YTM_CONSOLE + [0xE0, 0x80], "status": "VmRSS: 1024 kB"}
+        ],
+        "own_pid": 0,
+    },
+    # The unicode-name zoo.
+    {
+        "exists": True,
+        "entries": [{"name": "٣", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 2048 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "١٢", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1024 kB"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "²", "cmdline": _YTM_CONSOLE, "status": "VmRSS: 1 kB"}],
+        "own_pid": 0,
+    },
+    # Error shapes that must match: a raising exists probe, a non-OSError
+    # from a read, a nameless entry.
+    {"exists": True, "entries": [], "own_pid": 0, "exists_error": "RuntimeError"},
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "cmdline_error": "RuntimeError"}],
+        "own_pid": 0,
+    },
+    {
+        "exists": True,
+        "entries": [{"name": "1", "cmdline": _YTM_CONSOLE, "status_error": "RuntimeError"}],
+        "own_pid": 0,
+    },
+]
+
+_RUNNING_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _running_status_text
+
+
+class _ProcEntry:
+    def __init__(self, name, cmdline, status, cmdline_error, status_error):
+        self.name = name
+        self.cmdline = cmdline
+        self.status = status
+        self.cmdline_error = cmdline_error
+        self.status_error = status_error
+
+
+def build_thunks(case):
+    entries = [
+        _ProcEntry(
+            e["name"],
+            bytes(e.get("cmdline") or []),
+            e.get("status") or "",
+            e.get("cmdline_error"),
+            e.get("status_error"),
+        )
+        for e in case["entries"]
+    ]
+    log = []
+
+    def proc_exists():
+        log.append("exists")
+        if case.get("exists_error"):
+            raise RuntimeError("proc probe broke")
+        return case["exists"]
+
+    def proc_entries():
+        log.append("iterdir")
+        return iter(entries)
+
+    def read_cmdline(entry):
+        log.append(f"cmdline:{entry.name}")
+        if entry.cmdline_error:
+            raise OSError(f"cmdline gone: {entry.name}")
+        return entry.cmdline
+
+    def read_status(entry):
+        log.append(f"status:{entry.name}")
+        if entry.status_error:
+            raise OSError(f"status gone: {entry.name}")
+        return entry.status
+
+    def own_pid():
+        log.append("getpid")
+        return case["own_pid"]
+
+    return proc_exists, proc_entries, read_cmdline, read_status, own_pid, log
+
+
+def outcome(case):
+    thunks = build_thunks(case)
+    try:
+        text = _running_status_text(*thunks[:5])
+        return {"ok": text, "log": thunks[5]}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": thunks[5]}
+
+
+cases = json.load(sys.stdin)
+json.dump([outcome(case) for case in cases], sys.stdout)
+"""
+
+
+class TestRunningStatusNativeParity:
+    """When the Rust extension is built, the native /proc walk must
+    decide exactly like the pure-Python reference — same verdicts, same
+    skip sets, same getpid counts, same error shapes — for every case,
+    so the two implementations cannot drift."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_running_status_text_matches_fallback(self):
+        from ytm_player.utils.doctor import _running_status_text
+
+        result = subprocess.run(
+            [sys.executable, "-c", _RUNNING_CHILD_PROG],
+            input=json.dumps(_RUNNING_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = []
+        for case in _RUNNING_PARITY_CASES:
+            thunks = _proc_thunks(case)
+            try:
+                native.append({"ok": _running_status_text(*thunks[:5]), "log": thunks[5]})
+            except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+                native.append({"error": f"{type(exc).__name__}: {exc}", "log": thunks[5]})
+        for case, n, f in zip(_RUNNING_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback /proc walk outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+
+_MPV_VERSION_PARITY_CASES = [
+    {"which": None, "stdout": "never read"},
+    {"which": "", "stdout": "never read"},
+    {"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0 (C) 2000-2026\nmore lines\n", "stderr": None},
+    {"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0"},
+    {"which": "/usr/bin/mpv", "stdout": None, "stderr": "built from source\n"},
+    {"which": "/usr/bin/mpv", "stdout": "", "stderr": "warning line\n"},
+    {"which": "/usr/bin/mpv", "stdout": "", "stderr": ""},
+    {"which": "/usr/bin/mpv", "stdout": None, "stderr": None},
+    {"which": "/usr/bin/mpv", "stdout": "mpv 0.1\u0085hidden tail"},
+    {"which": "/usr/bin/mpv", "stdout": "first\u2028second", "stderr": None},
+    {"which": "/usr/bin/mpv", "stdout": "\nmpv later", "stderr": None},
+    # The stderr attribute is only read when stdout is falsy.
+    {"which": "/usr/bin/mpv", "stdout": "mpv 0.38.0", "stderr_error": "RuntimeError"},
+    {"which": "/usr/bin/mpv", "stdout": "", "stderr_error": "AttributeError"},
+    {"which": "/usr/bin/mpv", "stdout_error": "OSError"},
+    # Run errors: the two caught arms and the propagating one.
+    {"which": "/mpv", "run_error": ["FileNotFoundError", "/mpv"]},
+    {"which": "/mpv", "run_error": ["TimeoutExpired", "/mpv --version"]},
+    {"which": "/mpv", "run_error": ["ValueError", "boom"]},
+    # A weird-but-honest which result.
+    {"which": " ", "stdout": "mpv 1\n"},
+]
+
+_MPV_VERSION_CHILD_PROG = """
+import json
+import subprocess
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _mpv_version_text
+
+_ERRORS = {
+    "OSError": OSError,
+    "RuntimeError": RuntimeError,
+    "AttributeError": AttributeError,
+}
+
+
+class _Out:
+    def __init__(self, stdout, stderr, stdout_error, stderr_error):
+        self._stdout = stdout
+        self._stderr = stderr
+        self._stdout_error = stdout_error
+        self._stderr_error = stderr_error
+
+    @property
+    def stdout(self):
+        if self._stdout_error:
+            raise _ERRORS[self._stdout_error]("stdout broke")
+        return self._stdout
+
+    @property
+    def stderr(self):
+        if self._stderr_error:
+            raise _ERRORS[self._stderr_error]("stderr broke")
+        return self._stderr
+
+
+def build_thunks(case):
+    log = []
+
+    def which_mpv():
+        log.append("which")
+        return case["which"]
+
+    def run_version(mpv_bin):
+        log.append(f"run:{mpv_bin}")
+        err = case.get("run_error")
+        if err is not None:
+            kind, arg = err
+            if kind == "FileNotFoundError":
+                raise FileNotFoundError(arg)
+            if kind == "TimeoutExpired":
+                raise subprocess.TimeoutExpired(cmd=arg, timeout=3)
+            if kind == "ValueError":
+                raise ValueError(arg)
+        return _Out(
+            case.get("stdout"),
+            case.get("stderr"),
+            case.get("stdout_error"),
+            case.get("stderr_error"),
+        )
+
+    return which_mpv, run_version, log
+
+
+def outcome(case):
+    which_mpv, run_version, log = build_thunks(case)
+    try:
+        text = _mpv_version_text(which_mpv, run_version)
+        return {"ok": text, "log": log}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": log}
+
+
+cases = json.load(sys.stdin)
+json.dump([outcome(case) for case in cases], sys.stdout)
+"""
+
+
+class TestMpvVersionNativeParity:
+    """When the Rust extension is built, the native mpv probe must
+    decide exactly like the pure-Python reference — same version lines,
+    same markers, same probe timings, same error shapes — for every
+    case, so the two implementations cannot drift."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_mpv_version_text_matches_fallback(self):
+        from ytm_player.utils.doctor import _mpv_version_text
+
+        result = subprocess.run(
+            [sys.executable, "-c", _MPV_VERSION_CHILD_PROG],
+            input=json.dumps(_MPV_VERSION_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = []
+        for case in _MPV_VERSION_PARITY_CASES:
+            which_mpv, run_version, log = _mpv_thunks(case)
+            try:
+                native.append({"ok": _mpv_version_text(which_mpv, run_version), "log": log})
+            except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+                native.append({"error": f"{type(exc).__name__}: {exc}", "log": log})
+        for case, n, f in zip(_MPV_VERSION_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback mpv probe outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # The probe-timing contract, pinned by the compared call logs:
+        # the which probe always runs exactly once, and the subprocess
+        # probe only when the which result was truthy.
+        for case, n in zip(_MPV_VERSION_PARITY_CASES, native):
+            assert n["log"].count("which") == 1
+            if not case["which"]:
+                assert len(n["log"]) == 1

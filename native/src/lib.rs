@@ -1,7 +1,8 @@
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PyString, PyTuple,
+    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PySlice, PyString, PyTuple,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -343,6 +344,16 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(recent_mpv_lines, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(faulthandler_tail, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(crash_staleness_note, module)?)?;
+
+    // Doctor /proc and subprocess probe engines (utils/doctor.py
+    // equivalents): the Process status section's ytm-running verdict —
+    // the /proc walk, the cmdline decode and entry-point match, the
+    // VmRSS parse, the own-pid exclusion — and the `mpv:` version line
+    // behind the mpv status probe, both with their side-effecting
+    // probes (/proc reads, shutil.which, the --version subprocess run)
+    // supplied as thunks.
+    module.add_function(pyo3::wrap_pyfunction!(running_status_text, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(mpv_version_text, module)?)?;
     Ok(())
 }
 
@@ -7389,6 +7400,18 @@ fn parse_pep440(text: &str) -> Option<Pep440Key> {
     })
 }
 
+/// Split exactly like CPython's `str.split()` with no separator: on
+/// runs of the `isspace` set (see `py_isspace` — a wider set than the
+/// crate's own `split_whitespace`, which stops at the Unicode
+/// `White_Space` property and misses `\x1c`–`\x1f`), producing no
+/// empty pieces — leading and trailing whitespace yields nothing, and
+/// an empty string yields no pieces at all.
+fn py_split_none(s: &str) -> Vec<&str> {
+    s.split(py_isspace)
+        .filter(|piece| !piece.is_empty())
+        .collect()
+}
+
 /// Split exactly like CPython's `str.splitlines`: on every line boundary
 /// it accepts (`\n`, `\r\n` as one, `\r`, `\v`, `\f`, `\x1c`, `\x1d`,
 /// `\x1e`, `\x85`, `\u{2028}`, `\u{2029}`) — a wider set than the
@@ -7475,4 +7498,274 @@ fn crash_staleness_note(content: &str, current_version: &str) -> Option<String> 
         ));
     }
     None
+}
+
+/// The process-status text behind the Process status section of
+/// `ytm doctor` — the pure core of `_running_status` in
+/// `utils/doctor.py`.
+///
+/// Mirrors the pure-Python reference (`_running_status_text`): the
+/// /proc walk, with every side-effecting probe passed in as a callable
+/// the engine invokes exactly where the reference performs it — the
+/// *proc_exists* thunk (the reference's `Path("/proc").exists()`), the
+/// *proc_entries* thunk (the reference's `proc_root.iterdir()`), the
+/// per-entry *read_cmdline* and *read_status* thunks (the reference's
+/// `(entry / "cmdline").read_bytes()` and `(entry / "status")
+/// .read_text(encoding="utf-8", errors="replace")`), and the *own_pid*
+/// thunk (the reference's `os.getpid()`, evaluated once per collected
+/// pid by the reference's list-comprehension filter — so zero times
+/// when nothing was collected, once per match when something was).
+///
+/// The walk itself: a missing /proc is the cannot-determine marker;
+/// every entry whose `.name` attribute's own `isdigit` accepts —
+/// CPython's Numeric_Type=Digit-or-Decimal set, which the crate carries
+/// no table for, so the verdict runs through the name object's own
+/// method, str subclasses included — gets its cmdline read (an
+/// `OSError` skips the entry, exactly the reference's swallow; anything
+/// else propagates), NUL bytes replaced by spaces, the result decoded
+/// like `decode("utf-8", errors="replace")` — one U+FFFD per maximal
+/// invalid subpart, the same subpart boundaries CPython's replace
+/// handler draws — and split like `str.split()` (the CPython whitespace
+/// set, see `py_split_none`); an empty argv skips the entry, a
+/// non-ytm argv skips it through the same `argv_is_ytm` engine the
+/// Python side's module global resolves to (its own parity tests lock
+/// the two spellings together). A match gets its status read (the
+/// `OSError`-only swallow again), the first `VmRSS:` line's second
+/// split word coerced through CPython's own `int()` — the acceptance
+/// set (signed, underscored and non-ASCII digit spellings, the
+/// 4300-digit limit) and the `ValueError` swallows matching the
+/// reference's exactly, a missing or unparseable word leaving the
+/// reference's 0 (see `vmrss_word_kb`) — and the pair `int(entry.name)`
+/// builds appended, the pid conversion running through the builtin too
+/// so an isdigit-accepted name int() rejects (a superscript digit, say)
+/// raises exactly at the reference's append. The filter drops the
+/// entry whose pid compares equal to the thunk's (CPython's own `!=`,
+/// so an int own-pid compares numerically and anything else is never
+/// equal); no survivors is `ytm not running`, otherwise the survivors
+/// render as `PID <pid> (RSS <rss // 1024> MB)` parts — the floor
+/// division through the int object's own `__floordiv__`, so an
+/// unbounded VmRSS stays exact — joined after `ytm running: `.
+///
+/// The cmdline thunk's result is read as `bytes` and the status
+/// thunk's as `str` — the shapes `read_bytes()` and `read_text()`
+/// return — and both stay unmutated. The pid and RSS objects are the
+/// objects `int()` made; everything else is fresh. The inputs are
+/// never mutated.
+#[pyfunction]
+#[pyo3(signature = (proc_exists, proc_entries, read_cmdline, read_status, own_pid))]
+fn running_status_text<'py>(
+    py: Python<'py>,
+    proc_exists: &Bound<'py, PyAny>,
+    proc_entries: &Bound<'py, PyAny>,
+    read_cmdline: &Bound<'py, PyAny>,
+    read_status: &Bound<'py, PyAny>,
+    own_pid: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    if !proc_exists.call0()?.is_truthy()? {
+        return Ok("(cannot determine — /proc not available on this OS)".to_string());
+    }
+    // rss_kb = 0 — the reference's starting int, swapped in whenever the
+    // VmRSS parse yields nothing.
+    let zero_kb: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+    // (pid, rss) — both stay the Python objects int() made them, so a
+    // pid or VmRSS beyond i64 renders exactly like the reference's
+    // f-strings instead of overflowing a fixed-width coercion.
+    let mut pids: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = Vec::new();
+    for entry in proc_entries.call0()?.try_iter()? {
+        let entry = entry?;
+        // entry.name — the attribute read the reference performs.
+        let name = entry.getattr("name")?;
+        // entry.name.isdigit() — through the name object's own method
+        // (see the doc comment above).
+        if !name.call_method0("isdigit")?.is_truthy()? {
+            continue;
+        }
+        // cmdline_path.read_bytes() — the OSError-only swallow.
+        let cmdline_raw = match read_cmdline.call1((&entry,)) {
+            Ok(raw) => raw,
+            Err(err) if err.is_instance_of::<PyOSError>(py) => continue,
+            Err(err) => return Err(err),
+        };
+        // replace(b"\x00", b" ") then decode("utf-8", errors="replace").
+        let raw_bytes: Vec<u8> = cmdline_raw.extract()?;
+        let spaced: Vec<u8> = raw_bytes
+            .iter()
+            .map(|&b| if b == 0 { b' ' } else { b })
+            .collect();
+        let cmdline = String::from_utf8_lossy(&spaced);
+        // cmdline.split() — str.split() with no separator.
+        let argv: Vec<String> = py_split_none(&cmdline)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if argv.is_empty() {
+            continue;
+        }
+        // _argv_is_ytm(argv) — the same engine the Python side's module
+        // global resolves to.
+        if !argv_is_ytm(argv) {
+            continue;
+        }
+        // (entry / "status").read_text(...) — the OSError-only swallow
+        // again.
+        let status_text = match read_status.call1((&entry,)) {
+            Ok(text) => text,
+            Err(err) if err.is_instance_of::<PyOSError>(py) => continue,
+            Err(err) => return Err(err),
+        };
+        let status: String = status_text.extract()?;
+        // The VmRSS scan: the first VmRSS-prefixed line decides, and the
+        // break is unconditional — a later line never gets a say.
+        let mut rss_kb: Option<Bound<'py, PyAny>> = None;
+        for line in py_splitlines(&status) {
+            if line.starts_with("VmRSS:") {
+                rss_kb = Some(vmrss_word_kb(py, &line)?);
+                break;
+            }
+        }
+        // int(entry.name) — through the builtin, at the reference's
+        // append-time position.
+        let pid = builtin_int(py, &name)?;
+        let rss = rss_kb.unwrap_or_else(|| zero_kb.clone());
+        pids.push((pid, rss));
+    }
+    // pids = [(pid, rss) for pid, rss in pids if pid != os.getpid()] —
+    // the reference's comprehension evaluates the getpid call once per
+    // collected pid, so the thunk is invoked per element here too.
+    let mut kept: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = Vec::new();
+    for (pid, rss) in pids {
+        let own = own_pid.call0()?;
+        // pid != own — CPython's own != through PyObject_RichCompare.
+        let differs = pid.rich_compare(&own, CompareOp::Ne)?.is_truthy()?;
+        if differs {
+            kept.push((pid, rss));
+        }
+    }
+    if kept.is_empty() {
+        return Ok("ytm not running".to_string());
+    }
+    // parts = [f"PID {pid} (RSS {rss // 1024} MB)" ...] — the floor
+    // division through the int object's own __floordiv__, the
+    // interpolation through str() exactly like the reference's f-strings.
+    let mut parts: Vec<String> = Vec::with_capacity(kept.len());
+    for (pid, rss) in &kept {
+        let mb = rss.call_method1("__floordiv__", (1024,))?;
+        parts.push(format!("PID {} (RSS {} MB)", py_str(pid)?, py_str(&mb)?));
+    }
+    Ok("ytm running: ".to_string() + &parts.join(", "))
+}
+
+/// `int(line.split()[1])` — the VmRSS value word — with the reference's
+/// `(IndexError, ValueError)` swallow back to 0: a line whose split
+/// yields fewer than two words is the IndexError arm, a word CPython's
+/// `int()` rejects is the ValueError one, and anything `int()` accepts
+/// is the value — the object itself, unbounded, never a fixed-width
+/// coercion (see `builtin_int`).
+fn vmrss_word_kb<'py>(py: Python<'py>, line: &str) -> PyResult<Bound<'py, PyAny>> {
+    let words = py_split_none(line);
+    let Some(word) = words.get(1) else {
+        // IndexError — line.split()[1] on a one-word (or empty) line.
+        return Ok(0i64.into_pyobject(py)?.into_any());
+    };
+    let word_obj = PyString::new(py, word);
+    match builtin_int(py, &word_obj) {
+        Ok(value) => Ok(value),
+        // ValueError — a word int() cannot parse ("5,368", "N/A", a run
+        // beyond the 4300-digit limit, ...).
+        Err(err) if err.is_instance_of::<PyValueError>(py) => {
+            Ok(0i64.into_pyobject(py)?.into_any())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The `mpv:` version line behind the mpv status probe of `ytm doctor`
+/// — the pure core of `_mpv_version` in `utils/doctor.py`.
+///
+/// Mirrors the pure-Python reference (`_mpv_version_text`): the
+/// *which_mpv* thunk — the reference's `shutil.which("mpv")` PATH
+/// probe, invoked exactly once, exactly up front — and a falsy result
+/// (an unset `None` or an empty string alike, the reference's
+/// `if not mpv_bin:`) is the NOT FOUND marker, the *run_version* thunk
+/// never invoked; otherwise the *run_version* thunk — the reference's
+/// `subprocess.run([mpv_bin, "--version"], ...)` — runs with the
+/// resolved binary, and the version line comes from its result: the
+/// `stdout or stderr or ""` or-chain picks the first truthy output —
+/// `stderr` read only when `stdout` is falsy, exactly like the
+/// reference's or-chain, so a result whose `stderr` attribute raises
+/// never raises when `stdout` already satisfied it — the chosen
+/// output's own `splitlines()` supplies the lines (CPython's line
+/// boundaries, `\x85` and `\u{2028}` included, subclasses included),
+/// the `[0:1]` slice the first of them, the `unknown` stand-in when no
+/// line made it, and the f-string the `mpv: ` prefix. An `OSError` or
+/// `subprocess.SubprocessError` raised anywhere in the run or the
+/// parse — the whole span the reference's try block covers — is the
+/// failed-to-execute marker (see `is_subprocess_error`); anything else
+/// propagates. The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (which_mpv, run_version))]
+fn mpv_version_text<'py>(
+    py: Python<'py>,
+    which_mpv: &Bound<'py, PyAny>,
+    run_version: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    let mpv_bin = which_mpv.call0()?;
+    if !mpv_bin.is_truthy()? {
+        return Ok("mpv: NOT FOUND in PATH".to_string());
+    }
+    match mpv_version_attempt(py, run_version, &mpv_bin) {
+        Ok(line) => Ok(line),
+        // except (OSError, subprocess.SubprocessError) — the reference's
+        // clause, both arms through CPython's own exception matching.
+        Err(err) if err.is_instance_of::<PyOSError>(py) || is_subprocess_error(py, &err)? => {
+            Ok("mpv: failed to execute".to_string())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The run-and-parse half of the mpv version probe — everything the
+/// reference's try block covers, so an `OSError` or
+/// `subprocess.SubprocessError` from any of it lands in the
+/// failed-to-execute arm of the caller.
+fn mpv_version_attempt<'py>(
+    py: Python<'py>,
+    run_version: &Bound<'py, PyAny>,
+    mpv_bin: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    let out = run_version.call1((mpv_bin,))?;
+    // out.stdout — always read; out.stderr — only when stdout is falsy,
+    // exactly like the reference's or-chain.
+    let stdout = out.getattr("stdout")?;
+    let chosen = if stdout.is_truthy()? {
+        stdout
+    } else {
+        let stderr = out.getattr("stderr")?;
+        if stderr.is_truthy()? {
+            stderr
+        } else {
+            // "" — the or-chain's literal; its splitlines() is always
+            // [], so the [0:1] slice is empty and the marker is unknown.
+            return Ok("mpv: unknown".to_string());
+        }
+    };
+    // .splitlines() — the chosen output's own method.
+    let lines = chosen.call_method0("splitlines")?;
+    // [0:1] — the slice, then its truthiness, then first_line[0].
+    let first_line = lines.get_item(PySlice::new(py, 0, 1, 1))?;
+    if first_line.is_truthy()? {
+        let first = first_line.get_item(0)?;
+        Ok(format!("mpv: {}", py_str(&first)?))
+    } else {
+        Ok("mpv: unknown".to_string())
+    }
+}
+
+/// `isinstance(err, subprocess.SubprocessError)` — the second arm of
+/// the mpv probe's except clause, through the module's own exception
+/// root (`subprocess.TimeoutExpired` and `CalledProcessError` inherit
+/// it, so the reference's clause catches them too).
+fn is_subprocess_error(py: Python<'_>, err: &PyErr) -> PyResult<bool> {
+    let subprocess_error = py.import("subprocess")?.getattr("SubprocessError")?;
+    Ok(err.is_instance(py, &subprocess_error))
 }
