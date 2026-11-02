@@ -288,6 +288,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // first four fields.
     module.add_function(pyo3::wrap_pyfunction!(cli_stats_payload, module)?)?;
 
+    // CLI cache-status engines (cli.py equivalents): the six-key status
+    // payload behind the standalone `ytm cache status --json` command,
+    // and the four aligned human lines it echoes without --json — both
+    // from the cache directory and the walk's three aggregates.
+    module.add_function(pyo3::wrap_pyfunction!(cache_status_payload, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(cache_status_text, module)?)?;
+
     // IPC dispatch engine (app/_ipc.py _handle_ipc_command equivalent):
     // the dispatch-table walk behind the CLI-shells command router —
     // which branch of the match handles each command string, and the
@@ -6010,6 +6017,81 @@ fn cli_stats_payload<'py>(
     out.set_item("top_tracks", items)
         .expect("dict insertion with a str key cannot fail");
     Ok(out)
+}
+
+/// The status payload behind the CLI's standalone `ytm cache status`
+/// command — the pure core of the status read in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cache_status_payload`): the
+/// six-key dict assembled from the cache directory and the walk's
+/// three aggregates, in the reference's insertion order (the key order
+/// the JSON output preserves — `cache_dir`, `file_count`,
+/// `total_bytes`, `total_human`, `db_size_bytes`, `db_size_human`).
+/// `str(cache_dir)` renders the directory exactly like the reference's
+/// dict literal (a `Path` as its path text); `file_count`,
+/// `total_bytes` and `db_size` pass through as the objects they are —
+/// the count and the sums straight from the directory walk — and the
+/// two human spellings come from the same `format_size` engine the
+/// Python side's `from …formatting import format_size` resolves to
+/// when the extension is built, applied through the same conversion.
+/// The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (cache_dir, file_count, total_bytes, db_size))]
+fn cache_status_payload<'py>(
+    py: Python<'py>,
+    cache_dir: &Bound<'py, PyAny>,
+    file_count: &Bound<'py, PyAny>,
+    total_bytes: &Bound<'py, PyAny>,
+    db_size: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // str(cache_dir) — rendered like the reference's dict literal.
+    out.set_item("cache_dir", py_str(cache_dir)?)
+        .expect("dict insertion with a str key cannot fail");
+    // Each aggregate is stored as the object it is, never coerced.
+    out.set_item("file_count", file_count)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("total_bytes", total_bytes)
+        .expect("dict insertion with a str key cannot fail");
+    // format_size(total_bytes) — the same engine the Python side binds
+    // to, through the same conversion its own call would perform.
+    out.set_item("total_human", format_size(total_bytes.extract::<i64>()?))
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("db_size_bytes", db_size)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("db_size_human", format_size(db_size.extract::<i64>()?))
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The human-readable status text behind the CLI's standalone
+/// `ytm cache status` command — the four aligned lines the command
+/// echoes when `--json` is absent, joined by the newlines the four
+/// `click.echo` calls appended (the caller's own echo supplies the
+/// trailing one).
+///
+/// Mirrors the pure-Python reference (`_cache_status_text`): the
+/// `Cache directory:` line renders `str(cache_dir)` exactly like the
+/// reference's f-string (a `Path` as its path text), `Cached files:`
+/// interpolates the count object through `str()` as it is, and the
+/// two size lines come from the same `format_size` engine the Python
+/// side binds to, through the same conversion its own calls would
+/// perform. The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (cache_dir, file_count, total_bytes, db_size))]
+fn cache_status_text(
+    cache_dir: &Bound<'_, PyAny>,
+    file_count: &Bound<'_, PyAny>,
+    total_bytes: &Bound<'_, PyAny>,
+    db_size: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    Ok(format!(
+        "Cache directory: {}\nCached files:    {}\nTotal size:      {}\nDatabase size:   {}",
+        py_str(cache_dir)?,
+        py_str(file_count)?,
+        format_size(total_bytes.extract::<i64>()?),
+        format_size(db_size.extract::<i64>()?),
+    ))
 }
 
 /// The dispatch table behind `IPCMixin._handle_ipc_command` from

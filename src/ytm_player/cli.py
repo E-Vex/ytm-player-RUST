@@ -571,6 +571,71 @@ def stats(compact_json: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _cache_status_payload(
+    cache_dir: Any,
+    file_count: Any,
+    total_bytes: Any,
+    db_size: Any,
+) -> dict[str, Any]:
+    """The status payload the ``cache status`` command outputs.
+
+    The pure half of the standalone ``ytm cache status --json`` read:
+    the six-key dict assembled from the cache directory and the walk's
+    three aggregates, in this insertion order — the key order the
+    JSON output preserves. ``str(cache_dir)`` renders the directory
+    exactly like the reference's dict literal (a ``Path`` as its path
+    text); the count and the two sums pass through as the objects
+    they are; and the two human spellings come from ``format_size``
+    (itself native when the extension is built). The inputs are
+    never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cache_status_payload``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.utils.formatting import format_size
+
+    return {
+        "cache_dir": str(cache_dir),
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "total_human": format_size(total_bytes),
+        "db_size_bytes": db_size,
+        "db_size_human": format_size(db_size),
+    }
+
+
+def _cache_status_text(
+    cache_dir: Any,
+    file_count: Any,
+    total_bytes: Any,
+    db_size: Any,
+) -> str:
+    """The human-readable status text the ``cache status`` command echoes.
+
+    The pure half of the standalone ``ytm cache status`` read without
+    ``--json``: the four aligned lines — the directory, the file
+    count, and the two human sizes — each interpolated through
+    ``str()`` exactly like the reference's f-strings, joined by the
+    newlines the four ``click.echo`` calls appended (the caller's own
+    echo supplies the trailing one). The inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cache_status_text``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.utils.formatting import format_size
+
+    return "\n".join(
+        [
+            f"Cache directory: {cache_dir}",
+            f"Cached files:    {file_count}",
+            f"Total size:      {format_size(total_bytes)}",
+            f"Database size:   {format_size(db_size)}",
+        ]
+    )
+
+
 @main.group(invoke_without_command=True)
 @click.pass_context
 def cache(ctx: click.Context) -> None:
@@ -583,8 +648,6 @@ def cache(ctx: click.Context) -> None:
 @click.option("--json", "compact_json", is_flag=True, help="Compact JSON output.")
 def cache_status(compact_json: bool) -> None:
     """Show cache size and statistics."""
-    from ytm_player.utils.formatting import format_size
-
     total_bytes = 0
     file_count = 0
 
@@ -598,22 +661,12 @@ def cache_status(compact_json: bool) -> None:
     if CACHE_DB.exists():
         db_size = CACHE_DB.stat().st_size
 
-    data: dict[str, Any] = {
-        "cache_dir": str(CACHE_DIR),
-        "file_count": file_count,
-        "total_bytes": total_bytes,
-        "total_human": format_size(total_bytes),
-        "db_size_bytes": db_size,
-        "db_size_human": format_size(db_size),
-    }
-
     if compact_json:
-        _json_output(data, compact=True)
+        _json_output(
+            _cache_status_payload(CACHE_DIR, file_count, total_bytes, db_size), compact=True
+        )
     else:
-        click.echo(f"Cache directory: {CACHE_DIR}")
-        click.echo(f"Cached files:    {file_count}")
-        click.echo(f"Total size:      {format_size(total_bytes)}")
-        click.echo(f"Database size:   {format_size(db_size)}")
+        click.echo(_cache_status_text(CACHE_DIR, file_count, total_bytes, db_size))
 
 
 @cache.command("clear")
@@ -727,3 +780,21 @@ except ImportError:
     pass
 else:
     _json_dumps = _native_json_dumps  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cache_status_payload as _native_cache_status_payload,
+    )
+except ImportError:
+    pass
+else:
+    _cache_status_payload = _native_cache_status_payload  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cache_status_text as _native_cache_status_text,
+    )
+except ImportError:
+    pass
+else:
+    _cache_status_text = _native_cache_status_text  # type: ignore[assignment]
