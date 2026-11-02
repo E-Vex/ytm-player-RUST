@@ -720,6 +720,48 @@ def import_playlist(spotify_url: str) -> None:
     run_import(spotify_url, auth_path)
 
 
+def _config_editor_plan(
+    editor_env: Any,
+    is_win32: Any,
+    resolve_xdg: Any,
+    config_file: Any,
+    config_dir: Any,
+) -> dict[str, Any]:
+    """The editor resolution behind the ``config`` command.
+
+    The pure half of the standalone ``ytm config`` open: the plan —
+    which editor opens which target — decided from the ``EDITOR``
+    environment value (a truthy one opens the config *file*; an empty
+    string is falsy and falls through, exactly like the reference's
+    ``if editor:``), the Windows branch (``os.startfile`` shell-opens
+    the *file*; the call itself stays in the caller), and the
+    ``xdg-open`` fallback (the ``resolve_xdg`` thunk — the reference's
+    ``shutil.which("xdg-open")`` probe — is invoked exactly here,
+    exactly once, only on this branch, so the PATH scan never runs
+    when an ``EDITOR`` is set; its result opens the config
+    *directory*, and a ``None`` result is the manual-open error).
+    The ``which`` verdict is an ``is None`` check, not a truthiness
+    one; the targets render through ``str()``; the plan is a fresh
+    map and the inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.config_editor_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if editor_env:
+        return {"kind": "editor", "editor": editor_env, "target": str(config_file)}
+    if is_win32:
+        return {"kind": "startfile", "target": str(config_file)}
+    editor = resolve_xdg()
+    target = str(config_dir)
+    if editor is None:
+        return {
+            "kind": "error",
+            "message": f"No $EDITOR set and xdg-open not found. Open manually: {config_dir}",
+        }
+    return {"kind": "editor", "editor": editor, "target": target}
+
+
 @main.command()
 def config() -> None:
     """Open the config directory in your editor.
@@ -734,24 +776,30 @@ def config() -> None:
 
         Settings().save(CONFIG_FILE)
 
-    editor = os.environ.get("EDITOR")
-    if editor:
-        target = str(CONFIG_FILE)
-    elif sys.platform == "win32":
-        os.startfile(str(CONFIG_FILE))
+    plan = _config_editor_plan(
+        os.environ.get("EDITOR"),
+        sys.platform == "win32",
+        lambda: shutil.which("xdg-open"),
+        CONFIG_FILE,
+        CONFIG_DIR,
+    )
+    if plan["kind"] == "startfile":
+        # The plan's is_win32 is `sys.platform == "win32"`; re-checking
+        # the platform keeps os.startfile behind the same gate the
+        # reference's elif had — the only platform where the attribute
+        # exists at all.
+        if sys.platform == "win32":
+            os.startfile(plan["target"])
         return
-    else:
-        editor = shutil.which("xdg-open")
-        target = str(CONFIG_DIR)
-        if editor is None:
-            _error(f"No $EDITOR set and xdg-open not found. Open manually: {CONFIG_DIR}")
+    if plan["kind"] == "error":
+        _error(plan["message"])
 
     try:
         # shlex.split so EDITOR values with args ("code -w", "emacs -nw")
         # don't end up as a single bogus executable name. shlex.split
         # raises ValueError on unbalanced quotes — route that through
         # _error so a typo'd EDITOR doesn't crash the CLI.
-        subprocess.run([*shlex.split(editor), target], check=True)
+        subprocess.run([*shlex.split(plan["editor"]), plan["target"]], check=True)
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
         _error(f"Failed to open editor: {exc}")
 
@@ -798,3 +846,12 @@ except ImportError:
     pass
 else:
     _cache_status_text = _native_cache_status_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        config_editor_plan as _native_config_editor_plan,
+    )
+except ImportError:
+    pass
+else:
+    _config_editor_plan = _native_config_editor_plan  # type: ignore[assignment]

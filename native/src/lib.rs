@@ -295,6 +295,12 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(cache_status_payload, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(cache_status_text, module)?)?;
 
+    // CLI config editor resolution (cli.py equivalent): the plan behind
+    // the standalone `ytm config` command — which editor opens the
+    // config file, whether Windows shell-opens it instead, and the
+    // no-EDITOR no-xdg-open manual-open error.
+    module.add_function(pyo3::wrap_pyfunction!(config_editor_plan, module)?)?;
+
     // IPC dispatch engine (app/_ipc.py _handle_ipc_command equivalent):
     // the dispatch-table walk behind the CLI-shells command router —
     // which branch of the match handles each command string, and the
@@ -6092,6 +6098,70 @@ fn cache_status_text(
         format_size(total_bytes.extract::<i64>()?),
         format_size(db_size.extract::<i64>()?),
     ))
+}
+
+/// The editor resolution behind the CLI's standalone `ytm config`
+/// command — the pure core of the config open in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_config_editor_plan`): a truthy
+/// *editor_env* (the `EDITOR` environment value — an empty string is
+/// falsy and falls through, exactly like the reference's `if editor:`)
+/// opens the config *file* with that editor; otherwise a truthy
+/// *is_win32* (the reference's `sys.platform == "win32"`, computed by
+/// the caller) shell-opens the file (`os.startfile`, whose call stays
+/// in the caller); otherwise the *resolve_xdg* thunk — the reference's
+/// `shutil.which("xdg-open")` probe, passed as a zero-argument
+/// callable and invoked exactly here, exactly once, only on this
+/// branch, so the PATH scan never runs when an `EDITOR` is set — is
+/// asked for `xdg-open`, whose result opens the config *directory*.
+/// The `which` verdict is an `is None` check, not a truthiness one —
+/// an empty-string path is still the editor — and a `None` result is
+/// the manual-open error, its message naming the directory through
+/// `str()` exactly like the reference's f-string. The editor value
+/// passes through as the object it is; the targets render through
+/// `str()` exactly like the reference's assignments; the plan is a
+/// fresh map; the inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (editor_env, is_win32, resolve_xdg, config_file, config_dir))]
+fn config_editor_plan<'py>(
+    py: Python<'py>,
+    editor_env: &Bound<'py, PyAny>,
+    is_win32: &Bound<'py, PyAny>,
+    resolve_xdg: &Bound<'py, PyAny>,
+    config_file: &Bound<'py, PyAny>,
+    config_dir: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    if editor_env.is_truthy()? {
+        out.set_item("kind", "editor")?;
+        out.set_item("editor", editor_env)?;
+        out.set_item("target", py_str(config_file)?)?;
+    } else if is_win32.is_truthy()? {
+        out.set_item("kind", "startfile")?;
+        out.set_item("target", py_str(config_file)?)?;
+    } else {
+        // shutil.which("xdg-open") — the probe, invoked exactly here
+        // and exactly once, only on the no-EDITOR no-Windows branch.
+        let editor = resolve_xdg.call0()?;
+        let target = py_str(config_dir)?;
+        // `if editor is None` — not a truthiness gate: an empty-string
+        // path is still the editor.
+        if editor.is_none() {
+            out.set_item("kind", "error")?;
+            out.set_item(
+                "message",
+                format!(
+                    "No $EDITOR set and xdg-open not found. Open manually: {}",
+                    py_str(config_dir)?
+                ),
+            )?;
+        } else {
+            out.set_item("kind", "editor")?;
+            out.set_item("editor", editor)?;
+            out.set_item("target", target)?;
+        }
+    }
+    Ok(out)
 }
 
 /// The dispatch table behind `IPCMixin._handle_ipc_command` from
