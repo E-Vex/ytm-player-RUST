@@ -295,6 +295,12 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(cache_status_payload, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(cache_status_text, module)?)?;
 
+    // CLI cache-clear walk (cli.py equivalent): the directory walk
+    // behind the standalone `ytm cache clear` command — which entries
+    // of the cache directory are unlinked and how many were, with the
+    // exists/iterdir/is_file/unlink operations supplied as thunks.
+    module.add_function(pyo3::wrap_pyfunction!(cache_clear_walk, module)?)?;
+
     // CLI config editor resolution (cli.py equivalent): the plan behind
     // the standalone `ytm config` command — which editor opens the
     // config file, whether Windows shell-opens it instead, and the
@@ -6098,6 +6104,47 @@ fn cache_status_text(
         format_size(total_bytes.extract::<i64>()?),
         format_size(db_size.extract::<i64>()?),
     ))
+}
+
+/// The directory walk behind the CLI's standalone `ytm cache clear`
+/// command — the pure core of the delete in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cache_clear_walk`): when the
+/// *dir_exists* thunk (the reference's `CACHE_DIR.exists()`) reports the
+/// directory, every entry the *list_entries* thunk yields (the
+/// reference's `CACHE_DIR.iterdir()`) that the *is_file* thunk accepts
+/// is handed to the *unlink* thunk and counted — subdirectories and
+/// everything that is not a plain file are left untouched — and the
+/// walk returns the count the reference's `removed` accumulates. Each
+/// thunk is invoked exactly where the reference performs its own
+/// operation — the existence probe once up front, the listing only
+/// when the directory exists, the file test once per entry in
+/// iteration order, the unlink only for the entries that pass it — so
+/// the filesystem side effects stay Python's (a `Path`, a `Path`
+/// subclass or a stub steering both backends identically) while the
+/// walk's control flow runs native. An error from any thunk propagates
+/// exactly where the reference's own operation would raise it, leaving
+/// the count behind it unreturned; the count is a fresh `int`; the
+/// inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (dir_exists, list_entries, is_file, unlink))]
+fn cache_clear_walk(
+    dir_exists: &Bound<'_, PyAny>,
+    list_entries: &Bound<'_, PyAny>,
+    is_file: &Bound<'_, PyAny>,
+    unlink: &Bound<'_, PyAny>,
+) -> PyResult<u64> {
+    let mut removed: u64 = 0;
+    if dir_exists.call0()?.is_truthy()? {
+        for entry in list_entries.call0()?.try_iter()? {
+            let entry = entry?;
+            if is_file.call1((&entry,))?.is_truthy()? {
+                unlink.call1((&entry,))?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// The editor resolution behind the CLI's standalone `ytm config`

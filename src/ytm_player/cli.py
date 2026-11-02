@@ -669,17 +669,53 @@ def cache_status(compact_json: bool) -> None:
         click.echo(_cache_status_text(CACHE_DIR, file_count, total_bytes, db_size))
 
 
+def _cache_clear_walk(
+    dir_exists: Any,
+    list_entries: Any,
+    is_file: Any,
+    unlink: Any,
+) -> int:
+    """The directory walk behind the ``cache clear`` command.
+
+    The pure half of the standalone ``ytm cache clear`` delete: when
+    the *dir_exists* thunk (the reference's ``CACHE_DIR.exists()``)
+    reports the directory, every entry the *list_entries* thunk yields
+    (the reference's ``CACHE_DIR.iterdir()``) that the *is_file* thunk
+    accepts is handed to the *unlink* thunk and counted —
+    subdirectories and everything that is not a plain file are left
+    untouched — and the count comes back as the reference's
+    ``removed``. Each thunk is invoked exactly where the reference
+    performs its own operation — the existence probe once up front,
+    the listing only when the directory exists, the file test once per
+    entry in iteration order, the unlink only for the entries that
+    pass it — so the filesystem side effects stay Python's while the
+    walk's control flow runs native. An error from any thunk
+    propagates exactly where the reference's own operation would raise
+    it. The inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cache_clear_walk``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    removed = 0
+    if dir_exists():
+        for entry in list_entries():
+            if is_file(entry):
+                unlink(entry)
+                removed += 1
+    return removed
+
+
 @cache.command("clear")
 @click.confirmation_option(prompt="Are you sure you want to clear the audio cache?")
 def cache_clear() -> None:
     """Clear the audio cache."""
-    removed = 0
-
-    if CACHE_DIR.exists():
-        for f in CACHE_DIR.iterdir():
-            if f.is_file():
-                f.unlink()
-                removed += 1
+    removed = _cache_clear_walk(
+        CACHE_DIR.exists,
+        CACHE_DIR.iterdir,
+        lambda f: f.is_file(),
+        lambda f: f.unlink(),
+    )
 
     if CACHE_DB.exists():
         CACHE_DB.unlink()
@@ -846,6 +882,15 @@ except ImportError:
     pass
 else:
     _cache_status_text = _native_cache_status_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cache_clear_walk as _native_cache_clear_walk,
+    )
+except ImportError:
+    pass
+else:
+    _cache_clear_walk = _native_cache_clear_walk  # type: ignore[assignment]
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
