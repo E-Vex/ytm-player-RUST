@@ -434,6 +434,138 @@ class TestRecentMpvLines:
         assert lines == ["mpv[a]: 1\n", "plain\n"]
 
 
+class TestFaulthandlerTail:
+    """The `Fatal Python error:` tail behind the Most recent
+    faulthandler trace section."""
+
+    def test_last_block_from_marker_to_end(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        crash_dir = tmp_path / "crashes"
+        crash_dir.mkdir()
+        (crash_dir / "faulthandler.log").write_text(
+            "Fatal Python error: Segmentation fault\n\n"
+            "Current thread 0x0 (most recent call first):\n"
+            "  File 'a.py', line 1 in foo\n"
+        )
+
+        assert _recent_faulthandler(crash_dir) == (
+            "Fatal Python error: Segmentation fault\n\n"
+            "Current thread 0x0 (most recent call first):\n"
+            "  File 'a.py', line 1 in foo\n"
+        )
+
+    def test_last_of_several_blocks_wins(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        crash_dir = tmp_path / "crashes"
+        crash_dir.mkdir()
+        (crash_dir / "faulthandler.log").write_text(
+            "Fatal Python error: Segmentation fault\nold block\n"
+            "Fatal Python error: Aborted\nnew block\n"
+        )
+
+        assert _recent_faulthandler(crash_dir) == "Fatal Python error: Aborted\nnew block\n"
+
+    def test_missing_file_marker(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        assert _recent_faulthandler(tmp_path) == "(no faulthandler trace — file does not exist)"
+
+    def test_unreadable_file_marker(self, tmp_path):
+        # A directory passes .exists() but read_text() raises OSError.
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        crash_dir = tmp_path / "crashes"
+        (crash_dir / "faulthandler.log").mkdir(parents=True)
+
+        assert _recent_faulthandler(crash_dir) == "(could not read faulthandler.log)"
+
+    def test_empty_file_marker(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        crash_dir = tmp_path / "crashes"
+        crash_dir.mkdir()
+        (crash_dir / "faulthandler.log").write_text("")
+
+        assert _recent_faulthandler(crash_dir) == (
+            "(faulthandler.log is empty — no fatal signals captured)"
+        )
+
+    def test_long_log_without_marker_is_tailed_through_the_file(self, tmp_path):
+        from ytm_player.utils.doctor import _recent_faulthandler
+
+        crash_dir = tmp_path / "crashes"
+        crash_dir.mkdir()
+        (crash_dir / "faulthandler.log").write_text("z" * 4500)
+
+        assert _recent_faulthandler(crash_dir) == "z" * 4000
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            " ",
+            "\t\n \r\n\x0b\x0c",
+            "\x1c\x1d\x1e\x1f",
+            "\u00a0\u1680\u2028\u2029\u3000",
+        ],
+    )
+    def test_whitespace_only_text_is_the_empty_marker(self, text):
+        # The strip set is CPython's str.isspace — \x1c-\x1f count where
+        # Rust's own is_whitespace would stop at White_Space.
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        assert _faulthandler_tail(text) == (
+            "(faulthandler.log is empty — no fatal signals captured)"
+        )
+
+    def test_no_marker_short_text_is_returned_whole(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        text = "no fatal errors here\njust noise\n"
+        assert _faulthandler_tail(text) == text
+
+    def test_no_marker_text_of_exactly_4000_chars_is_returned_whole(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        text = "y" * 4000
+        assert _faulthandler_tail(text) == text
+
+    def test_no_marker_tail_caps_at_4000_chars(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        assert _faulthandler_tail("x" * 4001) == "x" * 4000
+
+    def test_tail_counts_characters_not_bytes(self):
+        # text[-4000:] slices code points: a 4001-char multi-byte text
+        # loses exactly its first character, not its first bytes.
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        assert _faulthandler_tail("é" * 4001) == "é" * 4000
+
+    def test_marker_wins_over_the_4000_char_tail(self):
+        # A marker earlier than the last 4000 characters still opens the
+        # slice — the two paths never mix.
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        text = "Fatal Python error: old\n" + "x" * 5000
+        assert _faulthandler_tail(text) == text
+
+    def test_marker_only_text(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        assert _faulthandler_tail("Fatal Python error:") == "Fatal Python error:"
+
+    def test_partial_or_lowercase_marker_is_not_a_marker(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        text = "fatal python error: Segmentation fault\n"  # lowercase — not the marker
+        assert _faulthandler_tail(text) == text
+        text = "Fatal Python error no colon\n"
+        assert _faulthandler_tail(text) == text
+
+
 class TestCrashStalenessPep440:
     """The PEP 440 ordering behind the staleness verdict — the same
     comparison packaging's ``Version`` performs, on both backends."""
@@ -969,6 +1101,83 @@ class TestRecentMpvLinesNativeParity:
                 f"native and fallback mpv tails differ for n={n} lines={lines!r}:\n"
                 f"native:   {nv!r}\n"
                 f"fallback: {fb!r}"
+            )
+
+
+# ── faulthandler-tail native vs fallback parity ───────────────────────
+
+# Shared with the child interpreter as JSON, so every value must be
+# JSON-round-trippable. Texts cover the strip-empty zoo (CPython's
+# str.isspace set, including the \x1c-\x1f file separators where Rust's
+# own is_whitespace disagrees), the marker paths (single, repeated — the
+# last block wins —, partial and case-mangled non-markers, the marker
+# with and without surrounding noise), and the 4000-character tail
+# boundary (exactly at it, one past it in ASCII, in two-byte and in
+# combining characters, the marker before it, and the marker after it).
+_FAULTHANDLER_PARITY_CASES = [
+    "",
+    " ",
+    "\t\n \r\n\x0b\x0c",
+    "\x1c\x1d\x1e\x1f",
+    "\u00a0\u1680\u2028\u2029\u3000",
+    "  \n not strip-empty: leading and trailing noise  ",
+    "Fatal Python error:",
+    "Fatal Python error: Segmentation fault\n",
+    "noise before\nFatal Python error: Aborted\nCurrent thread 0x0 (most recent call first):\n",
+    "Fatal Python error: A\nblock one\nFatal Python error: B\nblock two\n",
+    "Fatal Python error: A\n" + "x" * 5000,
+    "x" * 4000 + "Fatal Python error: late\nend",
+    "fatal python error: lowercase is not the marker\n",
+    "Fatal Python error missing its colon\n",
+    "Fatal Python Error: capital E is not the marker either\n",
+    "no marker at all, short text",
+    "x" * 4000,
+    "x" * 4001,
+    "x" * 4500,
+    "ab" * 2001,
+    "é" * 4001,
+    "e\u0301" * 4001,
+    "ünïcödé ✓ " * 500,
+    "line one\r\nFatal Python error: Windows CRLF block\r\nframe\r\n",
+    "Fatal Python error: trailing text without a newline",
+    "\x00\x01\x02not whitespace, no marker",
+]
+
+_FAULTHANDLER_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _faulthandler_tail
+
+payload = json.load(sys.stdin)
+json.dump([_faulthandler_tail(text) for text in payload], sys.stdout)
+"""
+
+
+class TestFaulthandlerTailNativeParity:
+    """The faulthandler-tail engine, on the same child-interpreter
+    pattern the doctor-report parity test above uses."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_faulthandler_tail_matches_fallback(self):
+        from ytm_player.utils.doctor import _faulthandler_tail
+
+        result = subprocess.run(
+            [sys.executable, "-c", _FAULTHANDLER_CHILD_PROG],
+            input=json.dumps(_FAULTHANDLER_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [_faulthandler_tail(text) for text in _FAULTHANDLER_PARITY_CASES]
+        for text, nv, fb in zip(_FAULTHANDLER_PARITY_CASES, native, fallback):
+            assert nv == fb, (
+                f"native and fallback faulthandler tails differ for {text[:60]!r}:\n"
+                f"native:   {nv[:80]!r}\n"
+                f"fallback: {fb[:80]!r}"
             )
 
 

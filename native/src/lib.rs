@@ -315,11 +315,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(doctor_report, module)?)?;
 
     // Doctor probe engines (utils/doctor.py equivalents): the
-    // mpv-warning tail behind the Recent mpv warnings/errors probe, and
-    // the crash-staleness verdict behind the Most recent crash file
-    // section — the metadata-header scan, the PEP 440 comparison of the
-    // recorded version against the installed one, and the note assembly.
+    // mpv-warning tail behind the Recent mpv warnings/errors probe, the
+    // `Fatal Python error:` tail extraction behind the Most recent
+    // faulthandler trace probe, and the crash-staleness verdict behind
+    // the Most recent crash file section — the metadata-header scan, the
+    // PEP 440 comparison of the recorded version against the installed
+    // one, and the note assembly.
     module.add_function(pyo3::wrap_pyfunction!(recent_mpv_lines, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(faulthandler_tail, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(crash_staleness_note, module)?)?;
     Ok(())
 }
@@ -6888,6 +6891,48 @@ fn recent_mpv_lines(lines: Vec<String>, n: i64) -> String {
         return "(no mpv warnings/errors logged)".to_string();
     }
     matches[py_tail_start(matches.len(), n)..].concat()
+}
+
+/// The `Fatal Python error:` tail extraction behind the Most recent
+/// faulthandler trace section of `ytm doctor`. Mirrors the pure core of
+/// `ytm_player.utils.doctor._recent_faulthandler` (the existence check
+/// and the file read stay in Python): a text that strips to nothing —
+/// every character in CPython's `str.isspace` set, the empty string
+/// included, so `\x1c`-`\x1f` count where Rust's own `is_whitespace`
+/// would stop at White_Space — returns the no-signals marker; otherwise
+/// the *last* occurrence of `Fatal Python error:` (`str.rfind`, so the
+/// last fatal block wins when the log holds several) opens the returned
+/// slice, which runs to the end of the text; and a text without the
+/// marker falls back to its last 4000 *characters* — `text[-4000:]`,
+/// which is the whole text at or below 4000 and cuts on a character
+/// boundary above it (Python slices by code point, not byte, so the
+/// 4000-character tail of a multi-byte text can span well over 4000
+/// bytes).
+#[pyfunction]
+fn faulthandler_tail(text: &str) -> String {
+    // not text.strip() — empty after stripping iff every character is
+    // CPython whitespace (an empty text included, all() on nothing).
+    if text.chars().all(py_isspace) {
+        return "(faulthandler.log is empty — no fatal signals captured)".to_string();
+    }
+    match text.rfind("Fatal Python error:") {
+        // text[last_idx:] — from the last marker occurrence to the end.
+        Some(idx) => text[idx..].to_string(),
+        None => {
+            // text[-4000:] — the last 4000 characters, the whole text at
+            // or below 4000 of them.
+            let char_count = text.chars().count();
+            if char_count <= 4000 {
+                return text.to_string();
+            }
+            let start = text
+                .char_indices()
+                .nth(char_count - 4000)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            text[start..].to_string()
+        }
+    }
 }
 
 /// The metadata keys `write_crash_file()` stamps at the top of every crash

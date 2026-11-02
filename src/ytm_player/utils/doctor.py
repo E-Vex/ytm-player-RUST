@@ -219,16 +219,24 @@ def _recent_mpv_lines(log_file: Path, n: int = 20) -> str:
     return _mpv_lines(lines, n)
 
 
-def _recent_faulthandler(crash_dir: Path) -> str:
-    """Return the last 'Fatal Python error' block from crash_dir/faulthandler.log,
-    or a marker if the file is missing/empty."""
-    fh_log = crash_dir / "faulthandler.log"
-    if not fh_log.exists():
-        return "(no faulthandler trace — file does not exist)"
-    try:
-        text = fh_log.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "(could not read faulthandler.log)"
+def _faulthandler_tail(text: str) -> str:
+    """The ``Fatal Python error:`` tail extraction behind
+    ``_recent_faulthandler``.
+
+    The pure half of the Most recent faulthandler trace probe: the
+    empty-after-strip check (a text that is nothing but Python
+    whitespace — the empty string included — is the no-signals
+    marker), the ``rfind`` of the ``Fatal Python error:`` marker, the
+    marker-to-end slice of the *last* fatal block when it is found,
+    and the last-4000-characters tail (``text[-4000:]`` — the whole
+    text when shorter, character- not byte-wise so a multi-byte tail
+    cuts on a code-point boundary) when it is not. The input is
+    never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.faulthandler_tail``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     if not text.strip():
         return "(faulthandler.log is empty — no fatal signals captured)"
     marker = "Fatal Python error:"
@@ -236,6 +244,26 @@ def _recent_faulthandler(crash_dir: Path) -> str:
     if last_idx == -1:
         return text[-4000:]
     return text[last_idx:]
+
+
+def _recent_faulthandler(crash_dir: Path) -> str:
+    """Return the last 'Fatal Python error' block from crash_dir/faulthandler.log,
+    or a marker if the file is missing/empty.
+
+    The tail extraction — the empty-text check, the ``rfind`` of the
+    marker and the two slices — is resolved by the
+    ``_faulthandler_tail`` engine above (native when the Rust
+    extension is built, the pure-Python transcription otherwise);
+    this helper performs the reads.
+    """
+    fh_log = crash_dir / "faulthandler.log"
+    if not fh_log.exists():
+        return "(no faulthandler trace — file does not exist)"
+    try:
+        text = fh_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(could not read faulthandler.log)"
+    return _faulthandler_tail(text)
 
 
 # The metadata keys write_crash_file() stamps at the top of every crash file
@@ -495,6 +523,15 @@ except ImportError:
     pass
 else:
     _mpv_lines = _native_recent_mpv_lines  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        faulthandler_tail as _native_faulthandler_tail,
+    )
+except ImportError:
+    pass
+else:
+    _faulthandler_tail = _native_faulthandler_tail  # type: ignore[assignment]
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
