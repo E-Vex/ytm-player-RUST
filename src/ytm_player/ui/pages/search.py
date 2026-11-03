@@ -1,10 +1,13 @@
 """Search page — query YouTube Music and display categorized results.
 
-The search-result label engine — ``_format_search_result``, the item-to-
-label composer behind the Albums/Artists/Playlists panels of the results
-area — is implemented by the Rust extension (``_ytm_player_native``) when
-it is built and by the pure-Python transcription in this module otherwise;
-the bottom-of-module seam rebinds the engine to the native function when
+The search-page label glue — ``_format_search_result``, the item-to-label
+composer behind the Albums/Artists/Playlists panels of the results area,
+plus the panel count label, the mode indicator label, the
+suggestion-overlay pick decision, the recent-searches label pass and
+the ``_search_all`` categorization — is implemented by the Rust
+extension (``_ytm_player_native``) when it is built and by the
+pure-Python transcriptions in this module otherwise; the
+bottom-of-module seam rebinds the engines to the native functions when
 the extension is importable. The widgets below only do I/O and rendering.
 """
 
@@ -87,6 +90,111 @@ def _format_search_result(item: dict[str, Any]) -> str:
     return truncate(title, 60)
 
 
+def _panel_count_label(count: int) -> str:
+    """The bottom-of-panel count label behind ``load_items``.
+
+    An empty panel reads ``"No results"``; otherwise the label is
+    ``"<count> result"`` for exactly one and ``"<count> results"`` from
+    two on (the ``!= 1`` plural rule).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_panel_count_label``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if count == 0:
+        return "No results"
+    return f"{count} result{'s' if count != 1 else ''}"
+
+
+def _mode_label(mode: str, color: str) -> str:
+    """The search-mode indicator label — the ``▶ Music`` / ``▶ All``
+    display beside the input, wrapped in the theme colour markup.
+
+    *mode* is the page's ``search_mode`` (``"music"`` or anything else
+    meaning the all-results mode); *color* is the theme primary the
+    ``▶`` glyph interpolates. One composer for the three former inline
+    copies (``compose``, ``on_mount`` and ``_toggle_search_mode``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_mode_label``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if mode == "music":
+        return f"[{color}]▶[/{color}] Music"
+    return f"[{color}]▶[/{color}] All"
+
+
+def _suggestion_pick(suggestions: list[str], index: int | None) -> str | None:
+    """The suggestion-overlay pick decision behind the suggestion-list's
+    ``ListView.Selected`` handling.
+
+    A ``None`` index (no row highlighted) or an index outside the
+    overlay's suggestion list — a stale selection arriving after the
+    list was repopulated — answers ``None`` so the handler ignores the
+    event; a valid index answers that suggestion, the raw stored row.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_suggestion_pick``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if index is None or not 0 <= index < len(suggestions):
+        return None
+    return suggestions[index]
+
+
+def _recent_search_labels(entries: list[dict[str, Any]]) -> list[Any]:
+    """The recent-searches label pass behind ``_load_recent_searches``.
+
+    Each history row becomes its suggestion label — the row's
+    ``query`` value, raw — and an empty history reads as an empty
+    list so the caller skips the overlay update.
+
+    Where the reference's list comprehension raises — a row without a
+    ``query`` key (unreachable through the history service's
+    SQL-materialised rows, which always carry the column) — the
+    (native) engine stays total and skips the row instead.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.recent_search_labels``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return [entry["query"] for entry in entries]
+
+
+def categorize_search_results(raw: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """The ``_search_all`` categorization — the bucketing of one
+    unfiltered search into the results area's four panels.
+
+    Each item's ``resultType`` (defaulting to ``""``) picks its bucket:
+    ``song`` and ``video`` go to ``songs``, ``album`` to ``albums``,
+    ``artist`` to ``artists`` and ``playlist`` to ``playlists``;
+    everything else (the empty default included) is dropped. The four
+    buckets are always present — the empty ones as empty lists — and
+    hold the item objects themselves in arrival order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.categorize_search_results``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    results: dict[str, list[dict[str, Any]]] = {
+        "songs": [],
+        "albums": [],
+        "artists": [],
+        "playlists": [],
+    }
+    for item in raw:
+        result_type = item.get("resultType", "")
+        if result_type == "song" or result_type == "video":
+            results["songs"].append(item)
+        elif result_type == "album":
+            results["albums"].append(item)
+        elif result_type == "artist":
+            results["artists"].append(item)
+        elif result_type == "playlist":
+            results["playlists"].append(item)
+    return results
+
+
 class SearchResultPanel(Widget):
     """A single panel within the search results area.
 
@@ -167,17 +275,16 @@ class SearchResultPanel(Widget):
         list_view = self.query_one(ListView)
         list_view.clear()
 
+        count_label = self.query_one(".panel-count", Static)
         if not items:
-            count_label = self.query_one(".panel-count", Static)
-            count_label.update("No results")
+            count_label.update(_panel_count_label(0))
             return
 
         for item in self._items:
             label = self._format_item(item)
             list_view.append(ListItem(Label(label)))
 
-        count_label = self.query_one(".panel-count", Static)
-        count_label.update(f"{len(self._items)} result{'s' if len(self._items) != 1 else ''}")
+        count_label.update(_panel_count_label(len(self._items)))
 
     def _format_item(self, item: dict[str, Any]) -> str:
         """Build a human-readable label for a result item (shared engine)."""
@@ -445,7 +552,7 @@ class SearchPage(Widget):
                     placeholder="Search YouTube Music...",
                     id="search-input",
                 )
-                yield Static(f"[{mode_color}]▶[/{mode_color}] Music", id="search-mode")
+                yield Static(_mode_label("music", mode_color), id="search-mode")
             yield SuggestionList(id="suggestion-overlay")
             yield Static("", id="loading-msg", classes="loading-indicator")
             with Horizontal(id="search-results"):
@@ -470,12 +577,7 @@ class SearchPage(Widget):
         # Update mode label to match.
         mode_label = self.query_one("#search-mode", Static)
         mode_color = get_theme().primary
-        display = (
-            f"[{mode_color}]▶[/{mode_color}] Music"
-            if self.search_mode == "music"
-            else f"[{mode_color}]▶[/{mode_color}] All"
-        )
-        mode_label.update(display)
+        mode_label.update(_mode_label(self.search_mode, mode_color))
 
         # Restore previous search results if navigating back.
         has_restored = bool(self._restore_results and any(self._restore_results.values()))
@@ -689,8 +791,8 @@ class SearchPage(Widget):
             history = cast("YTMHostBase", self.app).history
             assert history is not None
             entries = await history.get_search_history(limit=10)
-            if entries:
-                suggestions = [entry["query"] for entry in entries]
+            suggestions = _recent_search_labels(entries)
+            if suggestions:
                 overlay = self.query_one("#suggestion-overlay", SuggestionList)
                 overlay.show_suggestions(suggestions)
         except Exception:
@@ -705,9 +807,12 @@ class SearchPage(Widget):
         list_view = event.list_view
         if list_view.id == "suggestion-list":
             overlay = self.query_one("#suggestion-overlay", SuggestionList)
-            idx = list_view.index
-            if idx is not None and 0 <= idx < len(overlay.suggestions):
-                query = overlay.suggestions[idx]
+            # The pick decision — index bounds against the overlay's
+            # suggestions — runs through the (native-backed) engine; a
+            # stale selection (the list repopulated under the cursor)
+            # reads as None and is ignored.
+            query = _suggestion_pick(overlay.suggestions, list_view.index)
+            if query is not None:
                 # Cancel pending debounce and suppress the on_input_changed
                 # that fires from setting the input value programmatically.
                 if self._debounce_timer is not None:
@@ -814,30 +919,16 @@ class SearchPage(Widget):
         return results
 
     async def _search_all(self, query: str) -> dict[str, list[dict[str, Any]]]:
-        """Execute a single unfiltered search and categorize results."""
-        results: dict[str, list[dict[str, Any]]] = {
-            "songs": [],
-            "albums": [],
-            "artists": [],
-            "playlists": [],
-        }
+        """Execute a single unfiltered search and categorize results.
 
+        The categorization — bucketing each raw result into the four
+        panels by ``resultType`` — runs through the (native-backed)
+        engine; the unfiltered API call stays here because it is I/O.
+        """
         ytmusic = cast("YTMHostBase", self.app).ytmusic
         assert ytmusic is not None
         raw = await ytmusic.search(query, filter=None, limit=40)
-
-        for item in raw:
-            result_type = item.get("resultType", "")
-            if result_type == "song" or result_type == "video":
-                results["songs"].append(item)
-            elif result_type == "album":
-                results["albums"].append(item)
-            elif result_type == "artist":
-                results["artists"].append(item)
-            elif result_type == "playlist":
-                results["playlists"].append(item)
-
-        return results
+        return categorize_search_results(raw)
 
     # ------------------------------------------------------------------
     # Populate UI
@@ -915,12 +1006,7 @@ class SearchPage(Widget):
         # Update the mode indicator.
         mode_label = self.query_one("#search-mode", Static)
         mode_color = get_theme().primary
-        display = (
-            f"[{mode_color}]▶[/{mode_color}] Music"
-            if self.search_mode == "music"
-            else f"[{mode_color}]▶[/{mode_color}] All"
-        )
-        mode_label.update(display)
+        mode_label.update(_mode_label(self.search_mode, mode_color))
 
         # Re-run the last search with the new mode if we have a query.
         if self._last_query:
@@ -1079,16 +1165,31 @@ class SearchPage(Widget):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same label engine; this binding
-# replaces the pure-Python transcription above when the extension is
-# importable.  The rebinding must happen AFTER the definition above —
+# The Rust extension implements the same label glue; these bindings
+# replace the pure-Python transcriptions above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
 # assigning the native function any earlier would be clobbered by the
 # ``def`` statement (the lesson that produced formatting.py's dead native
 # bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        categorize_search_results as _native_categorize_search_results,
+    )
+    from ytm_player.utils._ytm_player_native import (
         format_search_result as _native_format_search_result,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        recent_search_labels as _native_recent_search_labels,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_mode_label as _native_search_mode_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_panel_count_label as _native_search_panel_count_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_suggestion_pick as _native_search_suggestion_pick,
     )
 except ImportError:
     pass
@@ -1097,3 +1198,9 @@ else:
     def _format_search_result(item: dict[str, Any]) -> str:  # noqa: F811
         """Search-result label formatting (native Rust engine)."""
         return _native_format_search_result(item)
+
+    _panel_count_label = _native_search_panel_count_label  # type: ignore[assignment]
+    _mode_label = _native_search_mode_label  # type: ignore[assignment]
+    _suggestion_pick = _native_search_suggestion_pick  # type: ignore[assignment]
+    _recent_search_labels = _native_recent_search_labels  # type: ignore[assignment]
+    categorize_search_results = _native_categorize_search_results  # type: ignore[assignment]

@@ -206,10 +206,19 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(is_playlist_row, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(playlist_rows, module)?)?;
 
-    // Search-result label formatting (ui/pages/search.py equivalent):
-    // the item-to-label composer behind the Albums/Artists/Playlists
-    // panels of the search results area.
+    // Search-page label glue (ui/pages/search.py equivalent): the
+    // item-to-label composer behind the Albums/Artists/Playlists panels
+    // of the search results area, the bottom-of-panel count label, the
+    // mode indicator beside the input, the suggestion-overlay pick
+    // decision, the recent-searches label pass, and the _search_all
+    // categorization bucketing one unfiltered search into the four
+    // panels.
     module.add_function(pyo3::wrap_pyfunction!(format_search_result, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_panel_count_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_mode_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_suggestion_pick, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(recent_search_labels, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(categorize_search_results, module)?)?;
 
     // Sidebar pane-routing state machine (app/_sidebar.py equivalent):
     // the three-pane focus router — per-page playlist-sidebar visibility
@@ -4824,6 +4833,139 @@ fn format_search_result(py: Python, item: &Bound<'_, PyAny>) -> PyResult<String>
 
     // Fallback: the bare title, truncated.
     Ok(truncate_str(&py_str(&title)?, 60))
+}
+
+/// The bottom-of-panel count label behind `SearchResultPanel.load_items`
+/// from `ui/pages/search.py`: `"No results"` for an empty panel,
+/// `"<count> result"` for exactly one and `"<count> results"` from two
+/// on (the `!= 1` plural rule).
+#[pyfunction]
+fn search_panel_count_label(count: i64) -> String {
+    if count == 0 {
+        return "No results".to_string();
+    }
+    let plural = if count != 1 { "s" } else { "" };
+    format!("{count} result{plural}")
+}
+
+/// The search-mode indicator label — the `\u{25b6} Music` / `\u{25b6} All`
+/// display beside the search input, wrapped in the theme colour markup.
+///
+/// Mirrors the inline f-string shared by `SearchPage.compose`,
+/// `SearchPage.on_mount` and `SearchPage._toggle_search_mode` from
+/// `ui/pages/search.py`: `"music"` renders the music-only label,
+/// anything else the all-results one.
+#[pyfunction]
+fn search_mode_label(mode: &str, color: &str) -> String {
+    if mode == "music" {
+        format!("[{color}]\u{25b6}[/{color}] Music")
+    } else {
+        format!("[{color}]\u{25b6}[/{color}] All")
+    }
+}
+
+/// The suggestion-overlay pick decision behind the suggestion-list's
+/// `ListView.Selected` handling from `ui/pages/search.py`: a `None`
+/// index (no row highlighted) or an index outside the suggestion list
+/// — a stale selection arriving after the overlay was repopulated —
+/// answers `None`; a valid index answers that suggestion, the raw
+/// stored row object.
+#[pyfunction]
+#[pyo3(signature = (suggestions, index))]
+fn search_suggestion_pick<'py>(
+    suggestions: &Bound<'py, PyList>,
+    index: Option<i64>,
+) -> Option<Bound<'py, PyAny>> {
+    // idx is not None and 0 <= idx < len(suggestions)
+    let index = index?;
+    if index < 0 || index >= suggestions.len() as i64 {
+        return None;
+    }
+    Some(
+        suggestions
+            .get_item(index as usize)
+            .expect("index bounds-checked above"),
+    )
+}
+
+/// The recent-searches label pass behind `SearchPage._load_recent_searches`
+/// from `ui/pages/search.py`: each history row becomes its suggestion
+/// label — the row's `query` value, raw — and an empty history reads as
+/// an empty list so the caller skips the overlay update.
+///
+/// `entry["query"]` resolves through the full subscription protocol,
+/// so a dict subclass's `__getitem__` steers exactly like the
+/// reference. Where the reference would raise `KeyError` — a row
+/// without a `query` key (unreachable through the history service's
+/// SQL-materialised rows, which always carry the column) — the engine
+/// stays total and skips the row instead.
+#[pyfunction]
+fn recent_search_labels<'py>(
+    py: Python<'py>,
+    entries: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let labels = PyList::empty(py);
+    for entry in entries.iter() {
+        match entry.get_item("query") {
+            Ok(query) => labels.append(query)?,
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyKeyError>(py) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(labels)
+}
+
+/// The `_search_all` categorization — the bucketing of one unfiltered
+/// search into the results area's four panels, from
+/// `SearchPage._search_all` in `ui/pages/search.py`.
+///
+/// Each item's `resultType` (defaulting to `""`, the nested default
+/// evaluated before the outer lookup exactly like the reference)
+/// picks its bucket through Python `==` semantics (see `eq_any_str`):
+/// `song` and `video` go to `songs`, `album` to `albums`, `artist` to
+/// `artists` and `playlist` to `playlists`; everything else (the
+/// empty default included) is dropped. The returned dict always
+/// carries the four buckets — the empty ones as empty lists — in the
+/// reference's insertion order, and each bucket holds the item
+/// objects themselves in arrival order. The input list is never
+/// mutated.
+///
+/// Field reads resolve exactly like the reference's `.get` calls, so
+/// dict subclasses steer the bucketing like they steer the reference.
+/// Where the reference would raise — a `.get`-less item
+/// (`AttributeError`) — the engine stays total: the item reads as
+/// type-less and is dropped, the same stance the label engine takes.
+#[pyfunction]
+fn categorize_search_results<'py>(
+    py: Python<'py>,
+    raw: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let songs = PyList::empty(py);
+    let albums = PyList::empty(py);
+    let artists = PyList::empty(py);
+    let playlists = PyList::empty(py);
+    let empty = PyString::new(py, "").into_any();
+
+    for item in raw.iter() {
+        // result_type = item.get("resultType", "")
+        let result_type = field_get(py, &item, "resultType", Some(empty.clone()))?;
+        if eq_any_str(&result_type, &["song", "video"])? {
+            songs.append(&item)?;
+        } else if eq_any_str(&result_type, &["album"])? {
+            albums.append(&item)?;
+        } else if eq_any_str(&result_type, &["artist"])? {
+            artists.append(&item)?;
+        } else if eq_any_str(&result_type, &["playlist"])? {
+            playlists.append(&item)?;
+        }
+    }
+
+    let results = PyDict::new(py);
+    results.set_item("songs", songs)?;
+    results.set_item("albums", albums)?;
+    results.set_item("artists", artists)?;
+    results.set_item("playlists", playlists)?;
+    Ok(results)
 }
 
 // ---------------------------------------------------------------------------
