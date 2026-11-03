@@ -22,6 +22,16 @@ from textual.theme import Theme
 
 from ytm_player.config.paths import THEME_FILE
 
+# Try to load the native Rust implementation via PyO3.  If the compiled
+# extension is unavailable (e.g. during development without a Rust toolchain),
+# fall back to the pure-Python implementations defined below.
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        theme_fields_from_css as _native_theme_fields_from_css,
+    )
+except ImportError:
+    _native_theme_fields_from_css = None
+
 # Default lyric-current color used when a theme defines no accent/primary.
 # Single source of truth: the dataclass default, the from_css_variables
 # fallback, and the two _app.py fallbacks (get_css_variables, watch_theme)
@@ -131,48 +141,14 @@ class ThemeColors:
 
         Maps Textual's variable names to our field names and applies any
         app-specific overrides from ``theme.toml``.
+
+        The 21-field resolution is resolved by the
+        ``_theme_fields_from_css`` engine below (native when the Rust
+        extension is built, the pure-Python transcription otherwise);
+        this classmethod constructs the dataclass from the fields and
+        applies the theme.toml overrides.
         """
-        tc = cls(
-            background=variables.get("background", cls.background),
-            foreground=variables.get("foreground", cls.foreground),
-            primary=variables.get("primary", cls.primary),
-            secondary=variables.get("secondary", cls.secondary),
-            accent=variables.get("accent", cls.accent),
-            success=variables.get("success", cls.success),
-            warning=variables.get("warning", cls.warning),
-            error=variables.get("error", cls.error),
-            surface=variables.get("surface", cls.surface),
-            border=variables.get("border", cls.border),
-            muted_text=variables.get("text-muted", cls.muted_text),
-            text=variables.get("text", cls.text),
-            # App-specific: use theme value if present, else derive from base.
-            playback_bar_bg=variables.get(
-                "playback-bar-bg", variables.get("surface", cls.playback_bar_bg)
-            ),
-            active_tab=variables.get("active-tab", variables.get("text", cls.active_tab)),
-            inactive_tab=variables.get(
-                "inactive-tab", variables.get("text-muted", cls.inactive_tab)
-            ),
-            selected_item=variables.get(
-                "selected-item", variables.get("surface", cls.selected_item)
-            ),
-            progress_filled=variables.get(
-                "progress-filled", variables.get("primary", cls.progress_filled)
-            ),
-            progress_empty=variables.get(
-                "progress-empty", variables.get("surface", cls.progress_empty)
-            ),
-            lyrics_played=variables.get(
-                "lyrics-played", variables.get("text-muted", cls.lyrics_played)
-            ),
-            lyrics_current=variables.get(
-                "lyrics-current",
-                variables.get("accent", variables.get("primary", cls.lyrics_current)),
-            ),
-            lyrics_upcoming=variables.get(
-                "lyrics-upcoming", variables.get("text", cls.lyrics_upcoming)
-            ),
-        )
+        tc = cls(**_theme_fields_from_css(variables))
 
         # Apply user overrides from theme.toml (app-specific vars only).
         tc._apply_toml_overrides()
@@ -243,3 +219,70 @@ def reset_theme() -> None:
     """Invalidate the cached ThemeColors so it's rebuilt on next access."""
     global _theme
     _theme = None
+
+
+def _theme_fields_from_css(variables: dict[str, str]) -> dict[str, str]:
+    """The 21 ThemeColors field values resolved from CSS variables.
+
+    The pure core of ``ThemeColors.from_css_variables``: each of the
+    twelve base fields is its CSS variable (``muted_text`` reads
+    ``text-muted``) or the dataclass default; the nine app-specific
+    fields fall back one level deeper — the derived-from variable first,
+    that field's own dataclass default last; and ``lyrics_current`` runs
+    the documented three-level chain
+    ``lyrics-current → accent → primary → DEFAULT_LYRIC_CURRENT``. A
+    present value passes through as the object it is — the ANSI-token
+    normalisation is ``__post_init__``'s, applied after construction on
+    whichever backend built the fields.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.theme_fields_from_css``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return {
+        "background": variables.get("background", "#0f0f0f"),
+        "foreground": variables.get("foreground", "#ffffff"),
+        "primary": variables.get("primary", "#ff0000"),
+        "secondary": variables.get("secondary", "#aaaaaa"),
+        "accent": variables.get("accent", "#ff4e45"),
+        "success": variables.get("success", "#2ecc71"),
+        "warning": variables.get("warning", "#f39c12"),
+        "error": variables.get("error", "#e74c3c"),
+        "surface": variables.get("surface", "#1a1a1a"),
+        "border": variables.get("border", "#333333"),
+        "muted_text": variables.get("text-muted", "#999999"),
+        "text": variables.get("text", "#ffffff"),
+        # App-specific: use theme value if present, else derive from base.
+        "playback_bar_bg": variables.get("playback-bar-bg", variables.get("surface", "#1a1a1a")),
+        "active_tab": variables.get("active-tab", variables.get("text", "#ffffff")),
+        "inactive_tab": variables.get("inactive-tab", variables.get("text-muted", "#999999")),
+        "selected_item": variables.get("selected-item", variables.get("surface", "#2a2a2a")),
+        "progress_filled": variables.get("progress-filled", variables.get("primary", "#ff0000")),
+        "progress_empty": variables.get("progress-empty", variables.get("surface", "#555555")),
+        "lyrics_played": variables.get("lyrics-played", variables.get("text-muted", "#999999")),
+        "lyrics_current": variables.get(
+            "lyrics-current",
+            variables.get("accent", variables.get("primary", DEFAULT_LYRIC_CURRENT)),
+        ),
+        "lyrics_upcoming": variables.get("lyrics-upcoming", variables.get("text", "#aaaaaa")),
+    }
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python transcriptions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements (the
+# lesson that produced formatting.py's dead native bindings).
+
+if _native_theme_fields_from_css is not None:
+    _theme_fields_from_css = _native_theme_fields_from_css  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        rich_safe_color as _native_rich_safe_color,
+    )
+except ImportError:
+    pass
+else:
+    rich_safe_color = _native_rich_safe_color  # type: ignore[assignment]

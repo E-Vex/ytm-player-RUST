@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -104,6 +104,132 @@ def _get_ytm_commands_provider():
     from ytm_player.app._commands import YTMCommandProvider
 
     return YTMCommandProvider
+
+
+def _app_css_variables(variables: dict[str, str], colors: dict | None) -> dict[str, str]:
+    """The app's CSS-variables overlay on Textual's theme variables.
+
+    The pure core of ``YTMPlayerApp.get_css_variables``: the nine
+    app-specific variables default to values derived from the base
+    palette — all evaluated from the pre-patch state, exactly as the
+    reference's dict literal evaluates them before any insertion, each
+    carrying its own innermost constant — and each is inserted only when
+    the theme hasn't set it; then the theme.toml overrides layer on top —
+    every ThemeColors field name mapped to its CSS dash-case variable,
+    in the reference's literal order, user values winning over
+    everything. Mutates and returns *variables* — the reference's
+    in-place patch of the dict Textual handed over — so existing keys
+    keep their position and new ones append in app-default order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.app_css_variables``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    app_defaults = {
+        "playback-bar-bg": variables.get("surface", "#1a1a1a"),
+        "active-tab": variables.get("text", "#ffffff"),
+        "inactive-tab": variables.get("text-muted", "#999999"),
+        "selected-item": variables.get("surface", "#2a2a2a"),
+        "progress-filled": variables.get("primary", "#ff0000"),
+        "progress-empty": variables.get("surface", "#555555"),
+        "lyrics-played": variables.get("text-muted", "#999999"),
+        "lyrics-current": variables.get("accent", variables.get("primary", DEFAULT_LYRIC_CURRENT)),
+        "lyrics-upcoming": variables.get("text", "#aaaaaa"),
+    }
+    for key, default in app_defaults.items():
+        if key not in variables:
+            variables[key] = default
+
+    if colors:
+        # Map underscore field names to CSS dash-case variable names.
+        field_to_css = {
+            "background": "background",
+            "foreground": "foreground",
+            "primary": "primary",
+            "secondary": "secondary",
+            "accent": "accent",
+            "success": "success",
+            "warning": "warning",
+            "error": "error",
+            "surface": "surface",
+            "border": "border",
+            "text": "text",
+            "muted_text": "text-muted",
+            "playback_bar_bg": "playback-bar-bg",
+            "active_tab": "active-tab",
+            "inactive_tab": "inactive-tab",
+            "selected_item": "selected-item",
+            "progress_filled": "progress-filled",
+            "progress_empty": "progress-empty",
+            "lyrics_played": "lyrics-played",
+            "lyrics_current": "lyrics-current",
+            "lyrics_upcoming": "lyrics-upcoming",
+        }
+        for field_name, css_name in field_to_css.items():
+            if field_name in colors:
+                variables[css_name] = colors[field_name]
+
+    return variables
+
+
+def _theme_fields_from_theme(
+    primary: object,
+    background: object,
+    foreground: object,
+    secondary: object,
+    accent: object,
+    success: object,
+    warning: object,
+    error: object,
+    surface: object,
+    variables: dict,
+) -> dict[str, object]:
+    """The 21 ThemeColors field values from a Textual Theme's raw colours.
+
+    The pure core of ``YTMPlayerApp.watch_theme``'s ThemeColors rebuild:
+    the nine raw Theme attributes arrive as plain values (the attribute
+    reads stay in the caller, in the reference's first-read order), and
+    every field applies the reference's own ``or`` chain — a falsy raw
+    value (None or empty) falls back to its per-site constant, which
+    differs between sites sharing a source (``foreground`` yields
+    ``#ffffff`` for itself but ``#aaaaaa`` for ``lyrics_upcoming``;
+    ``surface`` yields ``#1a1a1a``, ``#333333`` and ``#555555`` at its
+    three sites); ``progress_filled`` keeps the raw ``primary`` as its
+    default even when falsy; and ``lyrics_current``'s default side runs
+    the raw accent → primary → DEFAULT_LYRIC_CURRENT chain. The
+    ``variables`` dict is the Theme's own; a present app-specific key
+    wins over every fallback. The values pass through unnormalised —
+    ``ThemeColors.__post_init__`` runs after construction.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.theme_fields_from_theme``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return {
+        "primary": primary,
+        "background": background or "#0f0f0f",
+        "foreground": foreground or "#ffffff",
+        "secondary": secondary or "#aaaaaa",
+        "accent": accent or "#ff4e45",
+        "success": success or "#2ecc71",
+        "warning": warning or "#f39c12",
+        "error": error or "#e74c3c",
+        "surface": surface or "#1a1a1a",
+        "text": foreground or "#ffffff",
+        "muted_text": secondary or "#999999",
+        "border": surface or "#333333",
+        "playback_bar_bg": variables.get("playback-bar-bg", surface or "#1a1a1a"),
+        "active_tab": variables.get("active-tab", foreground or "#ffffff"),
+        "inactive_tab": variables.get("inactive-tab", secondary or "#999999"),
+        "selected_item": variables.get("selected-item", surface or "#2a2a2a"),
+        "progress_filled": variables.get("progress-filled", primary),
+        "progress_empty": variables.get("progress-empty", surface or "#555555"),
+        "lyrics_played": variables.get("lyrics-played", secondary or "#999999"),
+        "lyrics_current": variables.get(
+            "lyrics-current", accent or primary or DEFAULT_LYRIC_CURRENT
+        ),
+        "lyrics_upcoming": variables.get("lyrics-upcoming", foreground or "#aaaaaa"),
+    }
 
 
 # ── Main Application ────────────────────────────────────────────────
@@ -345,59 +471,16 @@ class YTMPlayerApp(
         Base colors (primary, background, surface, etc.) come from the
         active Textual theme.  App-specific variables are derived from
         the theme's palette when not explicitly provided by the theme.
+
+        The overlay — the nine derived defaults and the theme.toml
+        overrides — is resolved by the ``_app_css_variables`` engine
+        above (native when the Rust extension is built, the pure-Python
+        transcription otherwise); this method supplies Textual's own
+        variables and the cached theme.toml colours.
         """
         variables = super().get_css_variables()
-
-        # App-specific variables — derive from theme palette if not set.
-        app_defaults = {
-            "playback-bar-bg": variables.get("surface", "#1a1a1a"),
-            "active-tab": variables.get("text", "#ffffff"),
-            "inactive-tab": variables.get("text-muted", "#999999"),
-            "selected-item": variables.get("surface", "#2a2a2a"),
-            "progress-filled": variables.get("primary", "#ff0000"),
-            "progress-empty": variables.get("surface", "#555555"),
-            "lyrics-played": variables.get("text-muted", "#999999"),
-            "lyrics-current": variables.get(
-                "accent", variables.get("primary", DEFAULT_LYRIC_CURRENT)
-            ),
-            "lyrics-upcoming": variables.get("text", "#aaaaaa"),
-        }
-        for key, default in app_defaults.items():
-            if key not in variables:
-                variables[key] = default
-
-        # Apply theme.toml overrides on top (user customizations win over everything).
         colors = _read_theme_toml_cached()
-        if colors:
-            # Map underscore field names to CSS dash-case variable names.
-            field_to_css = {
-                "background": "background",
-                "foreground": "foreground",
-                "primary": "primary",
-                "secondary": "secondary",
-                "accent": "accent",
-                "success": "success",
-                "warning": "warning",
-                "error": "error",
-                "surface": "surface",
-                "border": "border",
-                "text": "text",
-                "muted_text": "text-muted",
-                "playback_bar_bg": "playback-bar-bg",
-                "active_tab": "active-tab",
-                "inactive_tab": "inactive-tab",
-                "selected_item": "selected-item",
-                "progress_filled": "progress-filled",
-                "progress_empty": "progress-empty",
-                "lyrics_played": "lyrics-played",
-                "lyrics_current": "lyrics-current",
-                "lyrics_upcoming": "lyrics-upcoming",
-            }
-            for field_name, css_name in field_to_css.items():
-                if field_name in colors:
-                    variables[css_name] = colors[field_name]
-
-        return variables
+        return _app_css_variables(variables, colors)
 
     def watch_theme(self, theme_name: str) -> None:
         """Rebuild ThemeColors when the Textual theme changes."""
@@ -406,30 +489,32 @@ class YTMPlayerApp(
         try:
             t = self.current_theme
             v = t.variables
+            # The 21-field resolution — the per-site `or` chains and the
+            # app-specific fallbacks — is resolved by the
+            # ``_theme_fields_from_theme`` engine above (native when the
+            # Rust extension is built, the pure-Python transcription
+            # otherwise); this handler supplies the Theme's raw colour
+            # attributes, read here in the reference's first-read order.
+            # The cast mirrors the reference's own typing view: the fields
+            # it passed straight through were str-typed there, and the
+            # engine's declared ``object`` parameters only exist to admit
+            # the falsy raw values (None/empty) the or-chains consume.
             tc = ThemeColors(
-                primary=t.primary,
-                background=t.background or "#0f0f0f",
-                foreground=t.foreground or "#ffffff",
-                secondary=t.secondary or "#aaaaaa",
-                accent=t.accent or "#ff4e45",
-                success=t.success or "#2ecc71",
-                warning=t.warning or "#f39c12",
-                error=t.error or "#e74c3c",
-                surface=t.surface or "#1a1a1a",
-                text=t.foreground or "#ffffff",
-                muted_text=t.secondary or "#999999",
-                border=t.surface or "#333333",
-                playback_bar_bg=v.get("playback-bar-bg", t.surface or "#1a1a1a"),
-                active_tab=v.get("active-tab", t.foreground or "#ffffff"),
-                inactive_tab=v.get("inactive-tab", t.secondary or "#999999"),
-                selected_item=v.get("selected-item", t.surface or "#2a2a2a"),
-                progress_filled=v.get("progress-filled", t.primary),
-                progress_empty=v.get("progress-empty", t.surface or "#555555"),
-                lyrics_played=v.get("lyrics-played", t.secondary or "#999999"),
-                lyrics_current=v.get(
-                    "lyrics-current", t.accent or t.primary or DEFAULT_LYRIC_CURRENT
-                ),
-                lyrics_upcoming=v.get("lyrics-upcoming", t.foreground or "#aaaaaa"),
+                **cast(
+                    "dict[str, str]",
+                    _theme_fields_from_theme(
+                        t.primary,
+                        t.background,
+                        t.foreground,
+                        t.secondary,
+                        t.accent,
+                        t.success,
+                        t.warning,
+                        t.error,
+                        t.surface,
+                        v,
+                    ),
+                )
             )
             tc._apply_toml_overrides()
             set_theme(tc)
@@ -969,3 +1054,29 @@ class YTMPlayerApp(
                 )
 
         self.run_worker(_run(), group="update-check", exclusive=True)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python transcriptions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements (the
+# lesson that produced formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        app_css_variables as _native_app_css_variables,
+    )
+except ImportError:
+    pass
+else:
+    _app_css_variables = _native_app_css_variables  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        theme_fields_from_theme as _native_theme_fields_from_theme,
+    )
+except ImportError:
+    pass
+else:
+    _theme_fields_from_theme = _native_theme_fields_from_theme  # type: ignore[assignment]
