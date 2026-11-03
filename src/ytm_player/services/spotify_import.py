@@ -94,13 +94,23 @@ def has_spotify_creds() -> bool:
 
 
 def _extract_playlist_id(url: str) -> str:
-    """Pull the playlist/album ID from a Spotify URL."""
+    """Pull the playlist/album ID from a Spotify URL.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.extract_playlist_id``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
     m = re.search(r"(playlist|album)/([a-zA-Z0-9]+)", url)
     return m.group(2) if m else ""
 
 
 def _parse_spotipy_item(item: dict) -> dict:
-    """Normalise a spotipy track item to our internal format."""
+    """Normalise a spotipy track item to our internal format.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.parse_spotipy_item``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
     track = item.get("track", item)
     if not track or not track.get("name"):
         return {}
@@ -504,3 +514,25 @@ def run_import(spotify_url: str, auth_file: Path) -> None:
         f"[green]✓[/green] Playlist created with {len(video_ids)} tracks"
         + (f" ({skipped} skipped)" if skipped else "")
     )
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same matching cores; these bindings
+# override the pure-Python definitions above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        extract_playlist_id as _native_extract_playlist_id,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        parse_spotipy_item as _native_parse_spotipy_item,
+    )
+except ImportError:
+    pass
+else:
+    _extract_playlist_id = _native_extract_playlist_id  # type: ignore[assignment]
+    _parse_spotipy_item = _native_parse_spotipy_item  # type: ignore[assignment]

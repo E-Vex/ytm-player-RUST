@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 import time
 import types
 from difflib import SequenceMatcher
@@ -588,3 +590,199 @@ class TestExtractDispatcher:
         with caplog.at_level(logging.WARNING, logger=si.logger.name):
             si.extract_spotify_tracks("https://open.spotify.com/playlist/x")
         assert any("scraper returned" in rec.message.lower() for rec in caplog.records)
+
+
+# ── native vs fallback parity: the matching cores ──────────────────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+
+# The URL zoo: playlist and album links (the two real shapes), query
+# suffixes, ids that embed the other marker word, URI-form links (no
+# slash — no match), plural paths, case-mismatched markers, markers
+# inside the id, empty and non-Spotify URLs, and a URL whose first
+# match is the album marker even though a playlist marker follows.
+_URL_ZOO = [
+    "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
+    "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3",
+    "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3?si=abc",
+    "open.spotify.com/playlist/short",
+    "https://open.spotify.com/playlist/albumabc",
+    "https://open.spotify.com/playlist/37i9d/album/1DFi",
+    "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+    "spotify:album:1DFixLWuPkv3KT3TnV35m3",
+    "https://open.spotify.com/playlists/37i9dQZF1DXcBWIGoYBM5M",
+    "https://open.spotify.com/PLAYLIST/37i9dQZF1DXcBWIGoYBM5M",
+    "https://open.spotify.com/Album/1DFixLWuPkv3KT3TnV35m3",
+    "https://open.spotify.com/playlist/",
+    "https://open.spotify.com/playlist/?si=x",
+    "https://open.spotify.com/playlist/a-b_c",
+    "https://example.com/nothing",
+    "",
+    "playlist/no-scheme",
+    "album/42",
+    "see /playlist/x for more",
+    "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3/playlist/zzz",
+]
+
+
+def _item(
+    name="Song",
+    artists=("Artist",),
+    album="Album",
+    duration_ms=1000,
+    artist=None,
+):
+    track: dict = {"name": name, "duration_ms": duration_ms}
+    if artist is not None:
+        track["artist"] = artist
+    else:
+        track["artists"] = [{"name": a} for a in artists]
+    if album is not None:
+        track["album"] = {"name": album}
+    return track
+
+
+# The item zoo: the nested-track shape, the direct (album-endpoint)
+# shape, the falsy gates (None track, empty track, missing/empty/None
+# name), the artist fallbacks (direct artist key, artists list, the
+# view-count pseudo-artist exclusion, no artists at all), the album
+# shapes (dict without name, name None, non-dict album, absent album),
+# and the duration_ms default-vs-None distinction.
+_ITEM_ZOO = [
+    {"track": _item()},
+    {"track": _item(name="Ünïcode Şong", artists=("Årtist", "Othër"), album="Ålbüm")},
+    {"track": _item(duration_ms=None)},
+    {"track": _item(album=None)},
+    _item(name="Direct"),
+    _item(name="No Album Field", album=None),
+    {"track": None},
+    {"track": {}},
+    {"track": {"name": ""}},
+    {"track": {"name": None}},
+    {"track": {"name": 0}},
+    {},
+    {"track": _item(artist="Direct Artist")},
+    {"track": _item(artists=())},
+    {"track": {"name": "V", "artists": [{"name": "358K views"}], "views": "358K views"}},
+    {
+        "track": {
+            "name": "V2",
+            "artists": [{"name": "Real"}, {"name": "1,234 views"}],
+            "views": "1,234 views",
+            "duration_ms": 0,
+        }
+    },
+    {"track": {"name": "N", "album": {}}},
+    {"track": {"name": "N", "album": {"name": None}}},
+    {"track": {"name": "N", "album": "Plain String"}},
+    {"track": {"name": "N"}},
+    {"track": {"name": "ᴱᵐᵖᵗʸ", "artists": [{"name": ""}, {"name": "K"}]}},
+]
+
+_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.services import spotify_import as si
+
+urls, items = json.load(sys.stdin)
+out = {
+    "ids": [si._extract_playlist_id(u) for u in urls],
+    "parsed": [si._parse_spotipy_item(i) for i in items],
+}
+json.dump(out, sys.stdout)
+"""
+
+
+class TestMatchingCoresNativeParity:
+    """The URL-parse and item-normalise cores, on the child-interpreter
+    pattern the other parity tests use: the fallback runs with the
+    extension import blocked, so both implementations are compared
+    directly instead of trusting whichever one the test process loaded.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_matching_cores_match_fallback(self):
+        result = subprocess.run(
+            [sys.executable, "-c", _CHILD_PROG],
+            input=json.dumps([_URL_ZOO, _ITEM_ZOO]),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+
+        ids = [si._extract_playlist_id(url) for url in _URL_ZOO]
+        for url, nv, fb in zip(_URL_ZOO, ids, fallback["ids"]):
+            assert nv == fb, f"playlist ids differ for {url!r}: {nv!r} vs {fb!r}"
+
+        parsed = [si._parse_spotipy_item(item) for item in _ITEM_ZOO]
+        for item, nv, fb in zip(_ITEM_ZOO, parsed, fallback["parsed"]):
+            assert nv == fb, f"parsed items differ for {item!r}:\n{nv!r}\nvs\n{fb!r}"
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_native_engines_really_answer(self):
+        """The bindings are live: the module's cores are the native
+        functions themselves when the extension is built."""
+        from ytm_player.utils._ytm_player_native import (
+            extract_playlist_id,
+            parse_spotipy_item,
+        )
+
+        assert si._extract_playlist_id is extract_playlist_id
+        assert si._parse_spotipy_item is parse_spotipy_item
+
+    def test_url_zoo_contracts(self):
+        """Pin the shared contract on whichever backend is loaded."""
+        assert (
+            si._extract_playlist_id("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M")
+            == "37i9dQZF1DXcBWIGoYBM5M"
+        )
+        # The first marker wins: an album marker inside a playlist id is
+        # part of the id, and a URL with both takes the earlier one.
+        assert si._extract_playlist_id("https://open.spotify.com/playlist/albumabc") == "albumabc"
+        assert si._extract_playlist_id("https://open.spotify.com/album/1DFi/playlist/zzz") == "1DFi"
+        # URI form, plural paths and case mismatches have no match.
+        assert si._extract_playlist_id("spotify:playlist:37i9dQZF1DXcBWIGoYBM5M") == ""
+        assert si._extract_playlist_id("https://open.spotify.com/playlists/abc") == ""
+        assert si._extract_playlist_id("https://open.spotify.com/PLAYLIST/abc") == ""
+        # An id-less marker is no match; the char class is [a-zA-Z0-9].
+        assert si._extract_playlist_id("https://open.spotify.com/playlist/") == ""
+        assert si._extract_playlist_id("https://open.spotify.com/playlist/a-b_c") == "a"
+
+    def test_item_zoo_contracts(self):
+        """Pin the shared contract on whichever backend is loaded."""
+        assert si._parse_spotipy_item({"track": _item()}) == {
+            "name": "Song",
+            "artist": "Artist",
+            "album": "Album",
+            "duration_ms": 1000,
+        }
+        # The falsy gates.
+        assert si._parse_spotipy_item({"track": None}) == {}
+        assert si._parse_spotipy_item({"track": {}}) == {}
+        assert si._parse_spotipy_item({"track": {"name": ""}}) == {}
+        # duration_ms: absent is 0, present-None is None (a .get default
+        # never replaces a present value).
+        assert si._parse_spotipy_item({"track": _item()})["duration_ms"] == 1000
+        assert si._parse_spotipy_item(_item())["duration_ms"] == 1000
+        assert si._parse_spotipy_item({"track": {"name": "N"}})["duration_ms"] == 0
+        # The artist chain: direct key, artists list, view-count runs
+        # dropped, no artists at all.
+        assert si._parse_spotipy_item({"track": _item(artist="Solo")})["artist"] == "Solo"
+        assert si._parse_spotipy_item({"track": _item(artists=("A", "B"))})["artist"] == "A, B"
+        assert (
+            si._parse_spotipy_item({"track": {"name": "V", "artists": []}})["artist"] == "Unknown"
+        )
+        # The album chain: only a dict's name is read; a present-None
+        # name passes through, a non-dict album is "".
+        assert si._parse_spotipy_item({"track": {"name": "N", "album": {}}})["album"] == ""
+        assert si._parse_spotipy_item({"track": {"name": "N", "album": "S"}})["album"] == ""

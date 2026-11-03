@@ -225,3 +225,203 @@ class TestAtomicWrites:
             data = tomllib.load(f)
         assert data["ui"]["theme"] == "textual-dark"
         assert not config_path.with_suffix(config_path.suffix + ".tmp").exists()
+
+
+# ── the TOML value renderer: contracts + native/fallback parity ────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+# The value zoo: every match arm and its edges — bools (before the int
+# arm they'd otherwise fall into), ints (including the widths no fixed
+# integer holds), strings (the control-character set, DEL, quotes and
+# backslashes, the non-ASCII range, the JSON/TOML-shared escape forms),
+# lists (empty, nested, mixed), and the repr catch-all (floats, None,
+# dicts — the shapes a programmatically-built field could carry).
+_VALUE_ZOO = [
+    True,
+    False,
+    0,
+    1,
+    -5,
+    80,
+    10**30,
+    -(10**30),
+    "",
+    "plain",
+    'say "hi" \\ done',
+    "\r\n\t\b\f",
+    "".join(chr(code) for code in range(32)) + "\x7f",
+    "DEL \x7f twice \x7f",
+    "Björk 日本語 🎵 \u0085\u2028\u2029",
+    '"\n[ui]\ntheme = "unexpected"\n#',
+    "C:\\path\\to\\file",
+    [],
+    ["a\nb", "\x00\x7f", '"quoted"', "🎵", "C:\\path"],
+    ["outer", ["nested", 2, True, ["deeper"]]],
+    [True, False, 0, -1],
+    1.5,
+    0.1,
+    None,
+    {"a": 1},
+]
+
+_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.config.settings import _format_toml_value
+
+
+def revive(v):
+    # JSON round-trips collapse the zoo's None marker; rebuild the exact
+    # shapes (None -> the {"$none": True} marker -> None).
+    if isinstance(v, dict) and "$none" in v:
+        return None
+    if isinstance(v, list):
+        return [revive(x) for x in v]
+    return v
+
+
+values = json.load(sys.stdin)
+json.dump([_format_toml_value(revive(v)) for v in values], sys.stdout)
+"""
+
+
+class TestFormatTomlValueEngine:
+    """The value-to-TOML-literal renderer, on whichever backend is
+    loaded, plus the child-interpreter parity matrix when the extension
+    is built."""
+
+    def test_bool_renders_before_the_int_arm(self):
+        from ytm_player.config.settings import _format_toml_value
+
+        assert _format_toml_value(True) == "true"
+        assert _format_toml_value(False) == "false"
+
+    def test_int_renders_through_str(self):
+        from ytm_player.config.settings import _format_toml_value
+
+        assert _format_toml_value(80) == "80"
+        assert _format_toml_value(-5) == "-5"
+        assert _format_toml_value(10**30) == str(10**30)
+
+    def test_string_renders_json_escaped_with_del(self):
+        import json as json_mod
+
+        from ytm_player.config.settings import _format_toml_value
+
+        for s in ["", "plain", 'q "\\\\', "\n\t\r\x0b\x0c", "\x7f", "ü🎵"]:
+            expected = json_mod.dumps(s, ensure_ascii=False).replace("\x7f", "\\u007f")
+            assert _format_toml_value(s) == expected
+
+    def test_list_renders_bracketed_join(self):
+        from ytm_player.config.settings import _format_toml_value
+
+        assert _format_toml_value([]) == "[]"
+        assert _format_toml_value(["a", "b"]) == '["a", "b"]'
+        assert _format_toml_value([["x", 1], True]) == '[["x", 1], true]'
+
+    def test_catch_all_renders_repr(self):
+        from ytm_player.config.settings import _format_toml_value
+
+        assert _format_toml_value(None) == "None"
+        assert _format_toml_value(1.5) == "1.5"
+        assert _format_toml_value({"a": 1}) == repr({"a": 1})
+
+    def test_every_rendered_list_stays_parseable_toml(self):
+        # The renderer's whole job: whatever it emits for the list-y zoo
+        # members re-parses to the same value.
+        from ytm_player.config.settings import _format_toml_value
+
+        for value in _VALUE_ZOO:
+            if isinstance(value, list):
+                rendered = _format_toml_value(value)
+                assert tomllib.loads(f"values = {rendered}")["values"] == value
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_renderer_matches_fallback(self):
+        import json as json_mod
+        import subprocess
+
+        from ytm_player.config.settings import _format_toml_value
+
+        payload = json_mod.dumps([{"$none": True} if v is None else v for v in _VALUE_ZOO])
+        result = subprocess.run(
+            [sys.executable, "-c", _CHILD_PROG],
+            input=payload,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json_mod.loads(result.stdout)
+        native = [_format_toml_value(v) for v in _VALUE_ZOO]
+        for value, nv, fb in zip(_VALUE_ZOO, native, fallback):
+            assert nv == fb, f"renders differ for {value!r}:\nnative:   {nv!r}\nfallback: {fb!r}"
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_native_engine_really_answers(self):
+        """The binding is live: the module's renderer is the native
+        function itself when the extension is built."""
+        from ytm_player.utils._ytm_player_native import format_toml_value
+
+        from ytm_player.config.settings import _format_toml_value
+
+        assert _format_toml_value is format_toml_value
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_settings_save_runs_the_native_renderer(self):
+        """Through the public save(): the emitted file is byte-identical
+        to the fallback's (child-interpreter) render of the same
+        settings."""
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        original = Settings()
+        original.notifications.format = "Dêl \x7f 'fmt' \n"
+        original.ui.theme = "ünïcode 🎵"
+        original.yt_dlp.remote_components = ["a b", '"q"', "C:\\p"]
+        original.playback.default_volume = 37
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            original.save(path)
+            native_text = path.read_text(encoding="utf-8")
+
+        child = (
+            "import sys, tempfile, json\n"
+            "from pathlib import Path\n"
+            "sys.modules['ytm_player.utils._ytm_player_native'] = None\n"
+            "from ytm_player.config.settings import Settings\n"
+            "s = Settings()\n"
+            "s.notifications.format = 'Dêl \\x7f \\'fmt\\' \\n'\n"
+            "s.ui.theme = 'ünïcode 🎵'\n"
+            "s.yt_dlp.remote_components = ['a b', '\"q\"', 'C:\\\\p']\n"
+            "s.playback.default_volume = 37\n"
+            "with tempfile.TemporaryDirectory() as tmp:\n"
+            "    p = Path(tmp) / 'config.toml'\n"
+            "    s.save(p)\n"
+            "    sys.stdout.write(p.read_text(encoding='utf-8'))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", child],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert native_text == result.stdout
+        # And the round trip still holds.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            original.save(path)
+            loaded = Settings.load(path)
+        assert loaded.notifications.format == original.notifications.format
+        assert loaded.ui.theme == original.ui.theme
+        assert loaded.yt_dlp.remote_components == original.yt_dlp.remote_components

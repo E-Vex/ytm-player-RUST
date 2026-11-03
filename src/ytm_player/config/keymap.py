@@ -218,6 +218,45 @@ def _is_valid_binding(keys: object) -> bool:
     return False
 
 
+def _keymap_load_plan(data: dict) -> list[tuple]:
+    """Build the load plan behind ``KeyMap._load_from_dict``.
+
+    The pure half of the keymap-merge engine: every top-level value
+    that is a dict is walked in insertion order, and each section entry
+    resolves to one plan step — ``("unknown", name)`` when
+    ``Action(name)`` raises ``ValueError``, ``("invalid", name,
+    type_name)`` when the binding value is neither a string nor a list
+    of strings, or ``("bind", action, sequences)`` with the
+    ``Action(name)`` member and each key string split into its
+    ``tuple(raw.strip().split())`` sequence. The plan preserves the
+    reference's order, so the warnings interleave with the applications
+    that follow them exactly as the reference emits them.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.keymap_load_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    plan: list[tuple] = []
+    for section in data.values():
+        if not isinstance(section, dict):
+            continue
+        for action_name, keys in section.items():
+            try:
+                action = Action(action_name)
+            except ValueError:
+                plan.append(("unknown", action_name))
+                continue
+
+            if not _is_valid_binding(keys):
+                plan.append(("invalid", action_name, type(keys).__name__))
+                continue
+
+            if isinstance(keys, str):
+                keys = [keys]
+            plan.append(("bind", action, [parse_key_sequence(k) for k in keys]))
+    return plan
+
+
 @dataclass
 class KeyMap:
     """Ordered key-sequence → action bindings with prefix matching.
@@ -276,33 +315,33 @@ class KeyMap:
         self._native_matcher = None  # table changed; rebuild lazily
 
     def _load_from_dict(self, data: dict) -> None:
+        """Merge a parsed keymap mapping over the defaults.
+
+        The section walk, action validation and binding classification
+        are resolved by the ``_keymap_load_plan`` engine below (native
+        when the Rust extension is built, the pure-Python transcription
+        otherwise); this method replays the plan — applying each bind
+        step through ``_remove_action`` plus the sequence assignments,
+        in the reference's order, so the warnings interleave exactly as
+        the reference emits them — and finishes with the matcher
+        invalidation.
+        """
         self._load_defaults()
 
-        for section in data.values():
-            if not isinstance(section, dict):
-                continue
-            for action_name, keys in section.items():
-                try:
-                    action = Action(action_name)
-                except ValueError:
-                    logger.warning("Unknown keymap action %r — ignoring.", action_name)
-                    continue
-
-                if not _is_valid_binding(keys):
-                    logger.warning(
-                        "Keymap binding for %r must be a string or list of strings, "
-                        "got %s — ignoring.",
-                        action_name,
-                        type(keys).__name__,
-                    )
-                    continue
-
+        for step in _keymap_load_plan(data):
+            kind = step[0]
+            if kind == "unknown":
+                logger.warning("Unknown keymap action %r — ignoring.", step[1])
+            elif kind == "invalid":
+                logger.warning(
+                    "Keymap binding for %r must be a string or list of strings, got %s — ignoring.",
+                    step[1],
+                    step[2],
+                )
+            else:
+                action, sequences = step[1], step[2]
                 self._remove_action(action)
-
-                if isinstance(keys, str):
-                    keys = [keys]
-                for key_str in keys:
-                    seq = parse_key_sequence(key_str)
+                for seq in sequences:
                     self.bindings[seq] = action
         self._native_matcher = None  # table changed; rebuild lazily
 
@@ -377,3 +416,26 @@ def get_keymap() -> KeyMap:
     if _keymap is None:
         _keymap = KeyMap.load()
     return _keymap
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────
+# The Rust extension implements the same engines; these bindings override
+# the pure-Python transcriptions above when the extension is importable.
+# The rebinding must happen AFTER the definitions above — assigning the
+# native functions any earlier would be clobbered by the ``def``
+# statements (the lesson that produced formatting.py's dead native
+# bindings).  ``_load_from_dict`` looks ``_keymap_load_plan`` up as a
+# module global at call time, so the late rebinding takes effect for
+# real.
+
+try:
+    from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
+        keymap_load_plan as _native_keymap_load_plan,
+    )
+except ImportError:
+    pass
+else:
+
+    def _keymap_load_plan(data: dict) -> list[tuple]:  # noqa: F811
+        """The keymap-merge plan (native)."""
+        return _native_keymap_load_plan(data, Action)

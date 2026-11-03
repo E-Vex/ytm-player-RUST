@@ -292,3 +292,243 @@ class TestKeyMapNativeParity:
         km._native_matcher = None  # honor the direct-mutation contract
         assert km.match(("y",)) == (MatchResult.PENDING, None)
         assert km.match(("y", "y")) == (MatchResult.EXACT, Action.HELP)
+
+
+# ── the load-plan engine: contracts + native/fallback parity ──────────
+
+# Keymap TOMLs exercising every plan step and the ordering contract:
+# valid string-form and list-form overrides, re-binding the same action
+# from two sections (the second application removes the first's keys),
+# the empty list (unbind) and the empty string (the empty sequence),
+# whitespace-padded and multi-key strings, unknown actions, invalid
+# binding values of several types, and non-dict top-level values.
+_PLAN_KEYMAPS = {
+    "overrides": (
+        "[pages]\n"
+        'library = "g x"\n'
+        'queue = ""\n'
+        "help = []\n"
+        "\n"
+        "[navigation]\n"
+        'move_down = ["j", " down ", "j2"]\n'
+        "\n"
+        "[actions]\n"
+        'bogus_action = "y y"\n'
+    ),
+    "rebinding_across_sections": (
+        '[navigation]\nmove_down = "j x"\n[more_navigation]\nmove_down = "j y"\nmove_up = "k y"\n'
+    ),
+    "invalid_values": (
+        "[pages]\n"
+        "library = 5\n"
+        'search = ["ok", 7]\n'
+        "queue = true\n"
+        "help = { not = 'a list' }\n"
+        "\n"
+        "[actions]\n"
+        'like_toggle = "l"\n'
+    ),
+    "non_dict_section": ('standalone = 5\nanother = "text"\n\n[pages]\nlibrary = "g z"\n'),
+    "whitespace_shapes": (
+        '[navigation]\nmove_down = "  j  "\nmove_up = "k\\tt"\ngo_top = " g  g "\n'
+    ),
+    "empty": "",
+}
+
+_PLAN_CHILD_PROG = """
+import json
+import sys
+from pathlib import Path
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+import logging
+
+logging.disable(logging.CRITICAL)
+
+from ytm_player.config.keymap import KeyMap
+
+payload = json.loads(sys.argv[1])
+path = Path(payload["path"])
+km = KeyMap.load(path)
+out = {
+    "bindings": sorted(
+        [list(seq), action.value] for seq, action in km.bindings.items()
+    ),
+    "order": [list(seq) for seq in km.bindings],
+    "warnings": payload.get("warnings", []),
+}
+json.dump(out, sys.stdout)
+"""
+
+
+_WARNINGS_CHILD_PROG = """
+import json
+import sys
+from pathlib import Path
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+import logging
+
+logging.basicConfig(stream=sys.stdout, level=logging.WARNING, format="%(message)s")
+
+from ytm_player.config.keymap import KeyMap
+
+payload = json.loads(sys.argv[1])
+km = KeyMap.load(Path(payload["path"]))
+"""
+
+
+class TestKeyMapLoadPlanEngine:
+    """The plan engine behind _load_from_dict, on whichever backend is
+    loaded, plus the child-interpreter parity matrix when the extension
+    is built."""
+
+    def test_plan_steps_classify_every_entry(self, tmp_path, caplog):
+        """The plan carries the unknown/invalid/bind classification in
+        section order — the replay's warnings and applications follow
+        it."""
+        import logging
+
+        from ytm_player.config.keymap import _keymap_load_plan
+
+        data = {
+            "pages": {
+                "library": 5,
+                "search": ["ok", 7],
+                "queue": True,
+                "help": {"not": "a list"},
+            },
+            "actions": {"like_toggle": "l"},
+        }
+        with caplog.at_level(logging.WARNING):
+            plan = _keymap_load_plan(data)
+        kinds = [step[0] for step in plan]
+        assert kinds == ["invalid", "invalid", "invalid", "invalid", "bind"]
+        # The names and type names ride along for the warnings.
+        assert plan[0][1] == "library" and plan[0][2] == "int"
+        assert plan[1][1] == "search" and plan[1][2] == "list"
+        assert plan[3][1] == "help" and plan[3][2] == "dict"
+
+    def test_rebinding_across_sections_removes_earlier_keys(self, tmp_path):
+        """Two sections binding the same action: the second application
+        removes the first's sequences — the reference's per-application
+        _remove_action, preserved by the plan replay."""
+        path = tmp_path / "keymap.toml"
+        path.write_text(_PLAN_KEYMAPS["rebinding_across_sections"], encoding="utf-8")
+
+        km = KeyMap.load(path)
+
+        assert km.match(("j", "x")) == (MatchResult.NO_MATCH, None)
+        assert km.match(("j", "y")) == (MatchResult.EXACT, Action.MOVE_DOWN)
+        assert km.match(("k", "y")) == (MatchResult.EXACT, Action.MOVE_UP)
+        # Both re-bound actions lost their whole default sets ("k" is now
+        # only a prefix of the new sequence; "up"/"C-p" were removed with
+        # the rest), while unrelated defaults survive untouched.
+        assert km.match(("k",)) == (MatchResult.PENDING, None)
+        assert km.match(("up",)) == (MatchResult.NO_MATCH, None)
+        assert km.match(("space",)) == (MatchResult.EXACT, Action.PLAY_PAUSE)
+        assert km.match(("n",)) == (MatchResult.EXACT, Action.NEXT_TRACK)
+
+    def test_whitespace_shapes_split_on_python_whitespace(self, tmp_path):
+        """Key strings strip then split on CPython's whitespace set —
+        padded strings bind their inner sequence, a tab separates two
+        keys."""
+        path = tmp_path / "keymap.toml"
+        path.write_text(_PLAN_KEYMAPS["whitespace_shapes"], encoding="utf-8")
+
+        km = KeyMap.load(path)
+
+        assert km.match(("j",)) == (MatchResult.EXACT, Action.MOVE_DOWN)
+        assert km.match(("k", "t")) == (MatchResult.EXACT, Action.MOVE_UP)
+        assert km.match(("g", "g")) == (MatchResult.EXACT, Action.GO_TOP)
+
+    def test_non_dict_sections_are_skipped(self, tmp_path):
+        path = tmp_path / "keymap.toml"
+        path.write_text(_PLAN_KEYMAPS["non_dict_section"], encoding="utf-8")
+
+        km = KeyMap.load(path)
+
+        assert km.match(("g", "z")) == (MatchResult.EXACT, Action.LIBRARY)
+        assert km.match(("g", "l")) == (MatchResult.NO_MATCH, None)
+
+    def test_empty_file_keeps_defaults(self, tmp_path):
+        path = tmp_path / "keymap.toml"
+        path.write_text(_PLAN_KEYMAPS["empty"], encoding="utf-8")
+
+        km = KeyMap.load(path)
+
+        assert km.match(("space",)) == (MatchResult.EXACT, Action.PLAY_PAUSE)
+        assert km.match(("g", "g")) == (MatchResult.EXACT, Action.GO_TOP)
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_loaded_bindings_match_fallback(self, tmp_path):
+        """Every keymap zoo entry loads to the identical bindings table
+        (contents AND order) as the child-interpreter fallback."""
+        import json
+
+        for name, toml_text in _PLAN_KEYMAPS.items():
+            path = tmp_path / f"{name}.toml"
+            path.write_text(toml_text, encoding="utf-8")
+
+            km = KeyMap.load(path)
+            native = {
+                "bindings": sorted([list(seq), a.value] for seq, a in km.bindings.items()),
+                "order": [list(seq) for seq in km.bindings],
+            }
+
+            result = subprocess.run(
+                [sys.executable, "-c", _PLAN_CHILD_PROG, json.dumps({"path": str(path)})],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            fallback = json.loads(result.stdout)
+
+            assert native["bindings"] == fallback["bindings"], name
+            assert native["order"] == fallback["order"], f"binding order differs for {name!r}"
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_load_warnings_match_fallback(self, tmp_path, caplog):
+        """The warnings the replay emits — message for message, in
+        order — are the fallback's own."""
+        import json
+        import logging
+
+        path = tmp_path / "keymap.toml"
+        path.write_text(_PLAN_KEYMAPS["invalid_values"], encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="ytm_player.config.keymap"):
+            KeyMap.load(path)
+        native_warnings = [r.getMessage() for r in caplog.records]
+
+        # The child mirrors its warnings to stdout through a
+        # logging.StreamHandler, one message per line.
+        result = subprocess.run(
+            [sys.executable, "-c", _WARNINGS_CHILD_PROG, json.dumps({"path": str(path)})],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback_warnings = [w for w in result.stdout.splitlines() if w]
+
+        assert native_warnings == fallback_warnings
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_native_engine_really_answers(self):
+        """The binding is live: the module's plan builder delegates to
+        the native function when the extension is built."""
+        from ytm_player.utils._ytm_player_native import keymap_load_plan
+
+        from ytm_player.config.keymap import _keymap_load_plan
+
+        assert _keymap_load_plan({}) == []
+        # The native engine is reachable through the wrapper (it returns
+        # the native plan for a non-trivial input).
+        plan = _keymap_load_plan({"pages": {"library": "g x"}})
+        assert [step[0] for step in plan] == ["bind"]
+        assert plan[0][2] == [("g", "x")]
+        # The module-level name is the wrapper; the native function is
+        # what it calls.
+        assert callable(keymap_load_plan)

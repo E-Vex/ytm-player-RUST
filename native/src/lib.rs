@@ -378,6 +378,24 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(theme_fields_from_css, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(app_css_variables, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(theme_fields_from_theme, module)?)?;
+
+    // Spotify-import matching cores (services/spotify_import.py
+    // equivalents): the playlist/album ID pull behind the import URL
+    // parse, and the spotipy item normaliser behind every track the
+    // Web-API path ingests.
+    module.add_function(pyo3::wrap_pyfunction!(extract_playlist_id, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(parse_spotipy_item, module)?)?;
+
+    // Settings TOML value formatting (config/settings.py equivalent):
+    // the value-to-TOML-literal renderer behind every line
+    // Settings.save writes.
+    module.add_function(pyo3::wrap_pyfunction!(format_toml_value, module)?)?;
+
+    // Keymap load plan (config/keymap.py _load_from_dict equivalent):
+    // the section walk, action validation and binding classification
+    // behind keymap.toml loading, applied by the Python caller as it
+    // replays the plan.
+    module.add_function(pyo3::wrap_pyfunction!(keymap_load_plan, module)?)?;
     Ok(())
 }
 
@@ -8544,4 +8562,341 @@ fn theme_fields_from_theme<'py>(
     )?;
 
     Ok(fields)
+}
+
+// ---------------------------------------------------------------------------
+// Spotify-import matching cores
+// ---------------------------------------------------------------------------
+
+/// The `(playlist|album)/([a-zA-Z0-9]+)` ID pattern from
+/// `services/spotify_import.py`'s `_extract_playlist_id` — `re.search`
+/// semantics: the leftmost-first match anywhere in the URL.
+static SPOTIFY_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(playlist|album)/([a-zA-Z0-9]+)").expect("valid spotify id regex")
+});
+
+/// Pull the playlist/album ID from a Spotify URL. Mirrors
+/// `spotify_import._extract_playlist_id`: the base-62 run after the
+/// first `playlist/` or `album/` the URL contains, or the empty string
+/// when it has neither.
+#[pyfunction]
+fn extract_playlist_id(url: &str) -> String {
+    SPOTIFY_ID_RE
+        .captures(url)
+        .and_then(|caps| caps.get(2))
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// Normalise a spotipy track item to the internal Spotify-track format.
+/// Mirrors `spotify_import._parse_spotipy_item`: the nested `track`
+/// mapping (the item itself when the key is absent — a present value
+/// passes through as-is, `None` included, into the falsy gate), the
+/// falsy-track / falsy-name gate that yields the empty dict, and the
+/// four-key output — the artist through the same `extract_artist`
+/// engine the Python side's module global resolves to, the album name
+/// read only when the `album` value is a dict (a present-but-`None`
+/// `name` inside it passes through as `None`, exactly like `.get`), and
+/// the `duration_ms` value passed through as the object it is (the `0`
+/// default only on an absent key). Key order mirrors the reference's
+/// dict literal.
+///
+/// The item and the nested track are the plain dicts spotipy's JSON
+/// payloads produce; a truthy non-dict `track` value — unreachable
+/// through `extract_spotify_tracks_spotipy`, the only caller — is
+/// outside the ported contract and reports a TypeError rather than the
+/// reference's AttributeError.
+#[pyfunction]
+fn parse_spotipy_item<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyDict>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // item.get("track", item)
+    let track_any: Bound<'py, PyAny> = match item.get_item("track")? {
+        Some(value) => value,
+        None => item.as_any().clone(),
+    };
+    // `not track or ...` — falsiness first, so an empty/None track
+    // never reaches the name read.
+    if !track_any.is_truthy()? {
+        return Ok(PyDict::new(py));
+    }
+    let track = track_any
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("spotipy track must be a dict"))?;
+
+    // `not track.get("name")` — absent and falsy (None, "", 0, ...)
+    // both yield the empty dict.
+    let name = match track.get_item("name")? {
+        Some(value) if value.is_truthy()? => value,
+        _ => return Ok(PyDict::new(py)),
+    };
+
+    let artist = extract_artist(py, track);
+
+    // track.get("album", {})
+    let album: Bound<'py, PyAny> = match track.get_item("album")? {
+        Some(value) => value,
+        None => PyDict::new(py).into_any(),
+    };
+    // album.get("name", "") if isinstance(album, dict) else ""
+    let album_name: Bound<'py, PyAny> = if album.is_instance_of::<PyDict>() {
+        match album.downcast::<PyDict>().unwrap().get_item("name")? {
+            Some(value) => value,
+            None => PyString::new(py, "").into_any(),
+        }
+    } else {
+        PyString::new(py, "").into_any()
+    };
+
+    // track.get("duration_ms", 0)
+    let duration_ms: Bound<'py, PyAny> = match track.get_item("duration_ms")? {
+        Some(value) => value,
+        None => 0i64.into_pyobject(py)?.into_any(),
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("name", name)?;
+    out.set_item("artist", artist)?;
+    out.set_item("album", album_name)?;
+    out.set_item("duration_ms", duration_ms)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Settings TOML value formatting
+// ---------------------------------------------------------------------------
+
+/// The `json.dumps(value, ensure_ascii=False)` string escaping behind
+/// `_format_toml_value`'s str branch in `config/settings.py`, with the
+/// reference's post-`.replace("\x7f", "\\u007f")` folded in (DEL can
+/// appear only inside the payload, so per-code-point is equivalent):
+/// the two always-escaped characters, the five short control forms,
+/// every other code point below 0x20 its lowercase four-hex `\u00XX`
+/// form, and everything else — DEL included, the whole non-ASCII range
+/// included — passing through literally.
+fn toml_json_escape_into(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{09}' => out.push_str("\\t"),
+            '\u{0a}' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\u{0d}' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => json_push_u_escape(out, c as u32),
+            '\u{7f}' => out.push_str("\\u007f"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Render one settings value as a TOML literal. Mirrors
+/// `config/settings.py`'s `_format_toml_value` match, arm for arm and
+/// in the reference's order: `bool` before `int` (bool is an int
+/// subclass — True renders `true`, never `1`), `int` through
+/// `str(value)`, `str` through `json.dumps(value, ensure_ascii=False)`
+/// plus the DEL escape, `list` as the bracketed comma-space join of the
+/// recursively rendered elements (an empty list is `[]`), and anything
+/// else through `repr(value)` — the str and repr renders running
+/// through CPython's own operations, so int/str subclasses and exotic
+/// objects render exactly as the reference does.
+///
+/// A string carrying lone surrogates — which Rust strings cannot spell,
+/// and which only a programmatically-built settings field could hold,
+/// a TOML file being valid Unicode — delegates its whole branch to
+/// CPython's own `json.dumps` (the reference implementation itself),
+/// so even that corner answers identically.
+#[pyfunction]
+fn format_toml_value<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyString>> {
+    // bool() — first, so True/False never render as 1/0.
+    if value.is_instance_of::<PyBool>() {
+        return Ok(PyString::new(
+            py,
+            if value.is_truthy()? { "true" } else { "false" },
+        ));
+    }
+    // int() — str(value), the interpreter's own render.
+    if value.is_instance_of::<PyInt>() {
+        return value.str();
+    }
+    // str() — json.dumps(ensure_ascii=False) + the DEL escape.
+    if let Ok(s) = value.downcast::<PyString>() {
+        if let Ok(text) = s.to_str() {
+            let mut out = String::with_capacity(text.len() + 2);
+            toml_json_escape_into(&mut out, text);
+            return Ok(PyString::new(py, &out));
+        }
+        // Lone surrogates: the reference's own serialiser, verbatim.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("ensure_ascii", false)?;
+        let dumped = py
+            .import("json")?
+            .getattr("dumps")?
+            .call((s,), Some(&kwargs))?;
+        let replaced = dumped.call_method1("replace", ("\u{7f}", "\\u007f"))?;
+        return Ok(replaced.downcast_into::<PyString>()?);
+    }
+    // list() — "[a, b]" over the recursive renders.
+    if let Ok(list) = value.downcast::<PyList>() {
+        let mut items = String::new();
+        let mut rendered: Vec<Bound<'py, PyString>> = Vec::with_capacity(list.len());
+        let mut all_text = true;
+        for (i, element) in list.iter().enumerate() {
+            let r = format_toml_value(py, &element)?;
+            if i > 0 {
+                items.push_str(", ");
+            }
+            match r.to_str() {
+                Ok(text) => items.push_str(text),
+                Err(_) => all_text = false,
+            }
+            rendered.push(r);
+        }
+        if all_text {
+            return Ok(PyString::new(py, &format!("[{items}]")));
+        }
+        // An element's rendering carries a lone surrogate: join through
+        // CPython so the result carries it too.
+        let sep = PyString::new(py, ", ");
+        let joined = sep.call_method1("join", (PyList::new(py, rendered)?,))?;
+        let parts = [
+            PyString::new(py, "[").into_any(),
+            joined,
+            PyString::new(py, "]").into_any(),
+        ];
+        let out = PyString::new(py, "")
+            .call_method1("join", (PyList::new(py, parts)?,))?
+            .downcast_into::<PyString>()?;
+        return Ok(out);
+    }
+    // The catch-all: repr(value).
+    value.repr()
+}
+
+// ---------------------------------------------------------------------------
+// Keymap load plan
+// ---------------------------------------------------------------------------
+
+/// `parse_key_sequence` — `tuple(raw.strip().split())` with CPython's
+/// whitespace set (see `py_isspace`) on both the strip and the split.
+fn parse_key_sequence_py<'py>(py: Python<'py>, raw: &str) -> PyResult<Bound<'py, PyTuple>> {
+    let parts: Vec<Bound<'py, PyString>> = py_split_none(py_strip(raw))
+        .into_iter()
+        .map(|part| PyString::new(py, part))
+        .collect();
+    PyTuple::new(py, parts)
+}
+
+/// Build the load plan behind `KeyMap._load_from_dict` — the section
+/// walk, action validation and binding classification of the
+/// keymap.toml merge, with the mutations themselves (and the native
+/// matcher invalidation) applied by the Python caller as it replays the
+/// plan.
+///
+/// Mirrors the reference: every top-level value that is a dict is walked
+/// in insertion order (a non-dict value is skipped, exactly the
+/// reference's `isinstance` gate), and each section entry resolves to
+/// one plan step — `("unknown", name)` when `Action(name)` raises
+/// ValueError (the enum's own `__call__` performs the lookup, so the
+/// value matching and any TypeError from an unhashable name are the
+/// interpreter's own, the latter propagating exactly where the
+/// reference's `except ValueError` lets it), `("invalid", name,
+/// type_name)` when the binding value is neither a string nor a list of
+/// strings (`type(keys).__name__` carried for the warning), or
+/// `("bind", action, sequences)` with the `Action(name)` member and
+/// each key string split into its `tuple(raw.strip().split())`
+/// sequence. The plan preserves the reference's order, so the warnings
+/// interleave with the applications that follow them exactly as the
+/// reference emits them.
+///
+/// The data is the tomllib-parsed mapping (top-level dict of section
+/// dicts with string keys); key strings are the valid-Unicode strs a
+/// TOML file produces.
+#[pyfunction]
+fn keymap_load_plan<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    action_cls: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let data = data
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("keymap data must be a dict"))?;
+    let plan = PyList::empty(py);
+    for section_value in data.values() {
+        // `if not isinstance(section, dict): continue`
+        let Ok(section) = section_value.downcast::<PyDict>() else {
+            continue;
+        };
+        for (name, keys) in section.iter() {
+            // `try: action = Action(action_name) except ValueError:`
+            let action = match action_cls.call1((name.clone(),)) {
+                Ok(action) => action,
+                Err(err) if err.is_instance_of::<PyValueError>(py) => {
+                    let step = PyTuple::new(py, [PyString::new(py, "unknown").into_any(), name])?;
+                    plan.append(step)?;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+
+            // `_is_valid_binding`: a str, or a list of strs.
+            let sequences: Vec<Bound<'py, PyTuple>> = if keys.is_instance_of::<PyString>() {
+                let raw = keys.downcast::<PyString>().unwrap();
+                vec![parse_key_sequence_py(py, raw.to_str()?)?]
+            } else if let Ok(list) = keys.downcast::<PyList>() {
+                let mut seqs = Vec::with_capacity(list.len());
+                let mut valid = true;
+                for element in list.iter() {
+                    if !element.is_instance_of::<PyString>() {
+                        valid = false;
+                        break;
+                    }
+                    let raw = element.downcast::<PyString>().unwrap();
+                    seqs.push(parse_key_sequence_py(py, raw.to_str()?)?);
+                }
+                if !valid {
+                    let step = PyTuple::new(
+                        py,
+                        [
+                            PyString::new(py, "invalid").into_any(),
+                            name,
+                            keys.get_type().name()?.into_any(),
+                        ],
+                    )?;
+                    plan.append(step)?;
+                    continue;
+                }
+                seqs
+            } else {
+                let step = PyTuple::new(
+                    py,
+                    [
+                        PyString::new(py, "invalid").into_any(),
+                        name,
+                        keys.get_type().name()?.into_any(),
+                    ],
+                )?;
+                plan.append(step)?;
+                continue;
+            };
+
+            let step = PyTuple::new(
+                py,
+                [
+                    PyString::new(py, "bind").into_any(),
+                    action,
+                    PyList::new(py, sequences)?.into_any(),
+                ],
+            )?;
+            plan.append(step)?;
+        }
+    }
+    Ok(plan)
 }

@@ -313,6 +313,19 @@ def _value_matches_type(value: object, expected: object) -> bool:
 
 
 def _format_toml_value(value: object) -> str:
+    """Render one settings value as a TOML literal.
+
+    Bools before ints (a bool is an int subclass — ``True`` must render
+    ``true``, never ``1``), strings through JSON's escaping (which is
+    also valid TOML basic-string escaping; DEL is allowed literally by
+    JSON but must be escaped in TOML too), lists as the bracketed
+    comma-space join of their recursively rendered elements, and
+    anything else through ``repr``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.format_toml_value``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
     match value:
         case bool():
             return "true" if value else "false"
@@ -337,3 +350,22 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings.load()
     return _settings
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────
+# The Rust extension implements the same engines; these bindings override
+# the pure-Python transcriptions above when the extension is importable.
+# The rebinding must happen AFTER the definitions above — assigning the
+# native functions any earlier would be clobbered by the ``def``
+# statements (the lesson that produced formatting.py's dead native
+# bindings).  ``save`` looks ``_format_toml_value`` up as a module global
+# at call time, so the late rebinding takes effect for real.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        format_toml_value as _native_format_toml_value,
+    )
+except ImportError:
+    pass
+else:
+    _format_toml_value = _native_format_toml_value  # type: ignore[assignment]
