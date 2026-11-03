@@ -115,6 +115,40 @@ def _mpv_version() -> str:
     )
 
 
+def _libmpv_status_text(import_player: Any) -> str:
+    """The libmpv status text behind ``_libmpv_status``.
+
+    The pure half of the libmpv loadability probe: the *import_player*
+    thunk — the reference's ``from ytm_player.services.player import
+    _IMPORT_ERROR_MSG`` — is invoked exactly once, exactly up front,
+    and an ``ImportError`` it raises (whatever arm produced it: the
+    module's own import failing, or the name being absent because the
+    mpv import succeeded) is the OK marker, the library loadable;
+    otherwise the message the thunk returns is rendered through
+    ``str()`` exactly like the reference's ``str(_IMPORT_ERROR_MSG)``,
+    its own ``splitlines()`` supplies the lines (CPython's line
+    boundaries, ``\\x85`` and ``\\u2028`` included), the ``[-1]``
+    index the last of them (an ``IndexError`` when none made it,
+    propagating exactly like the reference's — the except clause
+    covers ``ImportError`` only), and the ``strip()``-ed line
+    interpolates into the NOT LOADABLE message. Everything the
+    reference's try block covered stays under the same single
+    ``except ImportError`` here — a message object whose ``__str__``
+    itself raises ``ImportError`` is the OK marker too, exactly like
+    the reference's.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.libmpv_status_text``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    try:
+        import_error_msg = import_player()
+        first = str(import_error_msg).splitlines()[-1]
+        return f"libmpv: NOT LOADABLE ({first.strip()})"
+    except ImportError:
+        return "libmpv: OK"
+
+
 def _libmpv_status() -> str:
     """Report whether the libmpv shared library is loadable.
 
@@ -123,14 +157,57 @@ def _libmpv_status() -> str:
     ctypes.util.find_library can't see it from a non-brew Python
     (#90, #101, #104). Importing our player module exercises the full
     discovery chain including the brew-prefix fallback.
+
+    The probe — the player-module import and the last-line render — is
+    resolved by the ``_libmpv_status_text`` engine above (native when
+    the Rust extension is built, the pure-Python transcription
+    otherwise); this helper supplies the import as a thunk.
     """
-    try:
+
+    def _import_player() -> Any:
         from ytm_player.services.player import _IMPORT_ERROR_MSG  # type: ignore[attr-defined]
 
-        first = str(_IMPORT_ERROR_MSG).splitlines()[-1]
-        return f"libmpv: NOT LOADABLE ({first.strip()})"
-    except ImportError:
-        return "libmpv: OK"
+        return _IMPORT_ERROR_MSG
+
+    return _libmpv_status_text(_import_player)
+
+
+def _mpris_status_text(is_linux: Any, system_name: Any, import_mpris: Any) -> str:
+    """The MPRIS status text behind ``_mpris_status``.
+
+    The pure half of the MPRIS availability probe: a falsy *is_linux*
+    (the reference's ``sys.platform != "linux"``, computed by the
+    caller) is the n/a marker, the *system_name* thunk — the
+    reference's ``platform.system()`` — invoked exactly here, exactly
+    once, only on this branch, so the platform probe never runs on
+    Linux — rendering into the message through ``str()`` exactly like
+    the reference's f-string; otherwise the *import_mpris* thunk — the
+    reference's ``from ytm_player.services.mpris import BUS_NAME,
+    DBUS_AVAILABLE`` — supplies the pair, and a truthy
+    ``DBUS_AVAILABLE`` element is the available line interpolating the
+    ``BUS_NAME`` element through ``str()`` exactly like the reference's
+    f-string, a falsy one the UNAVAILABLE fix text. An error from
+    either thunk propagates exactly where the reference's own operation
+    would raise it — the reference has no try around the import, so an
+    ``ImportError`` surfaces instead of becoming the unavailable
+    marker. The inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.mpris_status_text``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if not is_linux:
+        return f"MPRIS: n/a ({system_name()} uses its native media integration)"
+    bus_name, dbus_available = import_mpris()
+    if dbus_available:
+        return f"MPRIS: available (dbus-fast OK; registers as {bus_name})"
+    return (
+        "MPRIS: UNAVAILABLE — dbus-fast is missing or failed to load (it's a "
+        "Linux core dependency, so this install is broken/partial; an "
+        "incompatible dbus-fast build logs the failure to ytm.log — see the "
+        "recent-errors section below). Fix: reinstall ytm-player "
+        "(pip install --force-reinstall ytm-player), or pip install dbus-fast."
+    )
 
 
 def _mpris_status() -> str:
@@ -142,19 +219,23 @@ def _mpris_status() -> str:
     playerctl finds no player (#110) — so surface the gap and the fix here.
     doctor runs in its own process, so this reflects dependency availability —
     not whether the live TUI currently holds the bus name.
-    """
-    if sys.platform != "linux":
-        return f"MPRIS: n/a ({platform.system()} uses its native media integration)"
-    from ytm_player.services.mpris import BUS_NAME, DBUS_AVAILABLE
 
-    if DBUS_AVAILABLE:
-        return f"MPRIS: available (dbus-fast OK; registers as {BUS_NAME})"
-    return (
-        "MPRIS: UNAVAILABLE — dbus-fast is missing or failed to load (it's a "
-        "Linux core dependency, so this install is broken/partial; an "
-        "incompatible dbus-fast build logs the failure to ytm.log — see the "
-        "recent-errors section below). Fix: reinstall ytm-player "
-        "(pip install --force-reinstall ytm-player), or pip install dbus-fast."
+    The verdict — the platform gate, the system render, the import and
+    the three spellings — is resolved by the ``_mpris_status_text``
+    engine above (native when the Rust extension is built, the
+    pure-Python transcription otherwise); this helper supplies the
+    platform facts and the import as thunks.
+    """
+
+    def _import_mpris() -> tuple[Any, Any]:
+        from ytm_player.services.mpris import BUS_NAME, DBUS_AVAILABLE
+
+        return BUS_NAME, DBUS_AVAILABLE
+
+    return _mpris_status_text(
+        sys.platform == "linux",
+        platform.system,
+        _import_mpris,
     )
 
 
@@ -654,3 +735,21 @@ except ImportError:
     pass
 else:
     _mpv_version_text = _native_mpv_version_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        libmpv_status_text as _native_libmpv_status_text,
+    )
+except ImportError:
+    pass
+else:
+    _libmpv_status_text = _native_libmpv_status_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        mpris_status_text as _native_mpris_status_text,
+    )
+except ImportError:
+    pass
+else:
+    _mpris_status_text = _native_mpris_status_text  # type: ignore[assignment]

@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyOSError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyIndexError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{
@@ -357,6 +357,15 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // supplied as thunks.
     module.add_function(pyo3::wrap_pyfunction!(running_status_text, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(mpv_version_text, module)?)?;
+
+    // Doctor import-probe engines (utils/doctor.py equivalents): the
+    // libmpv loadability verdict — the player-module import and the
+    // last-line render of its failure message — and the MPRIS
+    // availability verdict — the platform gate, the system render and
+    // the mpris-module import's BUS_NAME/DBUS_AVAILABLE pair — with the
+    // imports themselves supplied as thunks.
+    module.add_function(pyo3::wrap_pyfunction!(libmpv_status_text, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(mpris_status_text, module)?)?;
     Ok(())
 }
 
@@ -7481,6 +7490,14 @@ fn py_split_none(s: &str) -> Vec<&str> {
         .collect()
 }
 
+/// `str.strip()` with no arguments — trimmed of the `isspace` set's
+/// leading and trailing characters (see `py_isspace` — a wider set than
+/// the crate's own `str::trim`, which stops at the Unicode
+/// `White_Space` property and misses `\x1c`–`\x1f`).
+fn py_strip(s: &str) -> &str {
+    s.trim_matches(py_isspace)
+}
+
 /// Split exactly like CPython's `str.splitlines`: on every line boundary
 /// it accepts (`\n`, `\r\n` as one, `\r`, `\v`, `\f`, `\x1c`, `\x1d`,
 /// `\x1e`, `\x85`, `\u{2028}`, `\u{2029}`) — a wider set than the
@@ -7837,4 +7854,195 @@ fn mpv_version_attempt<'py>(
 fn is_subprocess_error(py: Python<'_>, err: &PyErr) -> PyResult<bool> {
     let subprocess_error = py.import("subprocess")?.getattr("SubprocessError")?;
     Ok(err.is_instance(py, &subprocess_error))
+}
+
+/// The libmpv status line behind the libmpv loadability probe of
+/// `ytm doctor` — the pure core of `_libmpv_status` in
+/// `utils/doctor.py`.
+///
+/// Mirrors the pure-Python reference (`_libmpv_status_text`): the
+/// *import_player* thunk — the reference's
+/// `from ytm_player.services.player import _IMPORT_ERROR_MSG` — is
+/// invoked exactly once, exactly up front, and an `ImportError` it
+/// raises (whatever arm produced it: the module's own import failing,
+/// or the name being absent because the mpv import succeeded) is the
+/// OK marker, the library loadable; otherwise the message the thunk
+/// returns is rendered through `str()` exactly like the reference's
+/// `str(_IMPORT_ERROR_MSG)`, its own `splitlines()` supplies the lines
+/// (CPython's line boundaries, `\x85` and `\u{2028}` included), the
+/// `[-1]` index the last of them (an `IndexError` when none made it,
+/// propagating exactly like the reference's — the except clause covers
+/// `ImportError` only), and the `strip()`-ed line (Python's whitespace
+/// set, see `py_strip`) interpolates into the NOT LOADABLE message.
+/// Everything the reference's try block covered stays under the same
+/// single `except ImportError` here — a message object whose own
+/// `__str__` raises `ImportError` is the OK marker too (see
+/// `libmpv_status_attempt`), exactly like the reference's. The inputs
+/// are never mutated.
+#[pyfunction]
+#[pyo3(signature = (import_player))]
+fn libmpv_status_text<'py>(py: Python<'py>, import_player: &Bound<'py, PyAny>) -> PyResult<String> {
+    match libmpv_status_attempt(import_player) {
+        Ok(text) => Ok(text),
+        // except ImportError — the reference's only clause, matched
+        // through the exception type itself.
+        Err(err) if err.is_instance_of::<PyImportError>(py) => Ok("libmpv: OK".to_string()),
+        Err(err) => Err(err),
+    }
+}
+
+/// The import-and-render half of the libmpv probe — everything the
+/// reference's try block covers, so an `ImportError` from any of it
+/// (the thunk itself, or a message object's own `__str__`) lands in the
+/// OK arm of the caller, and anything else propagates.
+fn libmpv_status_attempt(import_player: &Bound<'_, PyAny>) -> PyResult<String> {
+    // from ytm_player.services.player import _IMPORT_ERROR_MSG — the
+    // thunk, exactly once, exactly up front.
+    let import_error_msg = import_player.call0()?;
+    // str(_IMPORT_ERROR_MSG) — the reference's conversion, inside its
+    // try block, so an ImportError it raises is the OK marker.
+    let text = py_str(&import_error_msg)?;
+    // .splitlines() — CPython's line boundaries (see py_splitlines).
+    let lines = py_splitlines(&text);
+    // [-1] — the last line; an empty list is the reference's own
+    // IndexError (the except clause covers ImportError only), reproduced
+    // through CPython's own message.
+    let last = lines
+        .last()
+        .ok_or_else(|| PyIndexError::new_err("list index out of range"))?;
+    // first.strip() — Python's whitespace set (see py_strip).
+    Ok(format!("libmpv: NOT LOADABLE ({})", py_strip(last)))
+}
+
+/// The MPRIS status line behind the MPRIS availability probe of
+/// `ytm doctor` — the pure core of `_mpris_status` in
+/// `utils/doctor.py`.
+///
+/// Mirrors the pure-Python reference (`_mpris_status_text`): a falsy
+/// *is_linux* (the reference's `sys.platform != "linux"`, computed by
+/// the caller) is the n/a marker, the *system_name* thunk — the
+/// reference's `platform.system()` — invoked exactly here, exactly
+/// once, only on this branch, so the platform probe never runs on
+/// Linux — rendering into the message through `str()` exactly like the
+/// reference's f-string; otherwise the *import_mpris* thunk — the
+/// reference's `from ytm_player.services.mpris import BUS_NAME,
+/// DBUS_AVAILABLE` — supplies the pair, unpacked with CPython's own
+/// `UNPACK_SEQUENCE(2)` semantics (see `unpack_pair`), and a truthy
+/// `DBUS_AVAILABLE` element is the available line interpolating the
+/// `BUS_NAME` element through `str()` exactly like the reference's
+/// f-string, a falsy one the UNAVAILABLE fix text. An error from
+/// either thunk propagates exactly where the reference's own operation
+/// would raise it — the reference has no try around the import, so an
+/// `ImportError` surfaces instead of becoming the unavailable marker.
+/// The inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (is_linux, system_name, import_mpris))]
+fn mpris_status_text<'py>(
+    py: Python<'py>,
+    is_linux: &Bound<'py, PyAny>,
+    system_name: &Bound<'py, PyAny>,
+    import_mpris: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    if !is_linux.is_truthy()? {
+        // platform.system() — invoked exactly here, exactly once, only
+        // on this branch, exactly like the reference's f-string.
+        let system = system_name.call0()?;
+        return Ok(format!(
+            "MPRIS: n/a ({} uses its native media integration)",
+            py_str(&system)?
+        ));
+    }
+    // from ytm_player.services.mpris import BUS_NAME, DBUS_AVAILABLE —
+    // the thunk supplies the pair; the unpack is CPython's own (see
+    // unpack_pair).
+    let pair = import_mpris.call0()?;
+    let (bus_name, dbus_available) = unpack_pair(py, &pair)?;
+    if dbus_available.is_truthy()? {
+        Ok(format!(
+            "MPRIS: available (dbus-fast OK; registers as {})",
+            py_str(&bus_name)?
+        ))
+    } else {
+        Ok(
+            "MPRIS: UNAVAILABLE — dbus-fast is missing or failed to load (it's a \
+             Linux core dependency, so this install is broken/partial; an \
+             incompatible dbus-fast build logs the failure to ytm.log — see the \
+             recent-errors section below). Fix: reinstall ytm-player \
+             (pip install --force-reinstall ytm-player), or pip install dbus-fast."
+                .to_string(),
+        )
+    }
+}
+
+/// `a, b = obj` — CPython's `UNPACK_SEQUENCE(2)` exactly: the
+/// exact-tuple and exact-list fast paths (a *subclass* of either does
+/// not take them — its own `__iter__` runs, exactly like the opcode's
+/// slow path), otherwise the iterator protocol with the opcode's own
+/// error shaping — `ValueError: not enough values to unpack (expected
+/// 2, got N)` when the iterator ends early, `ValueError: too many
+/// values to unpack (expected 2)` when it keeps going, and a
+/// non-iterable reporting `TypeError: cannot unpack non-iterable <type>
+/// object`, the opcode's reformat of `GetIter`'s own TypeError.
+fn unpack_pair<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    // PyTuple_CheckExact(seq) && PyTuple_GET_SIZE(seq) == 2 — the fast
+    // path reads the items directly, no __iter__ dispatch.
+    if let Ok(tuple) = obj.downcast_exact::<PyTuple>() {
+        if tuple.len() == 2 {
+            return Ok((tuple.get_item(0)?, tuple.get_item(1)?));
+        }
+    }
+    // PyList_CheckExact(seq) && PyList_GET_SIZE(seq) == 2 — the same.
+    if let Ok(list) = obj.downcast_exact::<PyList>() {
+        if list.len() == 2 {
+            return Ok((list.get_item(0)?, list.get_item(1)?));
+        }
+    }
+    // The slow path — PyObject_GetIter, with the opcode's reformat of a
+    // non-iterable's TypeError.
+    let mut iter = match obj.try_iter() {
+        Ok(iter) => iter,
+        Err(err) => {
+            if err.is_instance_of::<PyTypeError>(py) {
+                let type_name = obj.get_type().name()?;
+                return Err(PyTypeError::new_err(format!(
+                    "cannot unpack non-iterable {type_name} object"
+                )));
+            }
+            return Err(err);
+        }
+    };
+    // Collect exactly two items, counting the successes for the
+    // not-enough message.
+    let mut items: [Option<Bound<'py, PyAny>>; 2] = [None, None];
+    let mut got = 0usize;
+    for slot in &mut items {
+        match iter.next() {
+            Some(Ok(item)) => {
+                *slot = Some(item);
+                got += 1;
+            }
+            Some(Err(err)) => return Err(err),
+            None => break, // StopIteration before the pair was filled
+        }
+    }
+    let [first, second] = items;
+    match (first, second) {
+        (Some(a), Some(b)) => {
+            // The extra-item probe: a third item is too many, the
+            // iterator ending is the reference's success.
+            match iter.next() {
+                Some(Ok(_)) => Err(PyValueError::new_err(
+                    "too many values to unpack (expected 2)",
+                )),
+                Some(Err(err)) => Err(err),
+                None => Ok((a, b)),
+            }
+        }
+        _ => Err(PyValueError::new_err(format!(
+            "not enough values to unpack (expected 2, got {got})"
+        ))),
+    }
 }

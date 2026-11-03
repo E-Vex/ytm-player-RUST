@@ -1914,6 +1914,242 @@ class TestMpvVersionText:
         assert log.count("which") == 1
 
 
+# ── The libmpv import probe behind the libmpv status line ──────────────
+
+
+class _OddStr:
+    """A message object whose ``__str__`` returns the text — or raises
+    the configured error instead (the reference's ``str()`` sits inside
+    its try block, so an ``ImportError`` from it is the OK marker)."""
+
+    def __init__(self, text, str_error=None):
+        self._text = text
+        self._str_error = str_error
+
+    def __str__(self):
+        if self._str_error is not None:
+            raise self._str_error("str broke")
+        return self._text
+
+
+class TestLibmpvStatusText:
+    """The libmpv loadability probe — on whichever backend is loaded."""
+
+    def _run(self, msg_or_error):
+        from ytm_player.utils.doctor import _libmpv_status_text
+
+        def import_player():
+            if isinstance(msg_or_error, BaseException):
+                raise msg_or_error
+            return msg_or_error
+
+        return _libmpv_status_text(import_player)
+
+    def test_import_error_is_the_ok_marker(self):
+        assert self._run(ImportError("cannot import name '_IMPORT_ERROR_MSG'")) == "libmpv: OK"
+
+    def test_module_import_failure_is_also_ok(self):
+        # The module's own import failing raises the same ImportError
+        # through the reference's single from-import — same arm.
+        assert self._run(ImportError("No module named 'mpv'")) == "libmpv: OK"
+
+    def test_the_last_line_of_the_message_renders(self):
+        assert self._run("Cannot load libmpv.\n  Linux: apt install mpv\n\nOriginal: boom") == (
+            "libmpv: NOT LOADABLE (Original: boom)"
+        )
+
+    def test_single_line_message(self):
+        assert self._run("one line") == "libmpv: NOT LOADABLE (one line)"
+
+    def test_no_trailing_newline(self):
+        assert self._run("a\nb") == "libmpv: NOT LOADABLE (b)"
+
+    def test_the_last_line_is_stripped(self):
+        assert self._run("head\n  \t padded \t ") == "libmpv: NOT LOADABLE (padded)"
+
+    def test_the_strip_is_pythons_whitespace_set(self):
+        # \x1c–\x1f are str.isspace() whitespace for CPython (and so
+        # stripped by str.strip()) but not Unicode White_Space — a trim
+        # that stops at White_Space would leave them behind.
+        assert self._run("head\n\x1cpadded\x1f") == "libmpv: NOT LOADABLE (padded)"
+
+    def test_non_breaking_space_is_stripped(self):
+        assert self._run("head\n\xa0nbsp\xa0") == "libmpv: NOT LOADABLE (nbsp)"
+
+    def test_empty_message_is_an_index_error(self):
+        # splitlines() of "" is [] — the [-1] index raises through,
+        # exactly like the reference's (the except clause covers
+        # ImportError only).
+        with pytest.raises(IndexError, match="list index out of range"):
+            self._run("")
+
+    def test_line_boundaries_are_cpythons(self):
+        # \x85 and \u2028 are str.splitlines boundaries — the last line
+        # stops at them.
+        assert self._run("a\x85b") == "libmpv: NOT LOADABLE (b)"
+        assert self._run("a\u2028b") == "libmpv: NOT LOADABLE (b)"
+
+    def test_non_import_errors_propagate(self):
+        with pytest.raises(RuntimeError, match="probe broke"):
+            self._run(RuntimeError("probe broke"))
+
+    def test_str_conversion_runs_inside_the_try(self):
+        # A message object whose __str__ raises ImportError lands in the
+        # OK arm — the reference's str() sits inside its try block.
+        assert self._run(_OddStr("ignored", ImportError)) == "libmpv: OK"
+
+    def test_str_conversion_error_of_other_kinds_propagates(self):
+        with pytest.raises(RuntimeError, match="str broke"):
+            self._run(_OddStr("ignored", RuntimeError))
+
+    def test_str_conversion_of_an_odd_object_renders_its_text(self):
+        assert self._run(_OddStr("a\nb")) == "libmpv: NOT LOADABLE (b)"
+
+    def test_the_probe_runs_exactly_once(self):
+        from ytm_player.utils.doctor import _libmpv_status_text
+
+        calls = []
+
+        def import_player():
+            calls.append("import")
+            return "a\nb"
+
+        _libmpv_status_text(import_player)
+        assert calls == ["import"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="player module imports on win32 too")
+    def test_the_real_player_probe(self):
+        # The production thunk shape: the wrapper's import against the
+        # real player module — either the OK marker (libmpv loadable) or
+        # the NOT LOADABLE line naming the message's last line.
+        from ytm_player.utils.doctor import _libmpv_status
+
+        status = _libmpv_status()
+        assert status == "libmpv: OK" or status.startswith("libmpv: NOT LOADABLE (")
+
+
+# ── The MPRIS import probe behind the MPRIS status line ────────────────
+
+
+class TestMprisStatusText:
+    """The MPRIS availability probe — on whichever backend is loaded."""
+
+    def _run(self, is_linux, system_name, pair_or_error):
+        from ytm_player.utils.doctor import _mpris_status_text
+
+        def import_mpris():
+            if isinstance(pair_or_error, BaseException):
+                raise pair_or_error
+            return pair_or_error
+
+        return _mpris_status_text(is_linux, system_name, import_mpris)
+
+    def test_non_linux_is_na_with_the_system_name(self):
+        assert self._run(False, lambda: "Darwin", RuntimeError("never imported")) == (
+            "MPRIS: n/a (Darwin uses its native media integration)"
+        )
+
+    def test_the_system_probe_never_runs_on_linux(self):
+        def system_name():
+            raise RuntimeError("platform.system() must not run on Linux")
+
+        assert self._run(True, system_name, ("org.mpris.MediaPlayer2.ytm_player", True)) == (
+            "MPRIS: available (dbus-fast OK; registers as org.mpris.MediaPlayer2.ytm_player)"
+        )
+
+    def test_available_line_names_the_bus_name(self):
+        assert self._run(True, None, ("org.mpris.MediaPlayer2.ytm_player", True)) == (
+            "MPRIS: available (dbus-fast OK; registers as org.mpris.MediaPlayer2.ytm_player)"
+        )
+
+    def test_unavailable_text_carries_the_fix(self):
+        text = self._run(True, None, ("org.mpris.MediaPlayer2.ytm_player", False))
+        assert text == (
+            "MPRIS: UNAVAILABLE — dbus-fast is missing or failed to load (it's a "
+            "Linux core dependency, so this install is broken/partial; an "
+            "incompatible dbus-fast build logs the failure to ytm.log — see the "
+            "recent-errors section below). Fix: reinstall ytm-player "
+            "(pip install --force-reinstall ytm-player), or pip install dbus-fast."
+        )
+
+    def test_truthiness_decides_the_verdict(self):
+        # The reference's `if DBUS_AVAILABLE:` — Python truthiness, not
+        # an is-True check.
+        assert "available" in self._run(True, None, ("n", 1))
+        assert "available" in self._run(True, None, ("n", "yes"))
+        assert "UNAVAILABLE" in self._run(True, None, ("n", 0))
+        assert "UNAVAILABLE" in self._run(True, None, ("n", ""))
+        assert "UNAVAILABLE" in self._run(True, None, ("n", None))
+
+    def test_bus_name_renders_through_str(self):
+        assert self._run(True, None, (_OddStr("bus-of-î"), True)) == (
+            "MPRIS: available (dbus-fast OK; registers as bus-of-î)"
+        )
+
+    def test_import_error_propagates(self):
+        # Unlike the libmpv probe, the reference has no try around the
+        # import — an ImportError surfaces, it is not the marker.
+        with pytest.raises(ImportError, match="No module named 'dbus_fast'"):
+            self._run(True, None, ImportError("No module named 'dbus_fast'"))
+
+    def test_system_probe_error_propagates(self):
+        with pytest.raises(RuntimeError, match="system broke"):
+            self._run(False, lambda: (_ for _ in ()).throw(RuntimeError("system broke")), None)
+
+    def test_short_pair_is_a_value_error(self):
+        with pytest.raises(ValueError, match="not enough values to unpack \\(expected 2, got 1\\)"):
+            self._run(True, None, ("name",))
+
+    def test_long_pair_is_a_value_error(self):
+        with pytest.raises(ValueError, match="too many values to unpack \\(expected 2\\)"):
+            self._run(True, None, ("a", "b", "c"))
+
+    def test_non_iterable_pair_is_a_type_error(self):
+        with pytest.raises(TypeError, match="cannot unpack non-iterable int object"):
+            self._run(True, None, 5)
+
+    def test_the_pair_unpacks_like_cpythons_opcode(self):
+        # A generator, an __getitem__ sequence and a 2-char string all
+        # unpack through the iterator protocol exactly like
+        # UNPACK_SEQUENCE(2).
+        assert self._run(True, None, (g for g in ("gen-name", 1))) == (
+            "MPRIS: available (dbus-fast OK; registers as gen-name)"
+        )
+        assert self._run(True, None, "a1") == "MPRIS: available (dbus-fast OK; registers as a)"
+        assert "UNAVAILABLE" in self._run(True, None, (g for g in ("n", "")))
+
+    def test_the_system_probe_runs_exactly_once(self):
+        calls = []
+
+        def system_name():
+            calls.append("system")
+            return "Darwin"
+
+        self._run(False, system_name, RuntimeError("never imported"))
+        assert calls == ["system"]
+
+    def test_falsy_is_linux_shapes(self):
+        # The caller-computed gate follows the reference's own
+        # truthiness — any falsy value is the n/a branch.
+        assert self._run(0, lambda: "OS/2", RuntimeError("never")) == (
+            "MPRIS: n/a (OS/2 uses its native media integration)"
+        )
+        assert self._run(None, lambda: "Haiku", RuntimeError("never")) == (
+            "MPRIS: n/a (Haiku uses its native media integration)"
+        )
+
+    def test_the_real_probe_on_this_platform(self):
+        # The production thunk shape: the wrapper's platform gate and
+        # import against the real mpris module.
+        from ytm_player.utils.doctor import _mpris_status
+
+        status = _mpris_status()
+        if sys.platform == "linux":
+            assert "MPRIS: " in status
+        else:
+            assert "MPRIS: n/a (" in status
+
+
 # ── Native vs fallback parity for the two probe engines ────────────────
 
 # Both matrices are shared with the child interpreter as JSON, so every
@@ -2346,3 +2582,371 @@ class TestMpvVersionNativeParity:
             assert n["log"].count("which") == 1
             if not case["which"]:
                 assert len(n["log"]) == 1
+
+
+# ── libmpv import-probe native vs fallback parity ──────────────────────
+
+# The matrices below are shared with the child interpreter as JSON, so
+# every value must be JSON-round-trippable. Case shape:
+# {"msg": str, "raise_exc": str | None, "odd_str": bool,
+#  "str_error": str | None} — the thunk returns the message (or an odd
+# object whose __str__ renders it / raises the configured error), or
+# raises the configured exception.
+_LIBMPV_PARITY_CASES = [
+    {"msg": "Cannot load libmpv.\n  Linux: apt install\n\nOriginal: boom"},
+    {"msg": "one line"},
+    {"msg": "a\nb"},  # no trailing newline
+    {"msg": ""},  # splitlines() is [] — the IndexError
+    {"msg": "\n"},  # splitlines() is [''] — the empty last line
+    {"msg": "head\n  \t padded \t "},  # the strip
+    {"msg": "head\n\x1cpadded\x1f"},  # CPython whitespace, not White_Space
+    {"msg": "head\n\xa0nbsp\xa0"},
+    {"msg": "a\x85b"},  # CPython line boundary
+    {"msg": "a\u2028b"},  # the other one
+    {"msg": "a\rb\rc"},  # \r boundaries
+    {"msg": "a\r\nb"},  # the \r\n single boundary
+    {"msg": "ünïcode\nlïne ✓"},  # unicode message
+    # The thunk raising.
+    {"msg": "", "raise_exc": "ImportError"},
+    {"msg": "", "raise_exc": "RuntimeError"},
+    # An odd message object whose __str__ renders the text.
+    {"msg": "x\ny", "odd_str": True},
+    # Whose __str__ raises — the ImportError arm is the OK marker (the
+    # reference's str() sits inside its try block), the others surface.
+    {"msg": "x", "odd_str": True, "str_error": "ImportError"},
+    {"msg": "x", "odd_str": True, "str_error": "RuntimeError"},
+]
+
+_LIBMPV_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _libmpv_status_text
+
+ERRORS = {"ImportError": ImportError, "RuntimeError": RuntimeError}
+
+
+class OddStr:
+    def __init__(self, text, str_error):
+        self._text = text
+        self._str_error = str_error
+
+    def __str__(self):
+        if self._str_error:
+            raise ERRORS[self._str_error]("str broke")
+        return self._text
+
+
+def build(case):
+    log = []
+
+    def import_player():
+        log.append("import")
+        if case.get("raise_exc"):
+            raise ERRORS[case["raise_exc"]]("probe broke")
+        if case.get("odd_str"):
+            return OddStr(case["msg"], case.get("str_error"))
+        return case["msg"]
+
+    return import_player, log
+
+
+def outcome(case):
+    import_player, log = build(case)
+    try:
+        return {"ok": _libmpv_status_text(import_player), "log": log}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": log}
+
+
+cases = json.load(sys.stdin)
+json.dump([outcome(case) for case in cases], sys.stdout)
+"""
+
+
+def _libmpv_thunks(case):
+    """The import thunk for a synthetic libmpv probe case, plus the log."""
+
+    class _OddStr:
+        def __init__(self, text, str_error):
+            self._text = text
+            self._str_error = str_error
+
+        def __str__(self):
+            if self._str_error is not None:
+                raise _ERRORS[self._str_error]("str broke")
+            return self._text
+
+    log: list[str] = []
+
+    def import_player():
+        log.append("import")
+        if case.get("raise_exc"):
+            raise _ERRORS[case["raise_exc"]]("probe broke")
+        if case.get("odd_str"):
+            return _OddStr(case["msg"], case.get("str_error"))
+        return case["msg"]
+
+    return import_player, log
+
+
+_ERRORS = {"ImportError": ImportError, "RuntimeError": RuntimeError}
+
+
+class TestLibmpvStatusNativeParity:
+    """When the Rust extension is built, the native libmpv probe must
+    decide exactly like the pure-Python reference — same status lines,
+    same OK markers, same error shapes — for every case, so the two
+    implementations cannot drift."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_libmpv_status_text_matches_fallback(self):
+        from ytm_player.utils.doctor import _libmpv_status_text
+
+        result = subprocess.run(
+            [sys.executable, "-c", _LIBMPV_CHILD_PROG],
+            input=json.dumps(_LIBMPV_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = []
+        for case in _LIBMPV_PARITY_CASES:
+            import_player, log = _libmpv_thunks(case)
+            try:
+                native.append({"ok": _libmpv_status_text(import_player), "log": log})
+            except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+                native.append({"error": f"{type(exc).__name__}: {exc}", "log": log})
+        for case, n, f in zip(_LIBMPV_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback libmpv probe outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # The probe-timing contract, pinned by the compared call logs:
+        # the import thunk always runs exactly once.
+        for n in native:
+            assert n["log"] == ["import"]
+
+
+# ── MPRIS import-probe native vs fallback parity ───────────────────────
+
+# Case shape: {"is_linux": bool, "system": str, "bus_name": str,
+# "dbus_available": <json value>, "pair_kind": "tuple" | "list" | "gen" |
+# "str" | "non_iterable" | "short" | "long", "raise_exc": str | None,
+# "system_error": str | None}.
+_MPRIS_PARITY_CASES = [
+    {"is_linux": False, "system": "Darwin", "bus_name": "n", "dbus_available": True},
+    {"is_linux": False, "system": "Windows", "bus_name": "n", "dbus_available": False},
+    {"is_linux": False, "system": "OS/2", "bus_name": "n", "dbus_available": True},
+    # The system probe's own failure surfaces on the n/a branch.
+    {
+        "is_linux": False,
+        "system": "Darwin",
+        "system_error": "RuntimeError",
+        "bus_name": "n",
+        "dbus_available": True,
+    },
+    # The Linux branch — the import never even runs off Linux.
+    {"is_linux": True, "system": "never read", "bus_name": "org.mpris.ytm", "dbus_available": True},
+    {
+        "is_linux": True,
+        "system": "never read",
+        "bus_name": "org.mpris.ytm",
+        "dbus_available": False,
+    },
+    # Truthiness of the DBUS_AVAILABLE element.
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": 1},
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": 0},
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": ""},
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": None},
+    # The bus name renders through str().
+    {"is_linux": True, "system": "", "bus_name": "ünïcode ✓", "dbus_available": True},
+    {"is_linux": True, "system": "", "bus_name": "", "dbus_available": True},
+    # The import raising — an ImportError surfaces, it is not the marker.
+    {
+        "is_linux": True,
+        "system": "",
+        "bus_name": "n",
+        "dbus_available": True,
+        "raise_exc": "ImportError",
+    },
+    {
+        "is_linux": True,
+        "system": "",
+        "bus_name": "n",
+        "dbus_available": True,
+        "raise_exc": "RuntimeError",
+    },
+    # The pair's own shape — CPython's UNPACK_SEQUENCE(2) semantics.
+    {
+        "is_linux": True,
+        "system": "",
+        "bus_name": "gen-name",
+        "dbus_available": 1,
+        "pair_kind": "gen",
+    },
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": True, "pair_kind": "list"},
+    {"is_linux": True, "system": "", "bus_name": "a", "dbus_available": "1", "pair_kind": "str"},
+    {
+        "is_linux": True,
+        "system": "",
+        "bus_name": "n",
+        "dbus_available": True,
+        "pair_kind": "non_iterable",
+    },
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": True, "pair_kind": "short"},
+    {"is_linux": True, "system": "", "bus_name": "n", "dbus_available": True, "pair_kind": "long"},
+]
+
+_MPRIS_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.utils.doctor import _mpris_status_text
+
+ERRORS = {"ImportError": ImportError, "RuntimeError": RuntimeError}
+
+
+def build_pair(case):
+    kind = case.get("pair_kind", "tuple")
+    bus_name = case["bus_name"]
+    dbus = case["dbus_available"]
+    if kind == "tuple":
+        return (bus_name, dbus)
+    if kind == "list":
+        return [bus_name, dbus]
+    if kind == "gen":
+        return (v for v in (bus_name, dbus))
+    if kind == "str":
+        return str(bus_name) + str(dbus)
+    if kind == "non_iterable":
+        return 5
+    if kind == "short":
+        return (bus_name,)
+    if kind == "long":
+        return (bus_name, dbus, "extra")
+    raise AssertionError(kind)
+
+
+def build(case):
+    log = []
+
+    def system_name():
+        log.append("system")
+        if case.get("system_error"):
+            raise ERRORS[case["system_error"]]("system broke")
+        return case["system"]
+
+    def import_mpris():
+        log.append("import")
+        if case.get("raise_exc"):
+            raise ERRORS[case["raise_exc"]]("probe broke")
+        return build_pair(case)
+
+    return system_name, import_mpris, log
+
+
+def outcome(case):
+    system_name, import_mpris, log = build(case)
+    try:
+        text = _mpris_status_text(case["is_linux"], system_name, import_mpris)
+        return {"ok": text, "log": log}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": log}
+
+
+cases = json.load(sys.stdin)
+json.dump([outcome(case) for case in cases], sys.stdout)
+"""
+
+
+def _mpris_thunks(case):
+    """The system + import thunks for a synthetic MPRIS probe case, plus
+    the log."""
+    log: list[str] = []
+
+    def build_pair():
+        kind = case.get("pair_kind", "tuple")
+        bus_name = case["bus_name"]
+        dbus = case["dbus_available"]
+        if kind == "tuple":
+            return (bus_name, dbus)
+        if kind == "list":
+            return [bus_name, dbus]
+        if kind == "gen":
+            return (v for v in (bus_name, dbus))
+        if kind == "str":
+            return str(bus_name) + str(dbus)
+        if kind == "non_iterable":
+            return 5
+        if kind == "short":
+            return (bus_name,)
+        if kind == "long":
+            return (bus_name, dbus, "extra")
+        raise AssertionError(kind)
+
+    def system_name():
+        log.append("system")
+        if case.get("system_error"):
+            raise _ERRORS[case["system_error"]]("system broke")
+        return case["system"]
+
+    def import_mpris():
+        log.append("import")
+        if case.get("raise_exc"):
+            raise _ERRORS[case["raise_exc"]]("probe broke")
+        return build_pair()
+
+    return system_name, import_mpris, log
+
+
+class TestMprisStatusNativeParity:
+    """When the Rust extension is built, the native MPRIS probe must
+    decide exactly like the pure-Python reference — same verdicts, same
+    n/a renders, same probe timings, same unpack error shapes — for
+    every case, so the two implementations cannot drift."""
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_mpris_status_text_matches_fallback(self):
+        from ytm_player.utils.doctor import _mpris_status_text
+
+        result = subprocess.run(
+            [sys.executable, "-c", _MPRIS_CHILD_PROG],
+            input=json.dumps(_MPRIS_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = []
+        for case in _MPRIS_PARITY_CASES:
+            system_name, import_mpris, log = _mpris_thunks(case)
+            try:
+                native.append(
+                    {
+                        "ok": _mpris_status_text(case["is_linux"], system_name, import_mpris),
+                        "log": log,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+                native.append({"error": f"{type(exc).__name__}: {exc}", "log": log})
+        for case, n, f in zip(_MPRIS_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback MPRIS probe outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # The probe-timing contract, pinned by the compared call logs:
+        # the system probe never runs on the Linux branch, and the
+        # import never runs off it.
+        for case, n in zip(_MPRIS_PARITY_CASES, native):
+            if case["is_linux"]:
+                assert n["log"] == ["import"], f"system probe ran on Linux: {case!r}"
+            else:
+                assert n["log"] == ["system"] or n["log"] == [], f"import ran off Linux: {case!r}"
