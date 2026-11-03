@@ -641,28 +641,74 @@ class TestCrashStalenessPep440:
         assert self.note("version: " + "9" * 5000 + "\n", "2.1.0") is None
         assert self.note("version: 1.0+" + "9" * 5000 + "\n", "2.1.0") is None
 
-    def test_unicode_folds_are_admitted(self):
+    def test_unicode_folds_follow_the_installed_packaging(self):
         # CPython's re.IGNORECASE folds a handful of non-ASCII letters onto
-        # ASCII ones, and packaging compiles its PEP 440 grammar with no
-        # ASCII scoping: the long s (U+017F), the Kelvin sign (U+212A) and
-        # the dotted and dotless i (U+0130/U+0131) are valid local-segment
-        # material, and the s of "post" / the i of "preview" accept their
-        # folds — so every one of these is a valid version older than 2.1.0.
-        assert self.note("version: 1.0+\u017f\n", "2.1.0") is not None  # ſ (long s)
-        assert self.note("version: 1.0+\u212a\n", "2.1.0") is not None  # K (Kelvin sign)
-        assert self.note("version: 1.0+\u0130\n", "2.1.0") is not None  # İ (dotted capital i)
-        assert self.note("version: 1.0+\u0131\n", "2.1.0") is not None  # ı (dotless i)
-        assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is not None
-        assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0") is not None
+        # ASCII ones. packaging compiled its PEP 440 grammar with no ASCII
+        # scoping through 26.0 — the long s (U+017F), the Kelvin sign
+        # (U+212A) and the dotted and dotless i (U+0130/U+0131) were valid
+        # local-segment material, and the s of "post" / the i of "preview"
+        # accepted their folds — while 26.1+ scopes the grammar's groups
+        # (?a:...) and rejects the same spellings. The engine's contract is
+        # to agree with whichever packaging release is installed (the same
+        # Version() the pure-Python fallback itself calls), so the expected
+        # verdict is computed from that Version, not pinned to either side.
+        from packaging.version import Version
+
+        def parses(v: str) -> bool:
+            try:
+                Version(v)
+            except ValueError:
+                return False
+            return True
+
+        folds_admitted = parses("1.0+\u017f")
+        assert folds_admitted == parses("1.0+\u212a")
+        assert folds_admitted == parses("1.0+\u0130")
+        assert folds_admitted == parses("1.0po\u017ft1")
+        assert folds_admitted == parses("2.1.0prev\u0131ew1")
+
+        expected = (
+            "⚠ This crash was recorded by ytm-player 1.0+\u017f, older than "
+            "the installed 2.1.0 — it may already be fixed. Reproduce on "
+            "the current version before reporting."
+        )
+        if folds_admitted:
+            assert self.note("version: 1.0+\u017f\n", "2.1.0") == expected  # ſ (long s)
+            assert self.note("version: 1.0+\u212a\n", "2.1.0") is not None  # K (Kelvin sign)
+            assert self.note("version: 1.0+\u0130\n", "2.1.0") is not None  # İ (dotted capital i)
+            assert self.note("version: 1.0+\u0131\n", "2.1.0") is not None  # ı (dotless i)
+            assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is not None
+            assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0") is not None
+        else:
+            # packaging 26.1+: the fold spellings are InvalidVersion, so
+            # every one of these is a no-verdict instead.
+            assert self.note("version: 1.0+\u017f\n", "2.1.0") is None
+            assert self.note("version: 1.0+\u212a\n", "2.1.0") is None
+            assert self.note("version: 1.0+\u0130\n", "2.1.0") is None
+            assert self.note("version: 1.0+\u0131\n", "2.1.0") is None
+            assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is None
+            assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0") is None
 
     def test_exotic_marker_spellings_keep_their_raw_order(self):
-        # packaging normalises only the exact marker spellings; a fold
-        # spelling like "prevıew" or "poſt" survives the lower() untouched
-        # and compares as its own string — between b and rc for the
-        # pre-release letter, above "post" for the post one — while the
-        # plain spellings collapse onto their canonical letters.
+        # packaging normalises only the exact marker spellings; on a
+        # fold-admitting packaging (<= 26.0) a spelling like "prevıew" or
+        # "poſt" survives the lower() untouched and compares as its own
+        # string — between b and rc for the pre-release letter, above
+        # "post" for the post one — while the plain spellings collapse
+        # onto their canonical letters. The alpha/beta pair below is
+        # packaging-independent; the fold pairs run only where the
+        # installed packaging admits folds (26.1+ rejects the spellings
+        # outright, a no-verdict on both backends).
+        from packaging.version import Version
+
         assert self.note("version: 2.1.0alpha1\n", "2.1.0b1") is not None
         assert self.note("version: 2.1.0b1\n", "2.1.0alpha1") is None
+
+        try:
+            Version("2.1.0prev\u0131ew1")
+        except ValueError:
+            return  # installed packaging rejects fold spellings
+
         assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0rc1") is not None
         assert self.note("version: 2.1.0rc1\n", "2.1.0prev\u0131ew1") is None
         assert self.note("version: 1.0-1\n", "1.0-po\u017ft") is not None
@@ -1344,6 +1390,74 @@ class TestCrashStalenessNativeParity:
                 f"native:   {nv!r}\n"
                 f"fallback: {fb!r}"
             )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_both_packaging_grammar_shapes_are_reachable(self):
+        """The engine's fold flag selects between the two grammars
+        packaging has shipped, regardless of which one is installed.
+
+        With ``admit_unicode_folds=True`` (packaging <= 26.0's unscoped
+        ``re.IGNORECASE``) the fold spellings parse and order by their raw
+        characters; with ``False`` (26.1+ ``(?a:...)`` scoping) the same
+        spellings are no-verdicts. Every non-fold verdict is identical
+        across both shapes — the grammars differ in exactly three
+        positions, none of which an ASCII spelling can reach.
+        """
+        from ytm_player.utils._ytm_player_native import crash_staleness_note
+
+        fold_cases = [
+            ("version: 1.0+\u017f\n", "2.1.0"),  # ſ local
+            ("version: 1.0+\u212a\n", "2.1.0"),  # K local
+            ("version: 1.0+\u0130\n", "2.1.0"),  # İ local
+            ("version: 1.0+\u0131\n", "2.1.0"),  # ı local
+            ("version: 1.0po\u017ft1\n", "2.1.0"),  # poſt marker
+            ("version: 2.1.0prev\u0131ew1\n", "2.1.0"),  # prevıew marker
+            ("version: 2.1.0prev\u0130ew1\n", "2.1.0"),  # prevİew marker
+            ("version: 2.1.0prev\u0131ew1\n", "2.1.0rc1"),  # raw ordering
+            ("version: 1.0-1\n", "1.0-po\u017ft"),  # raw post ordering
+        ]
+        for content, current in fold_cases:
+            assert crash_staleness_note(content, current, True) is not None, (content, current)
+            assert crash_staleness_note(content, current, False) is None, (content, current)
+
+        # The surrounding grammar is shared: ASCII spellings give the same
+        # verdict under both shapes — a stale note or none, as pinned.
+        shared_cases = [
+            ("version: 1.9.4\n", "2.1.0", True),
+            ("version: 2.1.0\n", "2.1.0", False),
+            ("version: 2.1.0rc1\n", "2.1.0", True),
+            ("version: 2.1.0alpha1\n", "2.1.0b1", True),
+            ("version: 2.1.0.post1\n", "2.1.0", False),
+            ("version: 2.1.0.dev1\n", "2.1.0a1", True),
+            ("version: 2.1.0+build.1\n", "2.1.0+build.2", True),
+            ("version: not-a-version\n", "2.1.0", False),
+            ("version: 1.0++local\n", "2.1.0", False),
+        ]
+        for content, current, stale in shared_cases:
+            a = crash_staleness_note(content, current, True)
+            b = crash_staleness_note(content, current, False)
+            assert a == b, (content, current, a, b)
+            assert (a is not None) is stale, (content, current, a)
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_probe_flag_matches_the_installed_packaging(self):
+        """The production wrapper's probe steers the engine to the
+        installed packaging's verdict, whichever release that is."""
+        from packaging.version import Version
+
+        import ytm_player.utils.doctor as doctor_mod
+
+        try:
+            Version("1.0+\u017f")
+            admitted = True
+        except ValueError:
+            admitted = False
+
+        assert doctor_mod._packaging_admits_unicode_folds() is admitted
+        assert doctor_mod._PACKAGING_ADMITS_UNICODE_FOLDS is admitted
+
+        note = doctor_mod._crash_staleness_note("version: 1.0+\u017f\n", "2.1.0")
+        assert (note is not None) is admitted
 
 
 # ── The /proc walk behind the Process status section ───────────────────

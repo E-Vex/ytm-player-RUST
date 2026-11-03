@@ -463,6 +463,13 @@ def _crash_staleness_note(content: str, current_version: str) -> str | None:
     accepting any key-shaped line, would let an exception line (``ValueError:
     x``) or a ``version:``-shaped traceback line produce a bogus verdict.
 
+    The PEP 440 comparison is whatever the installed ``packaging`` says it
+    is: through 26.0 its grammar admitted the simple Unicode case folds
+    (``1.0+ſ``, ``1.0prevıew`` parse), 26.1+ scopes them out — so the
+    verdict for such spellings follows the installed release. The native
+    engine probes the same behaviour once and mirrors it (see
+    ``_packaging_admits_unicode_folds``).
+
     Implemented by the Rust extension
     (``_ytm_player_native.crash_staleness_note``) when it is built;
     this pure-Python transcription is the fallback otherwise.
@@ -682,6 +689,10 @@ def gather_diagnostics() -> str:
 # functions any earlier would be clobbered by the ``def`` statements (the
 # lesson that produced formatting.py's dead native bindings).
 
+# Cache for the installed-packaging fold probe (see
+# _packaging_admits_unicode_folds below): None = not probed yet.
+_PACKAGING_ADMITS_UNICODE_FOLDS: bool | None = None
+
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         crash_staleness_note as _native_crash_staleness_note,
@@ -689,7 +700,40 @@ try:
 except ImportError:
     pass
 else:
-    _crash_staleness_note = _native_crash_staleness_note  # type: ignore[assignment]
+
+    def _packaging_admits_unicode_folds() -> bool:
+        """True when the installed ``packaging`` PEP 440 grammar admits the
+        simple Unicode case folds — the long s ``ſ`` (U+017F), the Kelvin
+        sign ``K`` (U+212A), the dotted and dotless ``İ``/``ı``
+        (U+0130/U+0131) — wherever a letter can appear.
+
+        ``packaging`` compiled its version grammar with plain
+        ``re.IGNORECASE`` through 26.0, so those folds parsed as valid
+        versions there (``Version("1.0+ſ")`` works); 26.1 scoped the
+        grammar's groups ``(?a:...)`` and the local alphabet ASCII, so the
+        same spellings are ``InvalidVersion`` now. The pure-Python
+        fallback follows the installed ``packaging`` by construction — it
+        calls ``Version`` directly — so the native engine must follow it
+        too: this probe (one parse attempt, cached) is the verdict both
+        sides agree on, whichever ``packaging`` the uncapped
+        ``>=21.0`` dependency range admits.
+        """
+        global _PACKAGING_ADMITS_UNICODE_FOLDS
+        if _PACKAGING_ADMITS_UNICODE_FOLDS is None:
+            try:
+                Version("1.0+\u017f")
+            except ValueError:
+                _PACKAGING_ADMITS_UNICODE_FOLDS = False
+            else:
+                _PACKAGING_ADMITS_UNICODE_FOLDS = True
+        return _PACKAGING_ADMITS_UNICODE_FOLDS
+
+    def _crash_staleness_note(content: str, current_version: str) -> str | None:  # noqa: F811
+        """Crash-staleness verdict (native), on the installed packaging's grammar."""
+        return _native_crash_staleness_note(
+            content, current_version, _packaging_admits_unicode_folds()
+        )
+
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
