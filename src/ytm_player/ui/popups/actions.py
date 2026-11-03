@@ -1,4 +1,15 @@
-"""Context action menu popup for tracks, albums, artists, and playlists."""
+"""Context action menu popup for tracks, albums, artists, and playlists.
+
+The menu builder — ``_build_actions`` — is dual-implemented: the Rust
+extension (``_ytm_player_native.build_actions``) implements it when it
+is built, and the pure-Python transcription below runs otherwise; the
+bottom-of-module seam rebinds the builder to the native function when
+the extension is importable. The per-type catalogs
+(``TRACK_ACTIONS`` & co.) stay the module's public data — the app's
+artist-actions flow extends ``ARTIST_ACTIONS`` with its ``_back`` entry
+— and the Rust side carries the same tables, pinned together by the
+parity tests.
+"""
 
 from __future__ import annotations
 
@@ -83,6 +94,10 @@ def _build_actions(
     "Add to Queue" gets swapped for "Remove from Queue" in that case.
     *in_playlist* signals the track is being viewed inside a playlist —
     "Remove from Playlist" is shown in that case.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.build_actions``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     base = list(_ACTIONS_BY_TYPE.get(item_type, TRACK_ACTIONS))
     result: list[tuple[str, str]] = []
@@ -258,3 +273,33 @@ class ActionsPopup(BasePopup[str | None]):
             item = list_view.highlighted_child
             if isinstance(item, _ActionItem):
                 self.dismiss(item.action_id)
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same menu builder; this binding
+# overrides the pure-Python reference above when the extension is
+# importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        build_actions as _native_build_actions,
+    )
+except ImportError:
+    pass
+else:
+
+    def _build_actions(  # noqa: F811
+        item: dict[str, Any],
+        item_type: str,
+        *,
+        in_queue: bool = False,
+        in_playlist: bool = False,
+        source: str = "default",
+    ) -> list[tuple[str, str]]:
+        """The context-menu action list (native Rust engine)."""
+        return _native_build_actions(
+            item, item_type, in_queue=in_queue, in_playlist=in_playlist, source=source
+        )

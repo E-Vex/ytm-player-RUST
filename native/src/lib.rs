@@ -396,6 +396,29 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // behind keymap.toml loading, applied by the Python caller as it
     // replays the plan.
     module.add_function(pyo3::wrap_pyfunction!(keymap_load_plan, module)?)?;
+
+    // Actions-popup menu builder (ui/popups/actions.py equivalent): the
+    // context-menu assembly behind every track/album/artist/playlist
+    // action menu — the per-type catalog walk with the queue-membership
+    // swap, the playlist-view and search-source gates, and the
+    // like/subscribe label flips.
+    module.add_function(pyo3::wrap_pyfunction!(build_actions, module)?)?;
+
+    // Progress-bar render geometry (ui/widgets/progress_bar.py
+    // equivalents): the progress fraction, the time-prefix/suffix/
+    // bar-width metrics, the filled/empty/marker cell computation behind
+    // every bar render tick, and the click-to-seek column mapping.
+    module.add_function(pyo3::wrap_pyfunction!(progress_fraction, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(progress_bar_metrics, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(progress_bar_cells, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(progress_x_to_seconds, module)?)?;
+
+    // Synced-lyrics LRC parser (ui/sidebars/lyrics_sidebar.py
+    // equivalent): the timestamp extraction behind every string-lyrics
+    // load — the [mm:ss(.fff)] match at each line's start, the
+    // fractional-second conversion, the timestamp stripping and the
+    // stable timestamp sort.
+    module.add_function(pyo3::wrap_pyfunction!(parse_synced_lyrics, module)?)?;
     Ok(())
 }
 
@@ -8899,4 +8922,393 @@ fn keymap_load_plan<'py>(
         }
     }
     Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// Actions-popup menu builder
+// ---------------------------------------------------------------------------
+
+/// The track catalog: `(action_id, label)` in dispatch order. Mirrors
+/// `TRACK_ACTIONS` from `ui/popups/actions.py` — static data on both
+/// backends, pinned together by the parity tests.
+const ACTIONS_TRACK: &[(&str, &str)] = &[
+    ("play", "Play"),
+    ("play_next", "Play Next"),
+    ("add_to_queue", "Add to Queue"),
+    ("download", "Download for Offline"),
+    ("start_radio", "Start Radio"),
+    ("go_to_artist", "Go to Artist"),
+    ("go_to_album", "Go to Album"),
+    ("add_to_playlist", "Add to Playlist"),
+    ("remove_from_playlist", "Remove from Playlist"),
+    ("toggle_like", "Like"),
+    ("copy_link", "Copy Link"),
+];
+
+/// The album catalog. Mirrors `ALBUM_ACTIONS` from `ui/popups/actions.py`.
+const ACTIONS_ALBUM: &[(&str, &str)] = &[
+    ("play_all", "Play All"),
+    ("shuffle_play", "Shuffle Play"),
+    ("add_to_library", "Add to Library"),
+    ("play_next", "Play Next"),
+    ("add_to_queue", "Add to Queue"),
+    ("go_to_artist", "Go to Artist"),
+    ("copy_link", "Copy Link"),
+];
+
+/// The artist catalog. Mirrors `ARTIST_ACTIONS` from `ui/popups/actions.py`.
+const ACTIONS_ARTIST: &[(&str, &str)] = &[
+    ("go_to_artist", "Go to Artist"),
+    ("play_top_songs", "Play Top Songs"),
+    ("start_radio", "Start Radio"),
+    ("toggle_subscribe", "Subscribe"),
+    ("view_similar", "View Similar Artists"),
+    ("copy_link", "Copy Link"),
+];
+
+/// The playlist catalog. Mirrors `PLAYLIST_ACTIONS` from
+/// `ui/popups/actions.py`.
+const ACTIONS_PLAYLIST: &[(&str, &str)] = &[
+    ("play_all", "Play All"),
+    ("shuffle_play", "Shuffle Play"),
+    ("play_next", "Play Next"),
+    ("add_to_queue", "Add to Queue"),
+    ("start_radio", "Start Radio"),
+    ("copy_link", "Copy Link"),
+    ("edit", "Edit Playlist"),
+    ("delete", "Delete Playlist"),
+];
+
+/// The context-menu assembly behind `ActionsPopup` — the pure core of
+/// `_build_actions` from `ui/popups/actions.py`. Walks the *item_type*'s
+/// catalog in dispatch order, arm for arm like the reference:
+///
+/// - `add_to_queue` becomes `("remove_from_queue", "Remove from Queue")`
+///   when *in_queue* is set (the swap runs before the gates, so the
+///   replaced id is what the later checks see — a no-op here, but the
+///   reference's order).
+/// - `remove_from_playlist` is dropped unless *in_playlist* is set.
+/// - `toggle_like` reads `item.get("likeStatus") == "LIKE"` (Python `==`,
+///   exotic objects steering) `or item.get("liked", False)` for its
+///   `Unlike`/`Like` label.
+/// - `toggle_subscribe` reads truthy `item.get("subscribed", False)` for
+///   its `Unsubscribe`/`Subscribe` label.
+/// - `go_to_artist` needs a truthy `artists` or a truthy `artist`.
+/// - `go_to_album` needs a truthy `album_id`, or an `album` that is a
+///   dict (subclasses included) with a truthy `id` — the `.get` runs
+///   only when the isinstance gate passes, like the reference's `and`.
+/// - `delete` is dropped for playlists when *source* is `"search"`.
+///
+/// Field reads resolve exactly like the reference's `.get` calls (see
+/// `field_get`); a `.get`-less item reads as field-less where the
+/// reference would raise — the engine stays total (the `filter_sort_tracks`
+/// precedent). A fresh list of fresh tuples comes back on every call;
+/// the item is never mutated.
+#[pyfunction]
+#[pyo3(signature = (item, item_type, *, in_queue = false, in_playlist = false, source = "default"))]
+fn build_actions<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    item_type: &str,
+    in_queue: bool,
+    in_playlist: bool,
+    source: &str,
+) -> PyResult<Vec<(String, String)>> {
+    // base = list(_ACTIONS_BY_TYPE.get(item_type, TRACK_ACTIONS))
+    let base = match item_type {
+        "album" => ACTIONS_ALBUM,
+        "artist" => ACTIONS_ARTIST,
+        "playlist" => ACTIONS_PLAYLIST,
+        // "track" and every unknown type alike — the dict lookup's default.
+        _ => ACTIONS_TRACK,
+    };
+    let false_default = false.into_pyobject(py)?.to_owned().into_any();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(base.len());
+    for (base_id, base_label) in base {
+        let mut action_id = *base_id;
+        let mut label = *base_label;
+        // if action_id == "add_to_queue" and in_queue: swap both halves.
+        if action_id == "add_to_queue" && in_queue {
+            action_id = "remove_from_queue";
+            label = "Remove from Queue";
+        }
+        // if action_id == "remove_from_playlist" and not in_playlist: continue
+        if action_id == "remove_from_playlist" && !in_playlist {
+            continue;
+        }
+        // if action_id == "toggle_like": Unlike / Like.
+        if action_id == "toggle_like" {
+            let like_status = field_get(py, item, "likeStatus", None)?;
+            let liked = field_get(py, item, "liked", Some(false_default.clone()))?;
+            let is_liked = like_status.eq("LIKE")? || liked.is_truthy()?;
+            label = if is_liked { "Unlike" } else { "Like" };
+        }
+        // if action_id == "toggle_subscribe": Unsubscribe / Subscribe.
+        if action_id == "toggle_subscribe" {
+            let subscribed = field_get(py, item, "subscribed", Some(false_default.clone()))?;
+            label = if subscribed.is_truthy()? {
+                "Unsubscribe"
+            } else {
+                "Subscribe"
+            };
+        }
+        // if action_id == "go_to_artist": needs an artist to go to.
+        if action_id == "go_to_artist" {
+            // artists = item.get("artists") or []
+            let artists = field_get(py, item, "artists", None)?;
+            let artist = field_get(py, item, "artist", None)?;
+            if !artists.is_truthy()? && !artist.is_truthy()? {
+                continue;
+            }
+        }
+        // if action_id == "go_to_album": needs an album to go to.
+        if action_id == "go_to_album" {
+            let album_id = field_get(py, item, "album_id", None)?;
+            let album = field_get(py, item, "album", None)?;
+            // isinstance(album, dict) and album.get("id") — the second
+            // read only runs once the first gate passes.
+            let album_has_id = album.is_instance_of::<PyDict>()
+                && field_get(py, &album, "id", None)?.is_truthy()?;
+            if !album_id.is_truthy()? && !album_has_id {
+                continue;
+            }
+        }
+        // if action_id == "delete" and source == "search" and
+        // item_type == "playlist": continue
+        if action_id == "delete" && source == "search" && item_type == "playlist" {
+            continue;
+        }
+        out.push((action_id.to_string(), label.to_string()));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Progress-bar render geometry
+// ---------------------------------------------------------------------------
+
+/// Python's two-argument `max(a, b)`: `b` displaces `a` only when
+/// strictly greater, so a NaN operand — every comparison false — keeps
+/// `a`, exactly CPython's `max(0.0, float("nan")) == 0.0`.
+fn py_max2(a: f64, b: f64) -> f64 {
+    if b > a {
+        b
+    } else {
+        a
+    }
+}
+
+/// Python's two-argument `min(a, b)`: the `py_max2` mirror.
+fn py_min2(a: f64, b: f64) -> f64 {
+    if b < a {
+        b
+    } else {
+        a
+    }
+}
+
+/// Python's `int()` on the float shapes the bar geometry multiplies out:
+/// truncation toward zero (`int(-0.9) == 0`, `int(2.7) == 2`). A NaN —
+/// which the reference's own `int()` would raise on, and which mpv's
+/// time-pos never produces — reads as 0 so the engine stays total;
+/// magnitudes beyond i64 clamp by sign, far past any terminal width or
+/// track length.
+fn py_int_trunc(f: f64) -> i64 {
+    if f.is_nan() {
+        0
+    } else {
+        f as i64
+    }
+}
+
+/// The progress fraction behind `PlaybackProgress.progress` — the pure
+/// core of the property from `ui/widgets/progress_bar.py`: `0.0` for a
+/// non-positive duration, otherwise `position / duration` clamped to
+/// `[0.0, 1.0]` through CPython's own two-argument `min`/`max` bounds
+/// (see `py_min2`/`py_max2`; a NaN duration fails the `<= 0` gate on
+/// both backends and flows into the clamp, where the bounds keep it at
+/// `0.0` — CPython's answer too).
+#[pyfunction]
+fn progress_fraction(position: f64, duration: f64) -> f64 {
+    if duration <= 0.0 {
+        return 0.0;
+    }
+    py_min2(1.0, py_max2(0.0, position / duration))
+}
+
+/// The metrics behind `PlaybackProgress`'s bar layout — the pure core of
+/// the widget's `_bar_metrics` from `ui/widgets/progress_bar.py`: the
+/// elapsed/total time labels (`format_duration(int(...))`, the pending
+/// scroll-seek preview standing in for the position) and the bar width
+/// left over once both labels' code-point lengths are reserved from the
+/// widget width, floored at 0.
+#[pyfunction]
+#[pyo3(signature = (position, duration, preview, width))]
+fn progress_bar_metrics(
+    position: f64,
+    duration: f64,
+    preview: Option<f64>,
+    width: i64,
+) -> (String, String, i64) {
+    // pos = self.position if self._preview_position is None else
+    // self._preview_position
+    let pos = preview.unwrap_or(position);
+    let time_prefix = format!(" {} ", format_duration(py_int_trunc(pos)));
+    let time_suffix = format!(" {} ", format_duration(py_int_trunc(duration)));
+    // len() counts code points; format_duration's renders are ASCII-only,
+    // so chars().count() is CPython's len() exactly.
+    let reserved = (time_prefix.chars().count() + time_suffix.chars().count()) as i64;
+    (time_prefix, time_suffix, (width - reserved).max(0))
+}
+
+/// The cell computation behind `PlaybackProgress.render` — the pure core
+/// of the bar composition from `ui/widgets/progress_bar.py`: the filled
+/// and empty cell counts (`int(bar_width * progress)`, truncation toward
+/// zero) and the scroll-seek preview's marker column — `-1` when no
+/// preview is pending or the bar has no width, otherwise
+/// `min(int(bar_width * preview_frac), bar_width - 1)` with
+/// `preview_frac` the preview position clamped against the duration
+/// exactly like the reference (the `duration > 0` ternary, then
+/// CPython's two-argument `min`/`max` bounds).
+#[pyfunction]
+#[pyo3(signature = (bar_width, progress, preview, duration))]
+fn progress_bar_cells(
+    bar_width: i64,
+    progress: f64,
+    preview: Option<f64>,
+    duration: f64,
+) -> (i64, i64, i64) {
+    let filled_count = py_int_trunc(bar_width as f64 * progress);
+    let empty_count = bar_width - filled_count;
+    let marker_col = match preview {
+        // if self._preview_position is not None and bar_width > 0
+        Some(preview_position) if bar_width > 0 => {
+            // preview_frac = min(1.0, max(0.0, preview / duration))
+            //                if duration > 0 else 0.0
+            let preview_frac = if duration > 0.0 {
+                py_min2(1.0, py_max2(0.0, preview_position / duration))
+            } else {
+                0.0
+            };
+            py_int_trunc(bar_width as f64 * preview_frac).min(bar_width - 1)
+        }
+        _ => -1,
+    };
+    (filled_count, empty_count, marker_col)
+}
+
+/// The click-to-seek mapping behind `PlaybackProgress`'s click handling —
+/// the pure core of the widget's `_x_to_seconds` from
+/// `ui/widgets/progress_bar.py`: the clicked column, translated through
+/// the same metrics the render uses (the time prefix eats the leading
+/// columns), clamped to `[0, bar_width - 1]` and scaled to
+/// `fraction * duration`. `None` — no seek — for a non-positive duration
+/// or a bar with no width, exactly the reference's gates.
+#[pyfunction]
+#[pyo3(signature = (x, position, duration, preview, width))]
+fn progress_x_to_seconds(
+    x: i64,
+    position: f64,
+    duration: f64,
+    preview: Option<f64>,
+    width: i64,
+) -> Option<f64> {
+    // if self.duration <= 0: return None
+    if duration <= 0.0 {
+        return None;
+    }
+    let (time_prefix, _time_suffix, bar_width) =
+        progress_bar_metrics(position, duration, preview, width);
+    // if bar_width <= 0: return None
+    if bar_width <= 0 {
+        return None;
+    }
+    // prefix_len = len(f" {format_duration(int(pos))} ") — the prefix's
+    // own code-point length.
+    let prefix_len = time_prefix.chars().count() as i64;
+    let mut bar_x = x - prefix_len;
+    if bar_x < 0 {
+        bar_x = 0;
+    }
+    if bar_x >= bar_width {
+        bar_x = bar_width - 1;
+    }
+    // fraction = bar_x / bar_width — true division, then the scale.
+    Some((bar_x as f64 / bar_width as f64) * duration)
+}
+
+// ---------------------------------------------------------------------------
+// Synced-lyrics LRC parser
+// ---------------------------------------------------------------------------
+
+/// The LRC timestamp shape the synced-lyrics parser strips: `[mm:ss]`,
+/// `[mm:ss.f]`, `[mm:ss.ff]` or `[mm:ss.fff]` — 1–2 digits, a colon,
+/// exactly 2 digits, an optional `.` plus 1–3 digits. Both `re` and the
+/// regex crate read `\d` as Unicode Nd (any script's decimal digits),
+/// so exotic-script digits parse identically on both backends — and
+/// `int()` reads them too (see `nd_digit_value`).
+static LRC_TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]").expect("valid LRC timestamp regex")
+});
+
+/// The same pattern anchored — the `re.match` half of the reference,
+/// which accepts a timestamp only at the (stripped) line's start.
+static LRC_TIMESTAMP_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]").expect("valid LRC start regex")
+});
+
+/// `int()` over a run of Nd digits the regex has already guaranteed —
+/// the only characters the pattern's digit groups can hold. Saturating,
+/// far above anything the 1–3 digit groups can spell.
+fn nd_run_value(digits: &str) -> i64 {
+    let mut acc: i64 = 0;
+    for c in digits.chars() {
+        if let Some(d) = nd_digit_value(c) {
+            acc = acc.saturating_mul(10).saturating_add(i64::from(d));
+        }
+    }
+    acc
+}
+
+/// The synced-lyrics parse behind `LyricsSidebar`'s string-lyrics path —
+/// the pure core of `_parse_synced_lyrics` from
+/// `ui/sidebars/lyrics_sidebar.py`. Each line of *raw* (CPython's
+/// `splitlines` boundaries — see `py_splitlines`) whose stripped form
+/// starts with an LRC timestamp contributes one `(timestamp, text)`
+/// pair: minutes and seconds through `int()`, the fractional part as
+/// `int(digits) / 10 ** len(digits)` (`.5`, `.50` and `.500` are all a
+/// half), and the text the line becomes once every timestamp-shaped
+/// span is stripped from the ORIGINAL line and the remainder
+/// `strip()`ped. The pairs come back stably sorted by timestamp —
+/// equal timestamps keep their line order, like the reference's
+/// `list.sort(key=...)`.
+#[pyfunction]
+fn parse_synced_lyrics(raw: &str) -> Vec<(f64, String)> {
+    let mut lines: Vec<(f64, String)> = Vec::new();
+    for line in py_splitlines(raw) {
+        let stripped = python_strip(&line);
+        let Some(m) = LRC_TIMESTAMP_START_RE.captures(stripped) else {
+            continue;
+        };
+        let minutes = nd_run_value(m.get(1).map(|g| g.as_str()).unwrap_or(""));
+        let seconds = nd_run_value(m.get(2).map(|g| g.as_str()).unwrap_or(""));
+        let frac = match m.get(3) {
+            // int(centis) / 10 ** len(centis) — len() counts code
+            // points, each Nd digit one.
+            Some(centis) => {
+                let run = centis.as_str();
+                let digits = run.chars().count();
+                nd_run_value(run) as f64 / 10f64.powi(digits as i32)
+            }
+            None => 0.0,
+        };
+        let ts = (minutes * 60 + seconds) as f64 + frac;
+        let text = python_strip(&LRC_TIMESTAMP_RE.replace_all(&line, "")).to_string();
+        lines.push((ts, text));
+    }
+    // list.sort(key=lambda x: x[0]) — stable, and every timestamp is
+    // finite (minutes/seconds are 1–2 digit fields), so total_cmp is
+    // the reference's ordering exactly.
+    lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+    lines
 }

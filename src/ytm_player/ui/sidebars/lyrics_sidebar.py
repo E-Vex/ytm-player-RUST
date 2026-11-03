@@ -27,7 +27,12 @@ _TIMESTAMP_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
 
 
 def _parse_synced_lyrics(raw: str) -> list[tuple[float, str]]:
-    """Parse LRC-format synced lyrics into (timestamp_seconds, text) tuples."""
+    """Parse LRC-format synced lyrics into (timestamp_seconds, text) tuples.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.parse_synced_lyrics``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     lines: list[tuple[float, str]] = []
     for line in raw.splitlines():
         match = _TIMESTAMP_RE.match(line.strip())
@@ -528,3 +533,21 @@ class LyricsSidebar(Widget):
             scroll.scroll_end(animate=False)
         except Exception:
             logger.debug("Failed to scroll lyrics sidebar to bottom", exc_info=True)
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same LRC parser; this binding
+# replaces the pure-Python definition above when the extension is
+# importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        parse_synced_lyrics as _native_parse_synced_lyrics,
+    )
+except ImportError:
+    pass
+else:
+    _parse_synced_lyrics = _native_parse_synced_lyrics  # type: ignore[assignment]
