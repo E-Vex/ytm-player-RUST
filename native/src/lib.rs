@@ -291,10 +291,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // CLI cache-status engines (cli.py equivalents): the six-key status
     // payload behind the standalone `ytm cache status --json` command,
-    // and the four aligned human lines it echoes without --json — both
-    // from the cache directory and the walk's three aggregates.
+    // the four aligned human lines it echoes without --json — both from
+    // the cache directory and the walk's three aggregates — and the
+    // directory walk that produces them, with the exists/iterdir/
+    // is_file/stat operations supplied as thunks.
     module.add_function(pyo3::wrap_pyfunction!(cache_status_payload, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(cache_status_text, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(cache_status_walk, module)?)?;
 
     // CLI cache-clear walk (cli.py equivalent): the directory walk
     // behind the standalone `ytm cache clear` command — which entries
@@ -6156,6 +6159,72 @@ fn cache_clear_walk(
         }
     }
     Ok(removed)
+}
+
+/// The directory walk behind the CLI's standalone `ytm cache status`
+/// command — the pure core of the status read in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cache_status_walk`): when the
+/// *dir_exists* thunk (the reference's `CACHE_DIR.exists()`) reports the
+/// directory, every entry the *list_entries* thunk yields (the
+/// reference's `CACHE_DIR.iterdir()`) that the *is_file* thunk accepts
+/// contributes its *stat_size* thunk result (the reference's
+/// `f.stat().st_size`) to the running totals — subdirectories and
+/// everything that is not a plain file are left out — and the walk
+/// returns the pair the reference's two accumulators build, the count
+/// first like the reference's return. Each thunk is invoked exactly
+/// where the reference performs its own operation — the existence probe
+/// once up front, the listing only when the directory exists, the file
+/// test once per entry in iteration order, the size read only for the
+/// entries that pass it — so the filesystem side effects stay Python's
+/// (a `Path`, a `Path` subclass or a stub steering both backends
+/// identically) while the walk's control flow runs native. The size
+/// read precedes the count increment exactly like the reference's
+/// statement order, so an error from it leaves that entry uncounted
+/// behind it; both accumulations run through CPython's own in-place add
+/// (`operator.iadd` — `PyNumber_InPlaceAdd`), so the int + int case
+/// stays an exact int whatever the sizes, and a stub's `st_size` that
+/// returns something exotic follows the same numeric protocol the
+/// reference's `+=` would (a float sum stays a float, a bigint stays
+/// unbounded). An error from any thunk propagates exactly where the
+/// reference's own operation would raise it, leaving the pair
+/// unreturned; the pair is a fresh tuple; the inputs are never mutated.
+#[pyfunction]
+#[pyo3(signature = (dir_exists, list_entries, is_file, stat_size))]
+fn cache_status_walk<'py>(
+    py: Python<'py>,
+    dir_exists: &Bound<'py, PyAny>,
+    list_entries: &Bound<'py, PyAny>,
+    is_file: &Bound<'py, PyAny>,
+    stat_size: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    // total_bytes = 0 / file_count = 0 — the reference's starting ints,
+    // kept as the Python objects the additions build (an unbounded sum
+    // renders exactly like the reference's, never a fixed-width
+    // coercion).
+    let mut total_bytes: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+    let mut file_count: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+    // operator.iadd — CPython's own += (PyNumber_InPlaceAdd), so both
+    // accumulations follow the reference's numeric protocol exactly.
+    let iadd = py.import("operator")?.getattr("iadd")?;
+    // file_count += 1 — the reference's literal increment, pre-built.
+    let one: Bound<'py, PyAny> = 1i64.into_pyobject(py)?.into_any();
+    if dir_exists.call0()?.is_truthy()? {
+        for entry in list_entries.call0()?.try_iter()? {
+            let entry = entry?;
+            if is_file.call1((&entry,))?.is_truthy()? {
+                // total_bytes += f.stat().st_size — the size read first,
+                // its result accumulated through the in-place add.
+                let size = stat_size.call1((&entry,))?;
+                total_bytes = iadd.call1((&total_bytes, &size))?;
+                // file_count += 1 — then the count increment, exactly the
+                // reference's statement order.
+                file_count = iadd.call1((&file_count, &one))?;
+            }
+        }
+    }
+    // return file_count, total_bytes — the reference's pair order.
+    Ok((file_count, total_bytes))
 }
 
 /// The editor resolution behind the CLI's standalone `ytm config`

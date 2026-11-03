@@ -4,19 +4,24 @@
 behind the standalone ``ytm cache status`` command: the six-key status
 payload assembled from the cache directory and the walk's three
 aggregates, and the four aligned human lines echoed without ``--json``.
-The pure-Python transcriptions live in ``cli.py``; when the Rust
-extension is built the same engines run natively
+``_cache_status_walk`` is the directory walk that produces two of those
+aggregates — the plain-file count and the byte total — with the
+exists/iterdir/is_file/stat operations supplied as thunks the engine
+invokes exactly where the reference performed them. The pure-Python
+transcriptions live in ``cli.py``; when the Rust extension is built the
+same engines run natively
 (``_ytm_player_native.cache_status_payload`` /
-``_ytm_player_native.cache_status_text``).
+``_ytm_player_native.cache_status_text`` /
+``_ytm_player_native.cache_status_walk``).
 
 The unit tests below assert the engines' contract on whichever backend
 is loaded, plus the command glue (the directory walk, the skipped
 subdirectories, the separately-sized database, and the no-directory
-zeros). When the extension is built, the parity test additionally
-compares the native engines against the pure-Python references (run in
+zeros). When the extension is built, the parity tests additionally
+compare the native engines against the pure-Python references (run in
 a child interpreter with the extension import blocked) case for case —
-payloads, texts and key orders — so the two implementations cannot
-drift apart.
+payloads, texts, key orders, walk pairs and call logs — so the two
+implementations cannot drift apart.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from ytm_player.cli import _cache_status_payload, _cache_status_text, main
+from ytm_player.cli import _cache_status_payload, _cache_status_text, _cache_status_walk, main
 
 try:
     from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
@@ -143,6 +148,189 @@ class TestCacheStatusText:
         assert _cache_status_text("/gone", 0, 0, 0) == (
             "Cache directory: /gone\nCached files:    0\nTotal size:      0 B\nDatabase size:   0 B"
         )
+
+
+class _RecordingWalk:
+    """Thunk quartet over a synthetic entry list, recording every call.
+
+    *entries* are the names the listing yields; *files* the names the
+    is_file thunk accepts; *sizes* the values the stat_size thunk
+    returns for the accepted names (a missing name reads as 0); the
+    optional error hooks raise instead of performing the named
+    operation (``list_error`` on the listing, ``is_file_error`` on the
+    named entry's file test, ``stat_error`` on the named entry's — or
+    every entry's, when "all" — size read).
+    """
+
+    def __init__(
+        self, entries, files, sizes=None, *, list_error=None, is_file_error=None, stat_error=None
+    ):
+        self.entries = list(entries)
+        self.files = set(files)
+        self.sizes = dict(sizes or {})
+        self.list_error = list_error
+        self.is_file_error = is_file_error
+        self.stat_error = stat_error
+        self.log: list[str] = []
+
+    def dir_exists(self):
+        self.log.append("exists")
+        return True
+
+    def list_entries(self):
+        self.log.append("iterdir")
+        if self.list_error is not None:
+            raise self.list_error
+        return iter(self.entries)
+
+    def is_file(self, entry):
+        self.log.append(f"is_file:{entry}")
+        if entry == self.is_file_error:
+            raise RuntimeError(f"file test broke on {entry}")
+        return entry in self.files
+
+    def stat_size(self, entry):
+        self.log.append(f"stat:{entry}")
+        if self.stat_error is not None and self.stat_error in (entry, "all"):
+            raise PermissionError(f"cannot stat {entry}")
+        return self.sizes.get(entry, 0)
+
+
+class TestCacheStatusWalk:
+    """The directory walk behind ``ytm cache status`` — on whichever
+    backend is loaded."""
+
+    def test_counts_and_sums_only_the_files(self):
+        walk = _RecordingWalk(
+            ["a.webm", "subdir", "b.webm", "sock"],
+            ["a.webm", "b.webm"],
+            {"a.webm": 1024, "b.webm": 2048},
+        )
+        assert _cache_status_walk(
+            walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size
+        ) == (2, 3072)
+
+    def test_empty_directory_counts_nothing(self):
+        walk = _RecordingWalk([], [])
+        assert _cache_status_walk(
+            walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size
+        ) == (0, 0)
+
+    def test_missing_directory_never_lists(self):
+        log: list[str] = []
+
+        def dir_exists():
+            log.append("exists")
+            return False
+
+        def list_entries():
+            log.append("iterdir")
+            return iter(["a.webm"])
+
+        def stat_size(entry):
+            log.append(f"stat:{entry}")
+            return 1
+
+        assert _cache_status_walk(dir_exists, list_entries, lambda e: True, stat_size) == (0, 0)
+        # The listing, the file tests and the size reads are all gated on
+        # the existence probe — a missing directory walks nothing.
+        assert log == ["exists"]
+
+    def test_the_call_log_pins_the_operations_order(self):
+        walk = _RecordingWalk(["dir", "a.webm"], ["a.webm"], {"a.webm": 512})
+        _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+        # The size read comes only for the entries that pass the file
+        # test, right after their own test — subdirectories are never
+        # statted.
+        assert walk.log == ["exists", "iterdir", "is_file:dir", "is_file:a.webm", "stat:a.webm"]
+
+    def test_exists_and_listing_run_exactly_once(self):
+        walk = _RecordingWalk(["a"], ["a"], {"a": 1})
+        _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+        assert walk.log.count("exists") == 1
+        assert walk.log.count("iterdir") == 1
+
+    def test_the_pair_is_two_ints_in_count_first_order(self):
+        walk = _RecordingWalk(["a", "b"], ["a", "b"], {"a": 3, "b": 4})
+        pair = _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+        assert type(pair) is tuple
+        assert len(pair) == 2
+        assert pair == (2, 7)
+        assert type(pair[0]) is int
+        assert type(pair[1]) is int
+
+    def test_bigint_sizes_sum_exactly(self):
+        # The totals follow Python's own += — a sum beyond every
+        # fixed-width coercion stays exact, never truncated.
+        walk = _RecordingWalk(["a", "b"], ["a", "b"], {"a": 10**30, "b": 10**30})
+        count, total = _cache_status_walk(
+            walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size
+        )
+        assert count == 2
+        assert total == 2 * 10**30
+        assert type(total) is int
+
+    def test_float_sizes_follow_the_reference_arithmetic(self):
+        # 0 + 0.5 + 1.25 — the int accumulator becomes the float the
+        # reference's own += would build.
+        walk = _RecordingWalk(["a", "b"], ["a", "b"], {"a": 0.5, "b": 1.25})
+        count, total = _cache_status_walk(
+            walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size
+        )
+        assert count == 2
+        assert total == 1.75
+        assert type(total) is float
+
+    def test_stat_error_propagates_and_keeps_the_earlier_reads(self):
+        # The reference's stat raises through — the walk stops, the pair
+        # is never returned, and the size reads already performed stay
+        # performed.
+        walk = _RecordingWalk(["a", "b", "c"], ["a", "b", "c"], {"a": 1, "b": 2}, stat_error="b")
+        with pytest.raises(PermissionError):
+            _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+        assert walk.log == [
+            "exists",
+            "iterdir",
+            "is_file:a",
+            "stat:a",
+            "is_file:b",
+            "stat:b",  # b's thunk raised after logging it
+        ]
+
+    def test_listing_error_propagates(self):
+        walk = _RecordingWalk(["a"], ["a"], {"a": 1}, list_error=OSError("unreadable"))
+        with pytest.raises(OSError, match="unreadable"):
+            _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+
+    def test_file_test_error_propagates(self):
+        walk = _RecordingWalk(["a"], ["a"], {"a": 1}, is_file_error="a")
+        with pytest.raises(RuntimeError, match="file test broke"):
+            _cache_status_walk(walk.dir_exists, walk.list_entries, walk.is_file, walk.stat_size)
+
+    def test_real_paths_walk_like_the_reference(self):
+        # Through the production thunk shape — bound Path methods and
+        # the is_file/stat lambdas the command passes — against a real
+        # temporary directory.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "audio"
+            cache.mkdir()
+            (cache / "a.webm").write_bytes(b"x" * 4)
+            (cache / "b.webm").write_bytes(b"y" * 6)
+            (cache / "nested").mkdir()
+            (cache / "nested" / "c.webm").write_bytes(b"z" * 8)
+            outside = Path(td) / "elsewhere.webm"
+            outside.write_bytes(b"w" * 10)
+            (cache / "link.webm").symlink_to(outside)
+
+            count, total = _cache_status_walk(
+                cache.exists, cache.iterdir, lambda f: f.is_file(), lambda f: f.stat().st_size
+            )
+
+            assert count == 3  # a, b and the symlink — is_file follows symlinks
+            assert total == 20  # 4 + 6 + the target's 10
+            assert (cache / "nested" / "c.webm").exists()  # subdirectories never contribute
 
 
 # ── Command glue ────────────────────────────────────────────────────────
@@ -364,3 +552,219 @@ class TestNativeParity:
                     f"native:   {list(n_pair[0]['ok'])!r}\n"
                     f"fallback: {list(f_pair[0]['ok'])!r}"
                 )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_cache_status_walk_matches_fallback(self):
+        result = subprocess.run(
+            [sys.executable, "-c", _WALK_CHILD_PROG],
+            input=json.dumps(_CACHE_WALK_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [_walk_outcome(case) for case in _CACHE_WALK_PARITY_CASES]
+        for case, n, f in zip(_CACHE_WALK_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback walk outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+        # The operation-timing contract, pinned by the compared call
+        # logs: nothing but the existence probe runs on a missing
+        # directory, and every size read follows its own file test.
+        for case, n in zip(_CACHE_WALK_PARITY_CASES, native):
+            if not case["exists"] or "exists_error" in case:
+                # A missing directory walks nothing; a raising existence
+                # probe never reaches the listing either.
+                assert n["log"] == ["exists"], f"walk ran without a directory: {case!r}"
+            else:
+                assert n["log"].count("iterdir") == 1
+
+
+# The walk matrix, shared with the child interpreter as JSON like the
+# payload/text one above. Case shape: {"exists": bool, "entries": [str],
+# "files": [str], "sizes": {str: number}, plus the optional error hooks
+# "exists_error" / "list_error" / "is_file_error" / "stat_error" (+
+# "stat_error_on": one entry name, or "all")}. The sizes run the numeric
+# zoo the reference's own += accepts — ints (including bigints beyond
+# every fixed-width coercion), floats (the accumulator follows), bools
+# (0 + True is 1) — plus the two TypeError arms, so the native engine's
+# in-place-add protocol is compared against the reference's exactly.
+_CACHE_WALK_PARITY_CASES = [
+    {
+        "exists": True,
+        "entries": ["a.webm", "b.webm"],
+        "files": ["a.webm", "b.webm"],
+        "sizes": {"a.webm": 1024, "b.webm": 2048},
+    },
+    {"exists": True, "entries": [], "files": []},  # the empty directory
+    {"exists": False, "entries": ["a.webm"], "files": ["a.webm"], "sizes": {"a.webm": 1}},
+    {
+        "exists": True,
+        "entries": ["subdir", "a.webm", "subdir2"],
+        "files": ["a.webm"],
+        "sizes": {"a.webm": 512},
+    },
+    {
+        "exists": True,
+        "entries": ["x", "y", "z"],
+        "files": ["x", "y", "z"],
+        "sizes": {"x": 1, "y": 2, "z": 3},
+    },
+    {
+        "exists": True,
+        "entries": ["weird ñ ✓.webm"],
+        "files": ["weird ñ ✓.webm"],
+        "sizes": {"weird ñ ✓.webm": 4096},
+    },
+    {"exists": True, "entries": ["weird ñ ✓.webm"], "files": []},
+    # The numeric zoo — the reference's own += decides the totals.
+    {
+        "exists": True,
+        "entries": ["a", "b"],
+        "files": ["a", "b"],
+        "sizes": {"a": 10**30, "b": 10**30},
+    },  # bigint sums stay exact
+    {
+        "exists": True,
+        "entries": ["a", "b"],
+        "files": ["a", "b"],
+        "sizes": {"a": 0.5, "b": 1.25},
+    },  # the int accumulator becomes a float
+    {"exists": True, "entries": ["a", "b"], "files": ["a", "b"], "sizes": {"a": 1, "b": 2.5}},
+    {"exists": True, "entries": ["a"], "files": ["a"], "sizes": {"a": True}},  # 0 + True is 1
+    {"exists": True, "entries": ["a"], "files": ["a"], "sizes": {"a": -5}},  # negatives sum too
+    {"exists": True, "entries": ["a"], "files": ["a"], "sizes": {"a": None}},  # TypeError
+    {"exists": True, "entries": ["a"], "files": ["a"], "sizes": {"a": "4"}},  # TypeError
+    # Error hooks — where each operation's failure surfaces and what it
+    # leaves behind.
+    {
+        "exists": True,
+        "entries": ["a", "b"],
+        "files": ["a", "b"],
+        "sizes": {"a": 1, "b": 2},
+        "stat_error": "PermissionError",
+        "stat_error_on": "b",
+    },
+    {
+        "exists": True,
+        "entries": ["a"],
+        "files": ["a"],
+        "sizes": {"a": 1},
+        "stat_error": "OSError",
+        "stat_error_on": "all",
+    },
+    {"exists": True, "entries": ["a"], "files": ["a"], "sizes": {"a": 1}, "is_file_error": "a"},
+    {"exists": True, "entries": ["a"], "files": [], "sizes": {}, "list_error": "OSError"},
+    {
+        "exists": True,
+        "entries": ["a"],
+        "files": ["a"],
+        "sizes": {"a": 1},
+        "exists_error": "RuntimeError",
+    },
+]
+
+_WALK_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.cli import _cache_status_walk
+
+ERROR_TYPES = {
+    "OSError": OSError,
+    "PermissionError": PermissionError,
+    "RuntimeError": RuntimeError,
+}
+
+
+def build(case):
+    log = []
+    sizes = case.get("sizes", {})
+
+    def dir_exists():
+        log.append("exists")
+        if case.get("exists_error"):
+            raise ERROR_TYPES[case["exists_error"]]
+        return case["exists"]
+
+    def list_entries():
+        log.append("iterdir")
+        if case.get("list_error"):
+            raise ERROR_TYPES[case["list_error"]]
+        return iter(case["entries"])
+
+    def is_file(entry):
+        log.append(f"is_file:{entry}")
+        if case.get("is_file_error") == entry:
+            raise RuntimeError(f"file test broke on {entry}")
+        return entry in set(case["files"])
+
+    def stat_size(entry):
+        log.append(f"stat:{entry}")
+        if case.get("stat_error") and case.get("stat_error_on") in (entry, "all"):
+            raise ERROR_TYPES[case["stat_error"]]
+        return sizes.get(entry, 0)
+
+    return dir_exists, list_entries, is_file, stat_size, log
+
+
+def outcome(case):
+    dir_exists, list_entries, is_file, stat_size, log = build(case)
+    try:
+        count, total = _cache_status_walk(dir_exists, list_entries, is_file, stat_size)
+        return {"ok": [count, total], "log": log}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": log}
+
+
+cases = json.load(sys.stdin)
+json.dump([outcome(case) for case in cases], sys.stdout)
+"""
+
+
+def _walk_outcome(case: dict) -> dict:
+    """The parent-side twin of the child program's outcome builder —
+    same thunks, same log, same error shaping, native engine."""
+    log: list[str] = []
+    sizes = case.get("sizes", {})
+
+    def dir_exists():
+        log.append("exists")
+        if case.get("exists_error"):
+            raise _ERROR_TYPES[case["exists_error"]]
+        return case["exists"]
+
+    def list_entries():
+        log.append("iterdir")
+        if case.get("list_error"):
+            raise _ERROR_TYPES[case["list_error"]]
+        return iter(case["entries"])
+
+    def is_file(entry):
+        log.append(f"is_file:{entry}")
+        if case.get("is_file_error") == entry:
+            raise RuntimeError(f"file test broke on {entry}")
+        return entry in set(case["files"])
+
+    def stat_size(entry):
+        log.append(f"stat:{entry}")
+        if case.get("stat_error") and case.get("stat_error_on") in (entry, "all"):
+            raise _ERROR_TYPES[case["stat_error"]]
+        return sizes.get(entry, 0)
+
+    try:
+        count, total = _cache_status_walk(dir_exists, list_entries, is_file, stat_size)
+        return {"ok": [count, total], "log": log}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}", "log": log}
+
+
+_ERROR_TYPES = {
+    "OSError": OSError,
+    "PermissionError": PermissionError,
+    "RuntimeError": RuntimeError,
+}

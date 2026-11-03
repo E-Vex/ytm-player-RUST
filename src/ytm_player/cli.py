@@ -644,18 +644,59 @@ def cache(ctx: click.Context) -> None:
         ctx.invoke(cache_status)
 
 
+def _cache_status_walk(
+    dir_exists: Any,
+    list_entries: Any,
+    is_file: Any,
+    stat_size: Any,
+) -> tuple[Any, Any]:
+    """The directory walk behind the ``cache status`` command.
+
+    The pure half of the standalone ``ytm cache status`` read: when the
+    *dir_exists* thunk (the reference's ``CACHE_DIR.exists()``) reports
+    the directory, every entry the *list_entries* thunk yields (the
+    reference's ``CACHE_DIR.iterdir()``) that the *is_file* thunk
+    accepts contributes its *stat_size* thunk result (the reference's
+    ``f.stat().st_size``) to the running totals — subdirectories and
+    everything that is not a plain file are left out — and the pair
+    ``(file_count, total_bytes)`` comes back as the reference's two
+    accumulators. Each thunk is invoked exactly where the reference
+    performs its own operation — the existence probe once up front, the
+    listing only when the directory exists, the file test once per entry
+    in iteration order, the size read only for the entries that pass it
+    — so the filesystem side effects stay Python's while the walk's
+    control flow runs native. The size read precedes the count
+    increment exactly like the reference's statement order, so an error
+    from it leaves that entry uncounted behind it; both accumulations
+    are the reference's own ``+=``, so the sums follow Python's numeric
+    protocol whatever the sizes. An error from any thunk propagates
+    exactly where the reference's own operation would raise it. The
+    inputs are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cache_status_walk``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    total_bytes: Any = 0
+    file_count: Any = 0
+    if dir_exists():
+        for entry in list_entries():
+            if is_file(entry):
+                total_bytes += stat_size(entry)
+                file_count += 1
+    return file_count, total_bytes
+
+
 @cache.command("status")
 @click.option("--json", "compact_json", is_flag=True, help="Compact JSON output.")
 def cache_status(compact_json: bool) -> None:
     """Show cache size and statistics."""
-    total_bytes = 0
-    file_count = 0
-
-    if CACHE_DIR.exists():
-        for f in CACHE_DIR.iterdir():
-            if f.is_file():
-                total_bytes += f.stat().st_size
-                file_count += 1
+    file_count, total_bytes = _cache_status_walk(
+        CACHE_DIR.exists,
+        CACHE_DIR.iterdir,
+        lambda f: f.is_file(),
+        lambda f: f.stat().st_size,
+    )
 
     db_size = 0
     if CACHE_DB.exists():
@@ -882,6 +923,15 @@ except ImportError:
     pass
 else:
     _cache_status_text = _native_cache_status_text  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cache_status_walk as _native_cache_status_walk,
+    )
+except ImportError:
+    pass
+else:
+    _cache_status_walk = _native_cache_status_walk  # type: ignore[assignment]
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
