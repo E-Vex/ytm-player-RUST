@@ -7242,15 +7242,20 @@ static CRASH_META_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\w+):[\s\x{1c}-\x{1f}]+([^\s\x{1c}-\x{1f}]+)").expect("valid crash meta regex")
 });
 
-/// The PEP 440 version grammar from `packaging`, ASCII-scoped and
-/// case-insensitive exactly like its `(?a:...)` groups under
-/// `re.IGNORECASE`: every word spelling is per-character cased (`AlPhA` is
-/// a valid pre-release marker), the local alphabet is `[a-zA-Z0-9]` — the
-/// `(?a:)` scoping rejects the Unicode folds (`ſ` U+017F, the Kelvin sign
-/// U+212A) the crate's own case-insensitive mode would admit — and the
-/// wrapping whitespace is CPython's `\s` (see `CRASH_META_RE`). Anchored at
-/// both ends like the reference's `fullmatch`, with group names mirroring
-/// packaging's own.
+/// The PEP 440 version grammar from `packaging`, case-insensitive the
+/// way CPython's `re` is on Unicode strings: every word spelling is
+/// per-character cased (`AlPhA` is a valid pre-release marker), and the
+/// simple case folds are admitted wherever a letter can appear — the
+/// long s `ſ` (U+017F) wherever an s/S can, the dotted and dotless İ/ı
+/// (U+0130/U+0131) wherever an i/I can, and the Kelvin sign `K`
+/// (U+212A) wherever a k/K can — because `packaging` compiles the
+/// grammar with plain `re.IGNORECASE` (no ASCII scoping), so `1.0+ſ`,
+/// `1.0+K`, `1.0prevıew` and `1.0poſt` parse as valid versions on every
+/// CPython this project supports. Only the `preview` word's i, the
+/// `post` word's s and the local alphabet can ever see a fold (no other
+/// grammar position spells an i, s or k). The wrapping whitespace is
+/// CPython's `\s` (see `CRASH_META_RE`). Anchored at both ends like the
+/// reference's `fullmatch`, with group names mirroring packaging's own.
 static PEP440_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"^[\s\x{1c}-\x{1f}]*[vV]?",
@@ -7258,13 +7263,13 @@ static PEP440_RE: LazyLock<Regex> = LazyLock::new(|| {
         r"(?:(?P<epoch>[0-9]+)!)?",
         r"(?P<release>[0-9]+(?:\.[0-9]+)*)",
         r"(?:[._-]?(?P<pre_l>[aA][lL][pP][hH][aA]|[aA]|[bB][eE][tT][aA]|[bB]",
-        r"|[pP][rR][eE][vV][iI][eE][wW]|[pP][rR][eE]|[cC]|[rR][cC])",
+        r"|[pP][rR][eE][vV][iI\x{130}\x{131}][eE][wW]|[pP][rR][eE]|[cC]|[rR][cC])",
         r"[._-]?(?P<pre_n>[0-9]+)?)?",
-        r"(?:-(?P<post_n1>[0-9]+)|[._-]?(?P<post_l>[pP][oO][sS][tT]|[rR][eE][vV]|[rR])",
+        r"(?:-(?P<post_n1>[0-9]+)|[._-]?(?P<post_l>[pP][oO][sS\x{17f}][tT]|[rR][eE][vV]|[rR])",
         r"[._-]?(?P<post_n2>[0-9]+)?)?",
         r"(?:[._-]?(?P<dev_l>[dD][eE][vV])[._-]?(?P<dev_n>[0-9]+)?)?",
         r")",
-        r"(?:\+(?P<local>[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*))?",
+        r"(?:\+(?P<local>[a-zA-Z0-9\x{130}\x{131}\x{17f}\x{212a}]+(?:[._-][a-zA-Z0-9\x{130}\x{131}\x{17f}\x{212a}]+)*))?",
         r"[\s\x{1c}-\x{1f}]*$",
     ))
     .expect("valid pep440 regex")
@@ -7328,27 +7333,45 @@ impl PartialOrd for BigNum {
     }
 }
 
-/// The pre-release rank from packaging's `_PRE_RANK`: a=0, b=1, rc=2 (the
-/// marker spellings alpha/beta/c/pre/preview all normalise onto these).
-fn pep440_pre_rank(letter: &str) -> i8 {
+/// packaging's `_LETTER_NORMALIZATION`, applied after `str.lower()`
+/// exactly like `_parse_letter_version`: the alternate spellings collapse
+/// onto the canonical marker letters (alpha→a, beta→b, c/pre/preview→rc,
+/// rev/r→post), and a spelling the lower() left untouched — an exotic
+/// Unicode fold like `prevıew` or `poſt`, which no map key equals — stays
+/// raw and compares as its own string, exactly the tuple the reference
+/// builds.
+fn pep440_letter(letter: &str) -> String {
     match letter.to_lowercase().as_str() {
-        "a" => 0,
-        "b" => 1,
-        _ => 2,
+        "alpha" => "a".to_string(),
+        "beta" => "b".to_string(),
+        "c" | "pre" | "preview" => "rc".to_string(),
+        "rev" | "r" => "post".to_string(),
+        raw => raw.to_string(),
     }
 }
 
-/// The flat pre/post/dev comparison suffix from packaging's `_cmpkey`,
-/// compared as the tuple it is: (pre_rank, pre_n, post_rank, post_n,
-/// dev_rank, dev_n).
+/// One pre/post/dev slot of the comparison key. packaging's `_cmpkey`
+/// fills each slot with `NegativeInfinity`, the `(letter, number)` tuple
+/// or `Infinity`, and the slots compare in exactly that order — the
+/// enum's derived ordering reproduces it: absent-before-everything, the
+/// `(letter, number)` pairs comparing as tuples (the letter as its
+/// post-lower() post-map string, so an exotic fold spelling like
+/// `prevıew` ranks between `b` and `rc` by its raw characters, and
+/// `poſt` sorts above `post`), absent-after-everything.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Pep440Slot {
+    NegInf,
+    Seg(String, BigNum),
+    Inf,
+}
+
+/// The pre/post/dev comparison suffix in packaging's `_cmpkey` order,
+/// each slot one `Pep440Slot`.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Pep440Suffix {
-    pre_rank: i8,
-    pre_n: BigNum,
-    post_rank: u8,
-    post_n: BigNum,
-    dev_rank: u8,
-    dev_n: BigNum,
+    pre: Pep440Slot,
+    post: Pep440Slot,
+    dev: Pep440Slot,
 }
 
 /// One local-version segment. Mirrors packaging's `(n, "")` /
@@ -7411,46 +7434,56 @@ fn parse_pep440(text: &str) -> Option<Pep440Key> {
     let post_matched = post_n1.is_some() || post_l.is_some();
     let dev_matched = dev_l.is_some();
 
-    // The pre rank: a dev-only release (no pre, no post, dev present)
+    // The pre slot: a dev-only release (no pre, no post, dev present)
     // sorts before every alpha; a release without a pre sorts after every
-    // rc; otherwise the marker's rank with its number (an implicit 0
-    // when the digits are absent).
-    let (pre_rank, pre_num) = if let Some(letter) = pre_l {
+    // rc; otherwise the marker's (letter, number) pair — the letter through
+    // packaging's lower+normalise map, an implicit 0 when the digits are
+    // absent — comparing as the tuple it is, so an exotic fold spelling
+    // like `prevıew` ranks by its raw characters, between `b` and `rc`.
+    let pre = if let Some(letter) = pre_l {
         let number = match pre_n {
             Some(number) => number?,
             None => BigNum::zero(),
         };
-        (pep440_pre_rank(letter), number)
+        Pep440Slot::Seg(pep440_letter(letter), number)
     } else if !post_matched && dev_matched {
-        (-1, BigNum::zero())
+        Pep440Slot::NegInf
     } else {
-        (3, BigNum::zero())
+        Pep440Slot::Inf
     };
 
     // post: `-N` (post_n1) and `postN`/`post`/`rev`/`r` (post_l+post_n2)
-    // both normalise to a number, again with the implicit 0.
-    let post_num = if post_matched {
-        match post_n1.or(post_n2) {
+    // both normalise to the ("post", N) pair — the `-N` shape's letter is
+    // exactly "post" — again with the implicit 0; no post segment sorts
+    // before every one that has it.
+    let post = if post_matched {
+        let number = match post_n1.or(post_n2) {
             Some(number) => number?,
             None => BigNum::zero(),
-        }
+        };
+        let letter = match post_l {
+            Some(letter) => pep440_letter(letter),
+            None => "post".to_string(),
+        };
+        Pep440Slot::Seg(letter, number)
     } else {
-        BigNum::zero()
+        Pep440Slot::NegInf
     };
 
-    let dev_num = match dev_n {
-        Some(number) => number?,
-        None => BigNum::zero(),
+    // dev: the ("dev", N) pair with the implicit 0; no dev segment sorts
+    // after every one that has it.
+    let dev = match dev_l {
+        Some(letter) => {
+            let number = match dev_n {
+                Some(number) => number?,
+                None => BigNum::zero(),
+            };
+            Pep440Slot::Seg(pep440_letter(letter), number)
+        }
+        None => Pep440Slot::Inf,
     };
 
-    let suffix = Pep440Suffix {
-        pre_rank,
-        pre_n: pre_num,
-        post_rank: u8::from(post_matched),
-        post_n: post_num,
-        dev_rank: u8::from(!dev_matched),
-        dev_n: dev_num,
-    };
+    let suffix = Pep440Suffix { pre, post, dev };
 
     let local = match caps.name("local") {
         None => None,

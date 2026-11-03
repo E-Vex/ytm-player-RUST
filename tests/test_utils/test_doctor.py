@@ -641,12 +641,32 @@ class TestCrashStalenessPep440:
         assert self.note("version: " + "9" * 5000 + "\n", "2.1.0") is None
         assert self.note("version: 1.0+" + "9" * 5000 + "\n", "2.1.0") is None
 
-    def test_unicode_folds_are_rejected(self):
-        # packaging's (?a:) ASCII scoping: the long s and the Kelvin sign
-        # are not ASCII letters.
-        assert self.note("version: 1.0+\u017f\n", "2.1.0") is None  # ſ (long s)
-        assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is None
-        assert self.note("version: 1.0+\u212a\n", "2.1.0") is None  # K (Kelvin sign)
+    def test_unicode_folds_are_admitted(self):
+        # CPython's re.IGNORECASE folds a handful of non-ASCII letters onto
+        # ASCII ones, and packaging compiles its PEP 440 grammar with no
+        # ASCII scoping: the long s (U+017F), the Kelvin sign (U+212A) and
+        # the dotted and dotless i (U+0130/U+0131) are valid local-segment
+        # material, and the s of "post" / the i of "preview" accept their
+        # folds — so every one of these is a valid version older than 2.1.0.
+        assert self.note("version: 1.0+\u017f\n", "2.1.0") is not None  # ſ (long s)
+        assert self.note("version: 1.0+\u212a\n", "2.1.0") is not None  # K (Kelvin sign)
+        assert self.note("version: 1.0+\u0130\n", "2.1.0") is not None  # İ (dotted capital i)
+        assert self.note("version: 1.0+\u0131\n", "2.1.0") is not None  # ı (dotless i)
+        assert self.note("version: 1.0po\u017ft1\n", "2.1.0") is not None
+        assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0") is not None
+
+    def test_exotic_marker_spellings_keep_their_raw_order(self):
+        # packaging normalises only the exact marker spellings; a fold
+        # spelling like "prevıew" or "poſt" survives the lower() untouched
+        # and compares as its own string — between b and rc for the
+        # pre-release letter, above "post" for the post one — while the
+        # plain spellings collapse onto their canonical letters.
+        assert self.note("version: 2.1.0alpha1\n", "2.1.0b1") is not None
+        assert self.note("version: 2.1.0b1\n", "2.1.0alpha1") is None
+        assert self.note("version: 2.1.0prev\u0131ew1\n", "2.1.0rc1") is not None
+        assert self.note("version: 2.1.0rc1\n", "2.1.0prev\u0131ew1") is None
+        assert self.note("version: 1.0-1\n", "1.0-po\u017ft") is not None
+        assert self.note("version: 1.0-po\u017ft\n", "1.0-1") is None
 
 
 class TestArgvIsYtm:
@@ -1186,9 +1206,10 @@ class TestFaulthandlerTailNativeParity:
 # (content, current_version) pairs, JSON-round-trippable. The matrix
 # covers the header scan (banners, known/unknown/unicode keys, blanks,
 # exotic separators and line boundaries, values-with-trailing-text) and
-# the PEP 440 comparison space (epochs, pre/post/dev ranks, trailing
-# zeros, local segments, case-insensitive spellings, invalid and
-# digit-limit-overflowing versions).
+# the PEP 440 comparison space (epochs, pre/post/dev ranks — the exotic
+# Unicode-fold marker spellings included — trailing zeros, local
+# segments, case-insensitive spellings, invalid and digit-limit-
+# overflowing versions).
 _CRASH_PARITY_CASES = [
     # Header-scan shapes.
     ("", "2.1.0"),
@@ -1228,6 +1249,22 @@ _CRASH_PARITY_CASES = [
     ("version: 2.1.0preview3\n", "2.1.0"),
     ("version: 2.1.0.pre1\n", "2.1.0"),
     ("version: 2.1.0_c3\n", "2.1.0"),
+    # Older via the pre/post letter's raw string: alpha normalises onto a
+    # (below b), while an exotic fold spelling like prevıew stays raw and
+    # ranks between b and rc; poſt stays raw and ranks above post.
+    ("version: 2.1.0alpha1\n", "2.1.0b1"),
+    ("version: 2.1.0prev\u0131ew1\n", "2.1.0rc1"),
+    ("version: 1.0-1\n", "1.0-po\u017ft"),
+    # Older through the Unicode folds re.IGNORECASE admits: the long s, the
+    # Kelvin sign and the dotted/dotless i are valid local material, and
+    # they spell marker words too (the s of "post", the i of "preview").
+    ("version: 1.0+\u017f\n", "2.1.0"),
+    ("version: 1.0+\u212a\n", "2.1.0"),
+    ("version: 1.0+\u0130\n", "2.1.0"),
+    ("version: 1.0+\u0131\n", "2.1.0"),
+    ("version: 1.0po\u017ft1\n", "2.1.0"),
+    ("version: 2.1.0prev\u0131ew1\n", "2.1.0"),
+    ("version: 2.1.0prev\u0130ew1\n", "2.1.0"),
     ("version: 2.1.0.dev1\n", "2.1.0"),
     ("version: 2.1.0dev\n", "2.1.0"),
     ("version: v1.9.4\n", "2.1.0"),
@@ -1257,9 +1294,6 @@ _CRASH_PARITY_CASES = [
     ("version: 1..0\n", "2.1.0"),
     ("version: 1.0+\n", "2.1.0"),
     ("version: 1.0++local\n", "2.1.0"),
-    ("version: 1.0+\u017f\n", "2.1.0"),  # long s — outside packaging's ASCII local alphabet
-    ("version: 1.0po\u017ft1\n", "2.1.0"),
-    ("version: 1.0+\u212a\n", "2.1.0"),  # Kelvin sign U+212A
     ("version: ²1.0\n", "2.1.0"),
     ("version: 1.0-4-5\n", "2.1.0"),
     ("version: 2.1.0-c4\n", "2.1.0"),  # implicit post needs digits after the hyphen
