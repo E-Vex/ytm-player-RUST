@@ -3,8 +3,12 @@
 The view-model assembly behind every context type — the album and
 playlist header compositions and the artist discography (top songs,
 albums+singles, related artists, and the see-all section selection
-behind the discography expansion) — is implemented by the Rust
-extension (``_ytm_player_native``) when it is built and by the
+behind the discography expansion) — plus the decision core of the
+artist songs worker merge (the first-batch plan and remaining-fetch
+decision behind ``_fetch_full_artist_songs``' swap of the artist's
+full song list, and the tail plan for the chained remaining-tracks
+fetch) are implemented by the Rust extension
+(``_ytm_player_native``) when it is built and by the
 pure-Python transcriptions in this module otherwise; the
 bottom-of-module seam rebinds the engine to the native functions when
 the extension is importable. The builders below only do I/O and
@@ -196,6 +200,64 @@ def expandable_sections(data: dict[str, Any]) -> list[Any]:
         for s in (data.get("albums"), data.get("singles"))
         if isinstance(s, dict) and s.get("browseId") and s.get("params")
     ]
+
+
+def artist_songs_first_batch(data: Any) -> dict[str, Any]:
+    """The first-batch plan behind the artist songs worker merge — the
+    pure decision core of ``_fetch_full_artist_songs``' first half.
+
+    The background ``get_playlist`` fetch of the artist's full song
+    list (the playlist behind ``songs.browseId``, fetched because
+    ytmusicapi truncates artist top songs) answers this plan: the
+    normalized batch to swap into the top-songs table (``tracks``);
+    whether the swap happens at all — only a non-empty raw list whose
+    normalization kept something swaps in, an all-unplayable batch
+    leaves the existing truncated list in place (``load``); and the
+    remaining-fetch decision (``fetch_remaining``) — the chained
+    ``get_playlist_remaining`` tail fetch runs only when the batch
+    loaded and the stored ``trackCount`` doesn't already cover it, a
+    missing count falling back to attempting the call (empty/error
+    there reading as "nothing more to fetch"). ``raw_count`` is the
+    ``already_have`` the tail resumes from — the raw batch length,
+    not the normalized one.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_songs_first_batch``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    raw_tracks = data.get("tracks", []) if isinstance(data, dict) else []
+    if not raw_tracks:
+        return {"tracks": [], "load": False, "fetch_remaining": False, "raw_count": 0}
+    full_tracks = normalize_tracks(raw_tracks)
+    if not full_tracks:
+        return {"tracks": [], "load": False, "fetch_remaining": False, "raw_count": 0}
+    total_count = data.get("trackCount") if isinstance(data, dict) else None
+    return {
+        "tracks": full_tracks,
+        "load": True,
+        "fetch_remaining": not (total_count is not None and total_count <= len(raw_tracks)),
+        "raw_count": len(raw_tracks),
+    }
+
+
+def artist_songs_tail(remaining: Any) -> dict[str, Any]:
+    """The tail plan behind the artist songs worker merge — the pure
+    decision core of ``_fetch_full_artist_songs``' second half.
+
+    The chained ``get_playlist_remaining`` fetch answers this plan:
+    the normalized tail rows to append to the top-songs table
+    (``tracks``) and the append gate (``append``) — the tail only
+    lands when the fetched list is non-empty and normalization kept
+    something, an all-unplayable tail leaving the loaded batch as-is.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_songs_tail``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if not remaining:
+        return {"tracks": [], "append": False}
+    tracks = normalize_tracks(remaining)
+    return {"tracks": tracks, "append": bool(tracks)}
 
 
 class _ArtistAlbumList(DataTable):
@@ -576,6 +638,12 @@ class ContextPage(TrackFilterHost, Widget):
         playlist progressive-load pattern in ``_fetch_remaining_tracks`` so
         artists with > _FIRST_BATCH top songs aren't silently truncated.
 
+        Every decision — what the first batch holds, whether it swaps in and
+        whether the tail fetch chains (the remaining-fetch decision) — comes
+        from the context-page engines (``artist_songs_first_batch`` /
+        ``artist_songs_tail``, natively implemented when the extension is
+        built); this coroutine only does the I/O and the table mutations.
+
         Silent on failure — if the fetch errors or the playlist is empty,
         leave the existing (truncated) list in place and log a debug message.
         """
@@ -585,36 +653,31 @@ class ContextPage(TrackFilterHost, Widget):
         except Exception:
             logger.debug("Failed to fetch full artist songs for %s", browse_id, exc_info=True)
             return
-        raw_tracks = data.get("tracks", []) if isinstance(data, dict) else []
-        if not raw_tracks:
-            return
-        full_tracks = normalize_tracks(raw_tracks)
-        if not full_tracks:
+        batch = artist_songs_first_batch(data)
+        if not batch["load"]:
             return
         try:
-            table.load_tracks(full_tracks)
+            table.load_tracks(batch["tracks"])
         except Exception:
             logger.debug("Failed to swap artist songs table contents", exc_info=True)
             return
 
-        # Chain remaining tracks if the playlist exceeds the first batch.
-        # If trackCount isn't exposed, fall back to attempting the call and
-        # treating empty/error as "nothing more to fetch".
-        total_count = data.get("trackCount") if isinstance(data, dict) else None
-        if total_count is not None and total_count <= len(raw_tracks):
+        # Chain remaining tracks when the plan's remaining-fetch decision
+        # says the playlist exceeds the first batch (a missing trackCount
+        # falls back to attempting the call; the tail plan treats an
+        # empty/error response as "nothing more to fetch").
+        if not batch["fetch_remaining"]:
             return
         try:
-            remaining = await ytmusic.get_playlist_remaining(browse_id, len(raw_tracks))
+            remaining = await ytmusic.get_playlist_remaining(browse_id, batch["raw_count"])
         except Exception:
             logger.debug("Failed to fetch remaining artist songs for %s", browse_id, exc_info=True)
             return
-        if not remaining:
-            return
-        remaining_tracks = normalize_tracks(remaining)
-        if not remaining_tracks:
+        tail = artist_songs_tail(remaining)
+        if not tail["append"]:
             return
         try:
-            table.append_tracks(remaining_tracks)
+            table.append_tracks(tail["tracks"])
         except Exception:
             logger.debug("Failed to append remaining artist songs", exc_info=True)
 
@@ -813,11 +876,12 @@ class ContextPage(TrackFilterHost, Widget):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same view-model assembly; these
-# bindings replace the pure-Python transcriptions above when the extension
-# is importable.  The rebinding must happen AFTER the definitions above —
-# assigning the native functions any earlier would be clobbered by the
-# ``def`` statements (the lesson that produced formatting.py's dead native
+# The Rust extension implements the same view-model assembly and the
+# artist songs worker merge's decision core; these bindings replace the
+# pure-Python transcriptions above when the extension is importable.
+# The rebinding must happen AFTER the definitions above — assigning the
+# native functions any earlier would be clobbered by the ``def``
+# statements (the lesson that produced formatting.py's dead native
 # bindings).
 
 try:
@@ -826,6 +890,12 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         artist_discography as _native_artist_discography,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        artist_songs_first_batch as _native_artist_songs_first_batch,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        artist_songs_tail as _native_artist_songs_tail,
     )
     from ytm_player.utils._ytm_player_native import (
         expandable_sections as _native_expandable_sections,
@@ -840,3 +910,5 @@ else:
     playlist_header = _native_playlist_header  # type: ignore[assignment]
     artist_discography = _native_artist_discography  # type: ignore[assignment]
     expandable_sections = _native_expandable_sections  # type: ignore[assignment]
+    artist_songs_first_batch = _native_artist_songs_first_batch  # type: ignore[assignment]
+    artist_songs_tail = _native_artist_songs_tail  # type: ignore[assignment]

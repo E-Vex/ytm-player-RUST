@@ -257,12 +257,18 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // (title, subtitle, unavailable count, the playlist's owned flag and
     // remaining-tail fetch gate), the artist discography (top songs,
     // the albums+singles concatenation, subscribers and the
-    // similar-artists bar), and the see-all section selection behind
-    // the discography expansion.
+    // similar-artists bar), the see-all section selection behind the
+    // discography expansion, and the artist-songs worker merge's
+    // decision core — the first-batch plan and the remaining-fetch
+    // decision behind `_fetch_full_artist_songs`'s swap of the artist's
+    // full song list into the top-songs table, plus the tail plan for
+    // the chained remaining-tracks fetch.
     module.add_function(pyo3::wrap_pyfunction!(album_header, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(playlist_header, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(artist_discography, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(expandable_sections, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(artist_songs_first_batch, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(artist_songs_tail, module)?)?;
 
     // Play-history row engine (ytm_player/services/history.py
     // equivalent): the skip gate and insert-row assembly behind
@@ -5924,6 +5930,165 @@ fn artist_discography<'py>(
     out.set_item("songs_browse_id", songs_browse_id)?;
     out.set_item("albums", PyList::new(py, album_rows)?)?;
     out.set_item("related_text", related_text)?;
+    Ok(out)
+}
+
+/// The closed first-batch plan — nothing to load, no tail to chain —
+/// for the worker's early-return gates (an empty raw batch, a batch
+/// normalization dropped everything from) and for the shapes the
+/// reference could not read at all (a non-dict `data`, a truthy
+/// non-list `tracks`).
+fn artist_songs_closed_plan(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("tracks", PyList::empty(py))?;
+    out.set_item("load", false)?;
+    out.set_item("fetch_remaining", false)?;
+    out.set_item("raw_count", 0)?;
+    Ok(out)
+}
+
+/// The first-batch plan behind the context-page worker merge — the pure
+/// decision core of the first half of
+/// `ContextPage._fetch_full_artist_songs` from `ui/pages/context.py`,
+/// the background fetch that swaps the artist's full song list (the
+/// playlist behind `songs.browseId`, fetched because ytmusicapi
+/// truncates artist top songs) into the top-songs table.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// raw_tracks = data.get("tracks", []) if isinstance(data, dict) else []
+/// if not raw_tracks: return
+/// full_tracks = normalize_tracks(raw_tracks)
+/// if not full_tracks: return
+/// ```
+///
+/// Returned keys:
+///
+/// - `tracks` — `normalize_tracks(raw_tracks)`, the batch to swap into
+///   the top-songs table; `[]` whenever the swap gate below is closed
+///   (the caller leaves the existing truncated list in place).
+/// - `load` — the swap gate: the batch only loads when the raw list is
+///   non-empty AND normalization kept something (an all-unplayable
+///   batch swaps nothing in).
+/// - `fetch_remaining` — the remaining-fetch decision, the merge's
+///   core: the chained `get_playlist_remaining` tail fetch runs only
+///   when the batch loaded AND the stored `trackCount` does not
+///   already cover it — a missing `trackCount` (or an explicit `None`)
+///   falls back to attempting the call, with empty/error there reading
+///   as "nothing more to fetch"; a count at or below the raw batch
+///   length closes the gate.
+/// - `raw_count` — `len(raw_tracks)`, the `already_have` the tail
+///   fetch resumes from; 0 whenever the tail gate is closed.
+///
+/// Field reads resolve exactly like the reference's `.get` calls, so
+/// dict subclasses steer the plan like they steer the reference. Where
+/// the reference would raise — a truthy non-list `tracks` (its
+/// `normalize_tracks` iteration) or a stored `trackCount` Python's
+/// `<=` would reject (`TypeError`, both unreachable through the
+/// service's dict-shaped, int-counted responses) — the engine stays
+/// total and reads the batch as closed, the same stance the header
+/// engines take.
+#[pyfunction]
+fn artist_songs_first_batch<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // raw_tracks = data.get("tracks", []) if isinstance(data, dict) else []
+    let raw_tracks = if data.is_instance_of::<PyDict>() {
+        let empty = PyList::empty(py).into_any();
+        field_get(py, data, "tracks", Some(empty))?
+    } else {
+        PyList::empty(py).into_any()
+    };
+    // if not raw_tracks: return — no swap, no tail fetch.
+    if !raw_tracks.is_truthy()? {
+        return artist_songs_closed_plan(py);
+    }
+    let (tracks, raw_len) = normalized_tracks_and_len(py, &raw_tracks)?;
+    // if not full_tracks: return — same gate one step later. A truthy
+    // non-list raw (where the reference's normalize_tracks would raise
+    // in the iteration) reads as no tracks here.
+    let raw_count = match raw_len {
+        Some(len) if !tracks.is_empty() => len,
+        _ => return artist_songs_closed_plan(py),
+    };
+
+    // The remaining-fetch decision:
+    //   total_count = data.get("trackCount")
+    //   if total_count is not None and total_count <= len(raw_tracks):
+    //       return
+    // — a `None` (missing or explicit) falls back to attempting the
+    // call; any comparable count above the batch length chains the
+    // tail; anything else closes the gate. `data` is a dict or dict
+    // subclass on every path that reaches here (a non-dict read as an
+    // empty batch above), so the `trackCount` read steers exactly like
+    // the reference's.
+    let total = field_get(py, data, "trackCount", None)?;
+    let fetch_remaining = if total.is_none() {
+        true
+    } else {
+        // numeric_gt(total, raw_count) == Some(true) is exactly
+        // `total > raw_count` — the one comparable outcome whose `<=`
+        // reads False and the tail chains. Some(false) is
+        // `total <= raw_count` (gate closed), and an uncomparable
+        // value — where the reference's `<=` would raise TypeError —
+        // closes the gate too, the header engines' stance.
+        numeric_gt(&total, raw_count) == Some(true)
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("tracks", tracks)?;
+    out.set_item("load", true)?;
+    out.set_item("fetch_remaining", fetch_remaining)?;
+    out.set_item("raw_count", raw_count)?;
+    Ok(out)
+}
+
+/// The tail plan behind the context-page worker merge — the pure
+/// decision core of the second half of
+/// `ContextPage._fetch_full_artist_songs` from `ui/pages/context.py`:
+/// what the chained `get_playlist_remaining` fetch appends to the
+/// top-songs table.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// if not remaining: return
+/// remaining_tracks = normalize_tracks(remaining)
+/// if not remaining_tracks: return
+/// ```
+///
+/// Returned keys:
+///
+/// - `tracks` — `normalize_tracks(remaining)`, the tail rows to
+///   append; `[]` whenever the append gate below is closed.
+/// - `append` — the append gate: the tail only lands when the fetched
+///   remaining list is non-empty AND normalization kept something (an
+///   all-unplayable tail is dropped, the batch stays as it loaded).
+///
+/// A truthy non-list `remaining` (where the reference's
+/// `normalize_tracks` iteration would raise — unreachable through
+/// `get_playlist_remaining`, which slices a list) reads as no rows —
+/// the engine stays total, the same stance the first-batch engine
+/// takes.
+#[pyfunction]
+fn artist_songs_tail<'py>(
+    py: Python<'py>,
+    remaining: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // if not remaining: return — nothing to append.
+    if !remaining.is_truthy()? {
+        let out = PyDict::new(py);
+        out.set_item("tracks", PyList::empty(py))?;
+        out.set_item("append", false)?;
+        return Ok(out);
+    }
+    let (tracks, _) = normalized_tracks_and_len(py, remaining)?;
+    let append = !tracks.is_empty();
+    let out = PyDict::new(py);
+    out.set_item("tracks", tracks)?;
+    out.set_item("append", append)?;
     Ok(out)
 }
 
