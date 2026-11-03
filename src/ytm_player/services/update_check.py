@@ -24,7 +24,25 @@ _REQUEST_TIMEOUT = 5.0
 
 
 def _is_newer(latest: str, current: str) -> bool:
-    """True when *latest* is strictly newer than *current* under PEP 440."""
+    """True when *latest* is strictly newer than *current* under PEP 440.
+
+    Only ``InvalidVersion`` is caught: a version whose numeric components
+    exceed CPython's int-conversion digit limit raises the plain
+    ``ValueError`` the constructor's own ``int()`` raises — not an
+    ``InvalidVersion`` — and propagates, exactly like the reference this
+    engine is transcribed from.
+
+    The comparison is whatever the installed ``packaging`` says it is:
+    through 26.0 its grammar admitted the simple Unicode case folds
+    (``1.0+ſ`` parses), 26.1+ scopes them out — so the verdict for such
+    spellings follows the installed release. The native engine probes
+    the same behaviour once and mirrors it (see
+    ``_packaging_admits_unicode_folds``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.pep440_is_newer``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     try:
         return Version(latest) > Version(current)
     except InvalidVersion:
@@ -94,3 +112,55 @@ def check_for_update(current_version: str, cache_file: Path) -> str | None:
     if _is_newer(latest, current_version):
         return latest
     return None
+
+
+# ── Native (Rust/PyO3) overrides, if available ─────────────────────────────
+# The Rust extension implements the same engines; these bindings override
+# the pure-Python transcriptions above when the extension is importable.
+# The rebinding must happen AFTER the definitions above — assigning the
+# native functions any earlier would be clobbered by the ``def``
+# statements (the lesson that produced formatting.py's dead native
+# bindings).
+
+# Cache for the installed-packaging fold probe (see
+# _packaging_admits_unicode_folds below): None = not probed yet.
+_PACKAGING_ADMITS_UNICODE_FOLDS: bool | None = None
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        pep440_is_newer as _native_pep440_is_newer,
+    )
+except ImportError:
+    pass
+else:
+
+    def _packaging_admits_unicode_folds() -> bool:
+        """True when the installed ``packaging`` PEP 440 grammar admits the
+        simple Unicode case folds — the long s ``ſ`` (U+017F), the Kelvin
+        sign ``K`` (U+212A), the dotted and dotless ``İ``/``ı``
+        (U+0130/U+0131) — wherever a letter can appear.
+
+        ``packaging`` compiled its version grammar with plain
+        ``re.IGNORECASE`` through 26.0, so those folds parsed as valid
+        versions there (``Version("1.0+ſ")`` works); 26.1 scoped the
+        grammar's groups ``(?a:...)`` and the local alphabet ASCII, so
+        the same spellings are ``InvalidVersion`` now. The pure-Python
+        fallback follows the installed ``packaging`` by construction — it
+        calls ``Version`` directly — so the native engine must follow it
+        too: this probe (one parse attempt, cached) is the verdict both
+        sides agree on, whichever ``packaging`` the uncapped ``>=21.0``
+        dependency range admits.
+        """
+        global _PACKAGING_ADMITS_UNICODE_FOLDS
+        if _PACKAGING_ADMITS_UNICODE_FOLDS is None:
+            try:
+                Version("1.0+\u017f")
+            except ValueError:
+                _PACKAGING_ADMITS_UNICODE_FOLDS = False
+            else:
+                _PACKAGING_ADMITS_UNICODE_FOLDS = True
+        return _PACKAGING_ADMITS_UNICODE_FOLDS
+
+    def _is_newer(latest: str, current: str) -> bool:  # noqa: F811
+        """Strictly-newer verdict (native), on the installed packaging's grammar."""
+        return _native_pep440_is_newer(latest, current, _packaging_admits_unicode_folds())

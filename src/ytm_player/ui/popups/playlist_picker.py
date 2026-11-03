@@ -44,13 +44,106 @@ def _save_recent_ids(ids: list[str]) -> None:
         logger.debug("Could not save recent playlists", exc_info=True)
 
 
-def _record_recent(playlist_id: str) -> None:
-    """Move *playlist_id* to the front of the recent list and persist."""
-    recent = _load_recent_ids()
+def _record_recent_ids(recent: list[str], playlist_id: str) -> list[str]:
+    """The move-to-front update — the ``_record_recent`` engine.
+
+    The pure half of the recently-used bookkeeping: the first equal
+    occurrence of *playlist_id* is removed (``list.remove`` drops exactly
+    one) and the id is inserted at the front. The mutated list is
+    returned; the caller persists it (with the ``MAX_RECENT`` cap applied
+    at save time).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_record_recent``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
     if playlist_id in recent:
         recent.remove(playlist_id)
     recent.insert(0, playlist_id)
-    _save_recent_ids(recent)
+    return recent
+
+
+def _record_recent(playlist_id: str) -> None:
+    """Move *playlist_id* to the front of the recent list and persist."""
+    recent = _load_recent_ids()
+    _save_recent_ids(_record_recent_ids(recent, playlist_id))
+
+
+def _sorted_by_recent(
+    playlists: list[dict[str, Any]], recent_ids: list[str]
+) -> list[dict[str, Any]]:
+    """The recency sort — the ``_sort_by_recent`` engine.
+
+    The pure half of the picker's list ordering: no recent ids means no
+    sort at all (the playlist order is whatever the fetch produced);
+    otherwise the key is ``(0, recent_order[pid])`` for a playlist whose
+    id is in the recent list and ``(1, 0)`` for one that is not, and the
+    sort is stable. ``recent_order`` is the dict comprehension, so a
+    duplicated recent id counts at its last position.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_picker_sort``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if not recent_ids:
+        return playlists
+
+    recent_set = set(recent_ids)
+    recent_order = {pid: i for i, pid in enumerate(recent_ids)}
+
+    def sort_key(pl: dict) -> tuple[int, int]:
+        pid = pl.get("playlistId", pl.get("id", ""))
+        if pid in recent_set:
+            return (0, recent_order[pid])
+        return (1, 0)
+
+    return sorted(playlists, key=sort_key)
+
+
+def _visible_picker_rows(
+    playlists: list[dict[str, Any]], filter_text: str
+) -> list[tuple[Any, Any, Any]]:
+    """The filtered rows — the ``_populate_list`` row engine.
+
+    The pure half of the picker's list rebuild: the query is
+    ``filter_text.strip().lower()`` (stripped first, then lowercased); an
+    empty query shows every playlist, a non-empty one only those whose
+    title lowercased contains it; and each surviving playlist contributes
+    the row ``(playlist_id, title, count)`` — the id through the
+    ``playlistId``-then-``id``-then-``""`` read, the title with its
+    "Untitled" default, and the count as ``""`` when absent or falsy,
+    ``str(count)`` when truthy.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_picker_rows``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    query = filter_text.strip().lower()
+
+    rows: list[tuple[Any, Any, Any]] = []
+    for pl in playlists:
+        title = pl.get("title", "Untitled")
+        if query and query not in title.lower():
+            continue
+        playlist_id = pl.get("playlistId", pl.get("id", ""))
+        track_count = pl.get("count", "")
+        if track_count:
+            track_count = str(track_count)
+        rows.append((playlist_id, title, track_count))
+    return rows
+
+
+def _count_label(count: int) -> str:
+    """The playlist-count status label — the ``_populate_list`` label engine.
+
+    The pure half of the picker's status line: ``f"{count} playlist{'s' if
+    count != 1 else ''}"``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_picker_count_label``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return f"{count} playlist{'s' if count != 1 else ''}"
 
 
 class _PlaylistItem(ListItem):
@@ -186,19 +279,7 @@ class PlaylistPicker(BasePopup[str | None]):
     def _sort_by_recent(self) -> None:
         """Sort playlists so recently-used ones appear first."""
         recent_ids = _load_recent_ids()
-        if not recent_ids:
-            return
-
-        recent_set = set(recent_ids)
-        recent_order = {pid: i for i, pid in enumerate(recent_ids)}
-
-        def sort_key(pl: dict) -> tuple[int, int]:
-            pid = pl.get("playlistId", pl.get("id", ""))
-            if pid in recent_set:
-                return (0, recent_order[pid])
-            return (1, 0)
-
-        self._playlists.sort(key=sort_key)
+        self._playlists = _sorted_by_recent(self._playlists, recent_ids)
 
     def _populate_list(self, filter_text: str = "", *, focus: bool = True) -> None:
         """Rebuild the ListView with current playlists, optionally filtered.
@@ -223,20 +304,10 @@ class PlaylistPicker(BasePopup[str | None]):
             filter_input.display = False
         else:
             if not self._submitting:
-                count = len(self._playlists)
-                status.update(f"{count} playlist{'s' if count != 1 else ''}")
+                status.update(_count_label(len(self._playlists)))
             filter_input.display = True
 
-        query = filter_text.strip().lower()
-
-        for pl in self._playlists:
-            title = pl.get("title", "Untitled")
-            if query and query not in title.lower():
-                continue
-            playlist_id = pl.get("playlistId", pl.get("id", ""))
-            track_count = pl.get("count", "")
-            if track_count:
-                track_count = str(track_count)
+        for playlist_id, title, track_count in _visible_picker_rows(self._playlists, filter_text):
             list_view.append(_PlaylistItem(playlist_id, title, track_count))
 
         if focus:
@@ -613,3 +684,49 @@ class PlaylistPicker(BasePopup[str | None]):
             self.notify(f"Failed to add to '{title}'", severity="error")
             status.update("Error")
             self._release()
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same view-model engines; these
+# bindings override the pure-Python transcriptions above when the
+# extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playlist_picker_count_label as _native_playlist_picker_count_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_picker_rows as _native_playlist_picker_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_picker_sort as _native_playlist_picker_sort,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_record_recent as _native_playlist_record_recent,
+    )
+except ImportError:
+    pass
+else:
+
+    def _record_recent_ids(recent: list[str], playlist_id: str) -> list[str]:  # noqa: F811
+        """The move-to-front update (native Rust engine)."""
+        return _native_playlist_record_recent(recent, playlist_id)
+
+    def _sorted_by_recent(  # noqa: F811
+        playlists: list[dict[str, Any]], recent_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """The recency sort (native Rust engine)."""
+        return _native_playlist_picker_sort(playlists, recent_ids)
+
+    def _visible_picker_rows(  # noqa: F811
+        playlists: list[dict[str, Any]], filter_text: str
+    ) -> list[tuple[Any, Any, Any]]:
+        """The filtered rows (native Rust engine)."""
+        return _native_playlist_picker_rows(playlists, filter_text)
+
+    def _count_label(count: int) -> str:  # noqa: F811
+        """The playlist-count status label (native Rust engine)."""
+        return _native_playlist_picker_count_label(count)

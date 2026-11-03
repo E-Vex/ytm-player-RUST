@@ -419,6 +419,32 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // fractional-second conversion, the timestamp stripping and the
     // stable timestamp sort.
     module.add_function(pyo3::wrap_pyfunction!(parse_synced_lyrics, module)?)?;
+
+    // Update-check version comparison (services/update_check.py
+    // equivalent): the strictly-newer PEP 440 verdict behind
+    // check_for_update's cache-hit and post-fetch decisions, on the same
+    // packaging grammar shape the installed release compiled (the fold
+    // flag the Python side probes once and passes down).
+    module.add_function(pyo3::wrap_pyfunction!(pep440_is_newer, module)?)?;
+
+    // Help-page rows engine (ui/pages/help.py equivalents): the
+    // keybinding-reference row assembly (the action-value title-casing
+    // through CPython's own str.title semantics, the key-sequence join,
+    // the "(unbound)" placeholder) and the filtered walk (the
+    // lowercased-then-stripped needle, the haystack containment, the
+    // category-header insertion) behind the searchable help table.
+    module.add_function(pyo3::wrap_pyfunction!(help_page_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(help_page_visible_rows, module)?)?;
+
+    // Playlist-picker view model (ui/popups/playlist_picker.py
+    // equivalents): the recent-list move-to-front bookkeeping behind
+    // _record_recent, the recency sort behind _sort_by_recent, the
+    // filtered visible-row walk behind _populate_list and the
+    // playlist-count status label.
+    module.add_function(pyo3::wrap_pyfunction!(playlist_record_recent, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(playlist_picker_sort, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(playlist_picker_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(playlist_picker_count_label, module)?)?;
     Ok(())
 }
 
@@ -7486,45 +7512,64 @@ struct Pep440Key {
     local: Option<Vec<Pep440LocalSeg>>,
 }
 
-/// Parse a version string into its PEP 440 comparison key, or None when
-/// the string is not a valid version — or one of its numbers exceeds
+/// How a PEP 440 parse failed. The distinction matters to callers that
+/// catch only `InvalidVersion` (an `InvalidVersion` subclass): the
+/// grammar's rejection is that exception, while a numeric component past
+/// CPython's int-conversion digit limit is the plain `ValueError` the
+/// constructor's own `int()` raises — which those callers let propagate.
+enum Pep440Err {
+    /// The grammar rejected the string — packaging raises `InvalidVersion`.
+    Invalid,
+    /// A numeric component exceeds CPython's int-conversion digit limit
+    /// (see `INT_MAX_STR_DIGITS`) — the constructor's `int()` raises a
+    /// plain `ValueError`, not an `InvalidVersion`.
+    IntLimit,
+}
+
+/// `BigNum::from_digits` with the failure reason kept: `None` (the digit
+/// run exceeds CPython's int-conversion limit) becomes `Pep440Err::IntLimit`.
+fn big_num(digits: &str) -> Result<BigNum, Pep440Err> {
+    BigNum::from_digits(digits).ok_or(Pep440Err::IntLimit)
+}
+
+/// Parse a version string into its PEP 440 comparison key, keeping the
+/// failure reason: `Err(Pep440Err::Invalid)` when the grammar rejects the
+/// string, `Err(Pep440Err::IntLimit)` when a numeric component exceeds
 /// CPython's int-conversion digit limit (see `INT_MAX_STR_DIGITS`).
 /// *admit_unicode_folds* selects the grammar shape (see `PEP440_FOLD_RE`).
-fn parse_pep440(text: &str, admit_unicode_folds: bool) -> Option<Pep440Key> {
+fn parse_pep440_err(text: &str, admit_unicode_folds: bool) -> Result<Pep440Key, Pep440Err> {
     let caps = if admit_unicode_folds {
-        PEP440_FOLD_RE.captures(text)?
+        PEP440_FOLD_RE.captures(text)
     } else {
-        PEP440_ASCII_RE.captures(text)?
+        PEP440_ASCII_RE.captures(text)
     };
+    let caps = caps.ok_or(Pep440Err::Invalid)?;
 
-    let epoch = BigNum::from_digits(caps.name("epoch").map(|m| m.as_str()).unwrap_or("0"))?;
+    let epoch = big_num(caps.name("epoch").map(|m| m.as_str()).unwrap_or("0"))?;
     let mut release: Vec<BigNum> = caps
-        .name("release")?
+        .name("release")
+        .ok_or(Pep440Err::Invalid)?
         .as_str()
         .split('.')
-        .map(BigNum::from_digits)
-        .collect::<Option<Vec<_>>>()?;
+        .map(big_num)
+        .collect::<Result<Vec<_>, _>>()?;
     // Strip trailing zeros: 1.0.0 compares equal to 1.
     while release.last().is_some_and(BigNum::is_zero) {
         release.pop();
     }
 
-    // Each numeric group is Option<Option<BigNum>>: the outer Option is
-    // "did the group match", the inner is the digit-limit-checked number.
-    // A matched group whose digits exceed the limit invalidates the whole
-    // version (the reference's int() raises through), an unmatched one
+    // Each numeric group is Option<Result<BigNum, Pep440Err>>: the outer
+    // Option is "did the group match", the inner is the digit-limit-checked
+    // number. A matched group whose digits exceed the limit invalidates the
+    // whole version (the reference's int() raises through), an unmatched one
     // simply carries no number.
     let pre_l = caps.name("pre_l").map(|m| m.as_str());
-    let pre_n = caps.name("pre_n").map(|m| BigNum::from_digits(m.as_str()));
-    let post_n1 = caps
-        .name("post_n1")
-        .map(|m| BigNum::from_digits(m.as_str()));
+    let pre_n = caps.name("pre_n").map(|m| big_num(m.as_str()));
+    let post_n1 = caps.name("post_n1").map(|m| big_num(m.as_str()));
     let post_l = caps.name("post_l").map(|m| m.as_str());
-    let post_n2 = caps
-        .name("post_n2")
-        .map(|m| BigNum::from_digits(m.as_str()));
+    let post_n2 = caps.name("post_n2").map(|m| big_num(m.as_str()));
     let dev_l = caps.name("dev_l").map(|m| m.as_str());
-    let dev_n = caps.name("dev_n").map(|m| BigNum::from_digits(m.as_str()));
+    let dev_n = caps.name("dev_n").map(|m| big_num(m.as_str()));
 
     let post_matched = post_n1.is_some() || post_l.is_some();
     let dev_matched = dev_l.is_some();
@@ -7589,21 +7634,30 @@ fn parse_pep440(text: &str, admit_unicode_folds: bool) -> Option<Pep440Key> {
                     if part.bytes().all(|b| b.is_ascii_digit()) {
                         // int(part): a digit run beyond the int-conversion
                         // limit invalidates the version.
-                        BigNum::from_digits(part).map(Pep440LocalSeg::Num)
+                        big_num(part).map(Pep440LocalSeg::Num)
                     } else {
-                        Some(Pep440LocalSeg::Str(part.to_lowercase()))
+                        Ok(Pep440LocalSeg::Str(part.to_lowercase()))
                     }
                 })
-                .collect::<Option<Vec<Pep440LocalSeg>>>()?,
+                .collect::<Result<Vec<Pep440LocalSeg>, _>>()?,
         ),
     };
 
-    Some(Pep440Key {
+    Ok(Pep440Key {
         epoch,
         release,
         suffix,
         local,
     })
+}
+
+/// Parse a version string into its PEP 440 comparison key, or None when
+/// the string is not a valid version — or one of its numbers exceeds
+/// CPython's int-conversion digit limit (see `INT_MAX_STR_DIGITS`); both
+/// failure kinds read the same to the crash-staleness verdict (no note).
+/// *admit_unicode_folds* selects the grammar shape (see `PEP440_FOLD_RE`).
+fn parse_pep440(text: &str, admit_unicode_folds: bool) -> Option<Pep440Key> {
+    parse_pep440_err(text, admit_unicode_folds).ok()
 }
 
 /// Split exactly like CPython's `str.split()` with no separator: on
@@ -9311,4 +9365,675 @@ fn parse_synced_lyrics(raw: &str) -> Vec<(f64, String)> {
     // the reference's ordering exactly.
     lines.sort_by(|a, b| a.0.total_cmp(&b.0));
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Update-check version comparison (mirrors services/update_check.py)
+// ---------------------------------------------------------------------------
+
+/// The strictly-newer PEP 440 verdict behind `check_for_update` from
+/// `services/update_check.py` — the pure core of `_is_newer`.
+///
+/// Mirrors the pure-Python reference: `Version(latest) > Version(current)`
+/// with only `InvalidVersion` caught (returning `False`). The parse and
+/// the comparison are the shared PEP 440 machinery the crash-staleness
+/// engine already uses (`parse_pep440_err` → the `Pep440Key` ordering),
+/// so every accept/reject and every ordering decision the reference makes
+/// comes free — epochs, trailing-zero releases, the pre/post/dev slot
+/// tuples, local segments.
+///
+/// The two failure kinds differ exactly as the reference's single
+/// `except InvalidVersion` makes them:
+///
+/// - a grammar rejection is `InvalidVersion` — the reference catches it
+///   and returns `False`, so the engine answers `Ok(false)` directly;
+/// - a numeric component past CPython's int-conversion digit limit is
+///   the plain `ValueError` the constructor's own `int()` raises (NOT an
+///   `InvalidVersion`) — the reference lets it propagate out of
+///   `_is_newer` into `check_for_update`'s caller, so the engine raises
+///   `PyValueError` with CPython's own message shape and the binding
+///   passes it through untouched.
+///
+/// `Version(latest)` evaluates before `Version(current)` in the
+/// reference's expression, so a bad *latest* never even parses *current*:
+/// the engine mirrors the order (an over-limit latest raises before the
+/// current string is looked at, an invalid latest short-circuits to
+/// `Ok(false)` the same way).
+///
+/// *admit_unicode_folds* steers the PEP 440 grammar to the shape the
+/// installed `packaging` compiled — the Python side probes it once
+/// (`Version("1.0+ſ")`: parseable through packaging 26.0, InvalidVersion
+/// from 26.1's `(?a:...)` scoping on) and passes the verdict here, so
+/// the engine tracks the reference the fallback itself calls, on every
+/// `packaging` the dependency range (`>=21.0`, uncapped) admits.
+#[pyfunction]
+#[pyo3(signature = (latest, current, admit_unicode_folds))]
+fn pep440_is_newer(latest: &str, current: &str, admit_unicode_folds: bool) -> PyResult<bool> {
+    let latest_key = match parse_pep440_err(latest, admit_unicode_folds) {
+        Ok(key) => key,
+        // except InvalidVersion: return False — the grammar's rejection
+        // never reaches the comparison.
+        Err(Pep440Err::Invalid) => return Ok(false),
+        // The plain ValueError CPython's int() raises for an over-limit
+        // component — not an InvalidVersion, so it propagates.
+        Err(Pep440Err::IntLimit) => return Err(int_limit_error(latest)),
+    };
+    let current_key = match parse_pep440_err(current, admit_unicode_folds) {
+        Ok(key) => key,
+        Err(Pep440Err::Invalid) => return Ok(false),
+        Err(Pep440Err::IntLimit) => return Err(int_limit_error(current)),
+    };
+    Ok(latest_key > current_key)
+}
+
+/// The `ValueError` CPython's own `int()` raises for a digit run past the
+/// conversion limit, in CPython's message shape — the digit count the
+/// reference's message reports is the offending operand's longest digit
+/// run (the component the constructor was converting when it raised).
+fn int_limit_error(version: &str) -> PyErr {
+    let digits = version
+        .split(|c: char| !c.is_ascii_digit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    PyValueError::new_err(format!(
+        "Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion: value \
+         has {digits} digits; use sys.set_int_max_str_digits() to increase the limit"
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Help-page rows engine (mirrors ui/pages/help.py)
+// ---------------------------------------------------------------------------
+
+/// The titlecase-letter category (Lt) — the 31 characters whose UnicodeData
+/// titlecase field is the mixed-case digraph form (ǅ-style). CPython's
+/// `ISTITLE` tests exactly this category, and `str.title()`'s
+/// previous-is-cased check admits them (see `py_is_cased`); Rust's
+/// `char::is_uppercase`/`is_lowercase` (the Uppercase/Lowercase derived
+/// properties: Lu+Other_Uppercase / Ll+Other_Lowercase) do not, so the
+/// category is spelled out. The set has been stable across every Unicode
+/// version CPython 3.10–3.14 ships.
+fn is_titlecase_letter(c: char) -> bool {
+    matches!(
+        c,
+        '\u{01C5}'
+            | '\u{01C8}'
+            | '\u{01CB}'
+            | '\u{01F2}'
+            | '\u{1F88}'..='\u{1F8F}'
+            | '\u{1F98}'..='\u{1F9F}'
+            | '\u{1FA8}'..='\u{1FAF}'
+            | '\u{1FBC}'
+            | '\u{1FCC}'
+            | '\u{1FFC}'
+    )
+}
+
+/// CPython's "cased" test as `str.title()` applies it: the Uppercase
+/// derived property (Lu + Other_Uppercase — Rust's `char::is_uppercase`,
+/// which is why Roman numerals and circled letters count) ∪ the Lowercase
+/// derived property (Ll + Other_Lowercase — `char::is_lowercase`, which
+/// is why modifier letters like `ʰ` and ordinal indicators like `ª`
+/// count) ∪ the titlecase letters (Lt — see `is_titlecase_letter`).
+fn py_is_cased(c: char) -> bool {
+    c.is_uppercase() || c.is_lowercase() || is_titlecase_letter(c)
+}
+
+/// The Case_Ignorable property: characters a final-sigma scan steps over.
+/// Case_Ignorable = Word_Break ∈ {MidLetter, MidNumLet, Single_Quote} ∪
+/// general categories {Mn, Me, Cf, Lm}. The general categories come from
+/// the regex crate's Unicode tables (`unicode-gencat`); the word-break
+/// characters and the modifier symbols the property also claims are the
+/// explicit list (verified against CPython's own tables char by char —
+/// every member below is Case_Ignorable on every Unicode release CPython
+/// 3.10–3.14 ships). A newly-scripted combining mark the regex tables
+/// know but an older CPython does not is the one place the two sides can
+/// disagree, and only for characters younger than the interpreter's
+/// Unicode — never for the ASCII identifiers the help rows carry.
+static CASE_IGNORABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"^[\u{0027}\u{002e}\u{003a}\u{005e}\u{0060}\u{00a8}\u{00af}\u{00b4}",
+        r"\u{00b7}\u{00b8}\u{02c2}\u{02c3}\u{02c4}\u{02c5}\u{02d2}\u{02d3}",
+        r"\u{02d4}\u{02d5}\u{02d6}\u{02d7}\u{02d8}\u{02d9}\u{02da}\u{02db}",
+        r"\u{02dc}\u{02dd}\u{02de}\u{02df}\u{02e5}\u{02e6}\u{02e7}\u{02e8}",
+        r"\u{02e9}\u{02ea}\u{02eb}\u{02ed}\u{02ef}\u{02f0}\u{02f1}\u{02f2}",
+        r"\u{02f3}\u{02f4}\u{02f5}\u{02f6}\u{02f7}\u{02f8}\u{02f9}\u{02fa}",
+        r"\u{02fb}\u{02fc}\u{02fd}\u{02fe}\u{02ff}\u{0375}\u{0384}\u{0385}",
+        r"\u{0387}\u{055f}\u{05f4}\u{0888}\u{1fbd}\u{1fbf}\u{1fc0}\u{1fc1}",
+        r"\u{1fcd}\u{1fce}\u{1fcf}\u{1fdd}\u{1fde}\u{1fdf}\u{1fed}\u{1fee}",
+        r"\u{1fef}\u{1ffd}\u{1ffe}\u{2018}\u{2019}\u{2024}\u{2027}\u{309b}",
+        r"\u{309c}\u{a700}\u{a701}\u{a702}\u{a703}\u{a704}\u{a705}\u{a706}",
+        r"\u{a707}\u{a708}\u{a709}\u{a70a}\u{a70b}\u{a70c}\u{a70d}\u{a70e}",
+        r"\u{a70f}\u{a710}\u{a711}\u{a712}\u{a713}\u{a714}\u{a715}\u{a716}",
+        r"\u{a720}\u{a721}\u{a789}\u{a78a}\u{ab5b}\u{ab6a}\u{ab6b}\u{fbb2}",
+        r"\u{fbb3}\u{fbb4}\u{fbb5}\u{fbb6}\u{fbb7}\u{fbb8}\u{fbb9}\u{fbba}",
+        r"\u{fbbb}\u{fbbc}\u{fbbd}\u{fbbe}\u{fbbf}\u{fbc0}\u{fbc1}\u{fbc2}",
+        r"\u{fe13}\u{fe52}\u{fe55}\u{ff07}\u{ff0e}\u{ff1a}\u{ff3e}\u{ff40}",
+        r"\u{ffe3}\u{1f3fb}\u{1f3fc}\u{1f3fd}\u{1f3fe}\u{1f3ff}",
+        r"\p{Mn}\p{Me}\p{Cf}\p{Lm}]$",
+    ))
+    .expect("valid case-ignorable class")
+});
+
+/// Case_Ignorable for a single character (see `CASE_IGNORABLE_RE`).
+fn case_ignorable(c: char) -> bool {
+    let mut buf = [0u8; 4];
+    CASE_IGNORABLE_RE.is_match(c.encode_utf8(&mut buf))
+}
+
+/// Every code point whose titlecase mapping differs from its uppercase
+/// mapping — the table `py_title` needs, because Rust's stable `std` has
+/// no `to_titlecase`. For every character NOT in this table the titlecase
+/// mapping equals the uppercase mapping (verified exhaustively against
+/// CPython: 135 divergences), which Rust's `char::to_uppercase` — the
+/// full Unicode uppercase mapping, multi-character expansions included —
+/// implements with the same mappings CPython does.
+///
+/// The members, all stable since the Unicode versions CPython 3.10–3.14
+/// ship: the sharp s (`ß` → `Ss`, the SpecialCasing title entry); the
+/// Latin digraph families (`Ǆ`/`ǅ`/`ǆ` and their LJ/NJ/DZ partners —
+/// every spelling titles onto the mixed-case form); the Armenian
+/// ligatures (`ﬗ` → `Եւ`, `ﬓ`–`ﬗ` → mixed-case pairs); the Latin
+/// ligatures (`ﬀ` → `Ff` … `ﬆ` → `St`); the Georgian mkhedruli letters
+/// (title is the character itself while uppercase is the Unicode 11
+/// Mtavruli capital — `ა` stays `ა`, unlike its `.upper()`); and the
+/// Greek ypogegrammeni family (`ᾀ` → `ᾈ`-shaped titles, the ᾳ/ῃ/ῳ
+/// trio → `ᾼ`-shaped single-char titles, and the circumflex-perispomeni
+/// trio → two- and three-character titles).
+static TITLE_DIVERGENCES: &[(char, &str)] = &[
+    ('\u{00DF}', "Ss"),
+    ('\u{01C4}', "\u{01C5}"),
+    ('\u{01C5}', "\u{01C5}"),
+    ('\u{01C6}', "\u{01C5}"),
+    ('\u{01C7}', "\u{01C8}"),
+    ('\u{01C8}', "\u{01C8}"),
+    ('\u{01C9}', "\u{01C8}"),
+    ('\u{01CA}', "\u{01CB}"),
+    ('\u{01CB}', "\u{01CB}"),
+    ('\u{01CC}', "\u{01CB}"),
+    ('\u{01F1}', "\u{01F2}"),
+    ('\u{01F2}', "\u{01F2}"),
+    ('\u{01F3}', "\u{01F2}"),
+    ('\u{0587}', "\u{0535}\u{0582}"),
+    ('\u{10D0}', "\u{10D0}"),
+    ('\u{10D1}', "\u{10D1}"),
+    ('\u{10D2}', "\u{10D2}"),
+    ('\u{10D3}', "\u{10D3}"),
+    ('\u{10D4}', "\u{10D4}"),
+    ('\u{10D5}', "\u{10D5}"),
+    ('\u{10D6}', "\u{10D6}"),
+    ('\u{10D7}', "\u{10D7}"),
+    ('\u{10D8}', "\u{10D8}"),
+    ('\u{10D9}', "\u{10D9}"),
+    ('\u{10DA}', "\u{10DA}"),
+    ('\u{10DB}', "\u{10DB}"),
+    ('\u{10DC}', "\u{10DC}"),
+    ('\u{10DD}', "\u{10DD}"),
+    ('\u{10DE}', "\u{10DE}"),
+    ('\u{10DF}', "\u{10DF}"),
+    ('\u{10E0}', "\u{10E0}"),
+    ('\u{10E1}', "\u{10E1}"),
+    ('\u{10E2}', "\u{10E2}"),
+    ('\u{10E3}', "\u{10E3}"),
+    ('\u{10E4}', "\u{10E4}"),
+    ('\u{10E5}', "\u{10E5}"),
+    ('\u{10E6}', "\u{10E6}"),
+    ('\u{10E7}', "\u{10E7}"),
+    ('\u{10E8}', "\u{10E8}"),
+    ('\u{10E9}', "\u{10E9}"),
+    ('\u{10EA}', "\u{10EA}"),
+    ('\u{10EB}', "\u{10EB}"),
+    ('\u{10EC}', "\u{10EC}"),
+    ('\u{10ED}', "\u{10ED}"),
+    ('\u{10EE}', "\u{10EE}"),
+    ('\u{10EF}', "\u{10EF}"),
+    ('\u{10F0}', "\u{10F0}"),
+    ('\u{10F1}', "\u{10F1}"),
+    ('\u{10F2}', "\u{10F2}"),
+    ('\u{10F3}', "\u{10F3}"),
+    ('\u{10F4}', "\u{10F4}"),
+    ('\u{10F5}', "\u{10F5}"),
+    ('\u{10F6}', "\u{10F6}"),
+    ('\u{10F7}', "\u{10F7}"),
+    ('\u{10F8}', "\u{10F8}"),
+    ('\u{10F9}', "\u{10F9}"),
+    ('\u{10FA}', "\u{10FA}"),
+    ('\u{10FD}', "\u{10FD}"),
+    ('\u{10FE}', "\u{10FE}"),
+    ('\u{10FF}', "\u{10FF}"),
+    ('\u{1F80}', "\u{1F88}"),
+    ('\u{1F81}', "\u{1F89}"),
+    ('\u{1F82}', "\u{1F8A}"),
+    ('\u{1F83}', "\u{1F8B}"),
+    ('\u{1F84}', "\u{1F8C}"),
+    ('\u{1F85}', "\u{1F8D}"),
+    ('\u{1F86}', "\u{1F8E}"),
+    ('\u{1F87}', "\u{1F8F}"),
+    ('\u{1F88}', "\u{1F88}"),
+    ('\u{1F89}', "\u{1F89}"),
+    ('\u{1F8A}', "\u{1F8A}"),
+    ('\u{1F8B}', "\u{1F8B}"),
+    ('\u{1F8C}', "\u{1F8C}"),
+    ('\u{1F8D}', "\u{1F8D}"),
+    ('\u{1F8E}', "\u{1F8E}"),
+    ('\u{1F8F}', "\u{1F8F}"),
+    ('\u{1F90}', "\u{1F98}"),
+    ('\u{1F91}', "\u{1F99}"),
+    ('\u{1F92}', "\u{1F9A}"),
+    ('\u{1F93}', "\u{1F9B}"),
+    ('\u{1F94}', "\u{1F9C}"),
+    ('\u{1F95}', "\u{1F9D}"),
+    ('\u{1F96}', "\u{1F9E}"),
+    ('\u{1F97}', "\u{1F9F}"),
+    ('\u{1F98}', "\u{1F98}"),
+    ('\u{1F99}', "\u{1F99}"),
+    ('\u{1F9A}', "\u{1F9A}"),
+    ('\u{1F9B}', "\u{1F9B}"),
+    ('\u{1F9C}', "\u{1F9C}"),
+    ('\u{1F9D}', "\u{1F9D}"),
+    ('\u{1F9E}', "\u{1F9E}"),
+    ('\u{1F9F}', "\u{1F9F}"),
+    ('\u{1FA0}', "\u{1FA8}"),
+    ('\u{1FA1}', "\u{1FA9}"),
+    ('\u{1FA2}', "\u{1FAA}"),
+    ('\u{1FA3}', "\u{1FAB}"),
+    ('\u{1FA4}', "\u{1FAC}"),
+    ('\u{1FA5}', "\u{1FAD}"),
+    ('\u{1FA6}', "\u{1FAE}"),
+    ('\u{1FA7}', "\u{1FAF}"),
+    ('\u{1FA8}', "\u{1FA8}"),
+    ('\u{1FA9}', "\u{1FA9}"),
+    ('\u{1FAA}', "\u{1FAA}"),
+    ('\u{1FAB}', "\u{1FAB}"),
+    ('\u{1FAC}', "\u{1FAC}"),
+    ('\u{1FAD}', "\u{1FAD}"),
+    ('\u{1FAE}', "\u{1FAE}"),
+    ('\u{1FAF}', "\u{1FAF}"),
+    ('\u{1FB2}', "\u{1FBA}\u{0345}"),
+    ('\u{1FB3}', "\u{1FBC}"),
+    ('\u{1FB4}', "\u{0386}\u{0345}"),
+    ('\u{1FB7}', "\u{0391}\u{0342}\u{0345}"),
+    ('\u{1FBC}', "\u{1FBC}"),
+    ('\u{1FC2}', "\u{1FCA}\u{0345}"),
+    ('\u{1FC3}', "\u{1FCC}"),
+    ('\u{1FC4}', "\u{0389}\u{0345}"),
+    ('\u{1FC7}', "\u{0397}\u{0342}\u{0345}"),
+    ('\u{1FCC}', "\u{1FCC}"),
+    ('\u{1FF2}', "\u{1FFA}\u{0345}"),
+    ('\u{1FF3}', "\u{1FFC}"),
+    ('\u{1FF4}', "\u{038F}\u{0345}"),
+    ('\u{1FF7}', "\u{03A9}\u{0342}\u{0345}"),
+    ('\u{1FFC}', "\u{1FFC}"),
+    ('\u{FB00}', "Ff"),
+    ('\u{FB01}', "Fi"),
+    ('\u{FB02}', "Fl"),
+    ('\u{FB03}', "Ffi"),
+    ('\u{FB04}', "Ffl"),
+    ('\u{FB05}', "St"),
+    ('\u{FB06}', "St"),
+    ('\u{FB13}', "\u{0544}\u{0576}"),
+    ('\u{FB14}', "\u{0544}\u{0565}"),
+    ('\u{FB15}', "\u{0544}\u{056B}"),
+    ('\u{FB16}', "\u{054E}\u{0576}"),
+    ('\u{FB17}', "\u{0544}\u{056D}"),
+];
+
+/// CPython's `str.title()`: the titlecase mapping of a character that
+/// follows an uncased one, the full lowercase mapping of one that follows
+/// a cased one — "cased" being the property `py_is_cased` tests on the
+/// ORIGINAL character, the immediately preceding one (no case-ignorable
+/// skipping: a combining mark between two letters breaks the run just
+/// like a digit does, so `a◌́Σ` titles the sigma, never lowers it).
+///
+/// Two properties CPython's tables carry that per-character Rust helpers
+/// alone do not, both reproduced exactly:
+///
+/// - the titlecase mapping is the TITLECASE mapping — `ß` titles to
+///   `Ss` (not the `SS` its uppercase gives), `ǳ` to `ǲ`, `ﬀ` to `Ff`,
+///   Georgian mkhedruli to itself (not its Mtavruli uppercase). The
+///   divergences from uppercase are `TITLE_DIVERGENCES`; everywhere else
+///   title equals uppercase, which `char::to_uppercase` (the full
+///   mapping, multi-character expansions like `ǰ` → `J̌` included)
+///   supplies;
+/// - the lowercase path applies the final-sigma rule: a capital sigma
+///   lowered with no cased character after it (skipping the
+///   Case_Ignorable set — see `case_ignorable`) becomes `ς`, one with a
+///   cased character ahead stays `σ` — `ΑΣΣ`.title() is `Ασς` exactly.
+///   Sigma is the only character whose lowercase mapping is contextual,
+///   so every other character goes through `char::to_lowercase` (the
+///   full mapping — `İ` lowers to `i` + combining dot above).
+///
+/// The production input is the help page's action values —
+/// `_`-separated ASCII identifiers (`play_pause`.title() →
+/// `Play_Pause`... after the caller's `_`→space replacement,
+/// `Play Pause`) — but the engine is a faithful `str.title()` for any
+/// string, pinned by the parity zoo.
+fn py_title(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut prev_cased = false;
+    for (i, &ch) in chars.iter().enumerate() {
+        if prev_cased {
+            if ch == '\u{03A3}' {
+                // Final sigma: preceded by a cased character (the
+                // lowercase path guarantees it), ς unless a cased
+                // character follows once the ignorable set is skipped.
+                let mut j = i + 1;
+                let mut followed_by_cased = false;
+                while j < chars.len() {
+                    if case_ignorable(chars[j]) {
+                        j += 1;
+                        continue;
+                    }
+                    followed_by_cased = py_is_cased(chars[j]);
+                    break;
+                }
+                out.push(if followed_by_cased {
+                    '\u{03C3}'
+                } else {
+                    '\u{03C2}'
+                });
+            } else {
+                // The full lowercase mapping (İ → i + U+0307 included).
+                out.extend(ch.to_lowercase());
+            }
+        } else {
+            // The titlecase mapping: the divergence table first, the
+            // uppercase mapping (identical to title everywhere else)
+            // otherwise.
+            match TITLE_DIVERGENCES.binary_search_by(|probe| probe.0.cmp(&ch)) {
+                Ok(idx) => out.push_str(TITLE_DIVERGENCES[idx].1),
+                Err(_) => out.extend(ch.to_uppercase()),
+            }
+        }
+        // Casedness of the ORIGINAL character decides the next step —
+        // not of anything the mapping emitted.
+        prev_cased = py_is_cased(ch);
+    }
+    out
+}
+
+/// The all-rows list behind `HelpPage._build_rows` — the pure core of
+/// the help page's row assembly.
+///
+/// Mirrors the pure-Python reference: each spec entry
+/// `(category, action_value, description, key_strs)` becomes the row
+/// `(category, name, keys_str, description)` — the name through the
+/// `action_value.replace("_", " ").title()` pipeline (`py_title`, the
+/// `_format_action_name` body), the keys as the `" / "` join of the
+/// formatted key strings, or `"(unbound)"` when the action has no
+/// binding. The keymap walk that produces the spec (the
+/// `get_keys_for_action`/`format_key` calls over `ACTION_CATEGORIES`
+/// and `ACTION_DESCRIPTIONS`) stays on the Python side next to the
+/// objects it reads; the description arrives already defaulted (`""`
+/// for an undocumented action), exactly as the reference's
+/// `ACTION_DESCRIPTIONS.get(action, "")` produced it.
+#[pyfunction]
+fn help_page_rows(spec: &Bound<'_, PyList>) -> PyResult<Vec<(String, String, String, String)>> {
+    let mut rows: Vec<(String, String, String, String)> = Vec::with_capacity(spec.len());
+    for entry in spec.iter() {
+        let (category, action_value, description, key_strs): (String, String, String, Vec<String>) =
+            entry.extract()?;
+        let name = py_title(&action_value.replace('_', " "));
+        let keys_str = if key_strs.is_empty() {
+            "(unbound)".to_string()
+        } else {
+            key_strs.join(" / ")
+        };
+        rows.push((category, name, keys_str, description));
+    }
+    Ok(rows)
+}
+
+/// One visible-row emission of the help walk: `(is_header, category,
+/// name, keys, description)` — headers carry `(True, category, "", "",
+/// "")`, data rows the row itself.
+type HelpVisibleRow = (bool, String, String, String, String);
+
+/// The visible-row walk behind `HelpPage._populate_table` — the pure
+/// core of the help page's filtering.
+///
+/// Mirrors the pure-Python reference: the needle is
+/// `filter_text.lower().strip()` (lowercased FIRST, then stripped — the
+/// opposite order of the playlist picker's query), an empty needle
+/// filters nothing, and a non-empty one matches a row only when it is a
+/// substring of the lowercased `"{category} {name} {keys} {desc}"`
+/// haystack. A category header is emitted whenever the category changes
+/// — starting from `""` (so the first category always earns one, and an
+/// empty-string category never does), and re-earned if a category
+/// recurs after another (a row list the reference would walk the same
+/// way, whatever its caller produced). Headers come back as
+/// `(True, category, "", "", "")` and data rows as
+/// `(False, category, name, keys, description)`; the Textual markup
+/// (`[b]{category}[/b]`) and the DataTable calls stay on the Python side.
+#[pyfunction]
+#[pyo3(signature = (all_rows, filter_text))]
+fn help_page_visible_rows(
+    all_rows: &Bound<'_, PyList>,
+    filter_text: &str,
+) -> PyResult<Vec<HelpVisibleRow>> {
+    // filter_text.lower().strip() — lower first, then strip.
+    let lowered = python_lower(filter_text);
+    let needle = python_strip(&lowered);
+    let mut out: Vec<HelpVisibleRow> = Vec::new();
+    let mut current_category = String::new();
+    for row in all_rows.iter() {
+        let (category, name, keys, desc): (String, String, String, String) = row.extract()?;
+        // `if needle:` — an empty (or whitespace-only) needle filters
+        // nothing; every row passes.
+        if !needle.is_empty() {
+            let haystack = python_lower(&format!("{category} {name} {keys} {desc}"));
+            if !haystack.contains(needle) {
+                continue;
+            }
+        }
+        if category != current_category {
+            current_category.clone_from(&category);
+            out.push((
+                true,
+                category.clone(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ));
+        }
+        out.push((false, category, name, keys, desc));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Playlist-picker view model (mirrors ui/popups/playlist_picker.py)
+// ---------------------------------------------------------------------------
+
+/// `pl.get("playlistId", pl.get("id", ""))` — the picker's playlist-id
+/// read: the inner `.get("id", "")` evaluates first (argument order), so
+/// a missing `playlistId` falls back to `id`, and both missing give `""`.
+/// Uses the shared `field_get` (a `.get`-less item reads as the default —
+/// the engine stays total where the reference would raise).
+fn playlist_pid<'py>(py: Python<'py>, pl: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let fallback = field_get(py, pl, "id", Some(PyString::new(py, "").into_any()))?;
+    field_get(py, pl, "playlistId", Some(fallback))
+}
+
+/// The recent-list move-to-front behind `_record_recent` — the pure core
+/// of the picker's recently-used bookkeeping.
+///
+/// Mirrors the pure-Python reference: `if playlist_id in recent:
+/// recent.remove(playlist_id)` — the FIRST equal occurrence is dropped —
+/// then `recent.insert(0, playlist_id)`, so the result is the playlist id
+/// followed by the recent list minus its first equal entry. A fresh list
+/// comes back; the input is never mutated. The membership test compares
+/// str values (a str subclass entry with content equal to *playlist_id*
+/// matches, exactly as the reference's `==` does); a non-str entry — junk
+/// from a corrupted recent-playlists file — never matches and passes
+/// through untouched, where the reference's `==` against JSON-shaped
+/// junk (numbers, nulls, lists) also never matches. The load/save around
+/// this core (the JSON round-trip and the MAX_RECENT cap applied at
+/// save time) stays on the Python side.
+#[pyfunction]
+#[pyo3(signature = (recent, playlist_id))]
+fn playlist_record_recent<'py>(
+    py: Python<'py>,
+    recent: &Bound<'py, PyList>,
+    playlist_id: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(recent.len() + 1);
+    items.push(PyString::new(py, playlist_id).into_any());
+    let mut removed = false;
+    for item in recent.iter() {
+        if !removed {
+            if let Ok(entry) = item.downcast::<PyString>() {
+                if entry.to_string_lossy() == playlist_id {
+                    // list.remove drops exactly the first occurrence.
+                    removed = true;
+                    continue;
+                }
+            }
+        }
+        items.push(item);
+    }
+    PyList::new(py, items)
+}
+
+/// The recency sort behind `PlaylistPicker._sort_by_recent` — the pure
+/// core of the picker's list ordering.
+///
+/// Mirrors the pure-Python reference: no recent ids means no sort at all
+/// (the playlist order is whatever the fetch produced); otherwise the
+/// key is `(0, recent_order[pid])` for a playlist whose id is in the
+/// recent list and `(1, 0)` for one that is not, and the sort is stable
+/// (equal keys keep fetch order — `sort_by` is Rust's stable sort, the
+/// reference's `list.sort`). `recent_order` is the reference's dict
+/// comprehension, so a duplicated recent id counts at its LAST position.
+/// The id is read through `playlist_pid` (`playlistId`, then `id`, then
+/// `""`); a str id (subclasses included) matches by content, any other
+/// id — and any non-str recent entry, junk a corrupted file could hold —
+/// never matches, where the reference's set membership would also never
+/// match same-shaped JSON junk (and would raise on an unhashable entry:
+/// the engine stays total instead). A fresh list comes back; the input
+/// is never mutated.
+#[pyfunction]
+#[pyo3(signature = (playlists, recent_ids))]
+fn playlist_picker_sort<'py>(
+    py: Python<'py>,
+    playlists: &Bound<'py, PyList>,
+    recent_ids: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    // `if not recent_ids: return` — an empty recent list leaves the
+    // playlist order untouched.
+    if recent_ids.is_empty() {
+        let items: Vec<Bound<'py, PyAny>> = playlists.iter().collect();
+        return PyList::new(py, items);
+    }
+
+    // {pid: i for i, pid in enumerate(recent_ids)} — the LAST position of
+    // a duplicated id wins, exactly like the dict comprehension.
+    let mut recent_order: HashMap<String, usize> = HashMap::with_capacity(recent_ids.len());
+    for (i, item) in recent_ids.iter().enumerate() {
+        if let Ok(entry) = item.downcast::<PyString>() {
+            recent_order.insert(entry.to_string_lossy().into_owned(), i);
+        }
+    }
+
+    // Decorate with (0, order) / (1, 0), stable-sort, undecorate.
+    let mut decorated: Vec<((u8, usize), Bound<'py, PyAny>)> = Vec::with_capacity(playlists.len());
+    for pl in playlists.iter() {
+        let pid = playlist_pid(py, &pl)?;
+        let key = match pid.downcast::<PyString>() {
+            Ok(entry) => {
+                let pid_str = entry.to_string_lossy();
+                match recent_order.get(pid_str.as_ref()) {
+                    // (0, recent_order[pid]) — the recency rank.
+                    Some(&order) => (0u8, order),
+                    // (1, 0) — not recently used.
+                    None => (1u8, 0usize),
+                }
+            }
+            Err(_) => (1u8, 0usize),
+        };
+        decorated.push((key, pl));
+    }
+    // sort_by_key is stable: equal keys keep fetch order, like list.sort.
+    decorated.sort_by_key(|entry| entry.0);
+
+    let items: Vec<Bound<'py, PyAny>> = decorated.into_iter().map(|(_, pl)| pl).collect();
+    PyList::new(py, items)
+}
+
+/// The visible-row walk behind `PlaylistPicker._populate_list` — the pure
+/// core of the picker's list rebuild.
+///
+/// Mirrors the pure-Python reference: the query is
+/// `filter_text.strip().lower()` (stripped FIRST, then lowercased — the
+/// opposite order of the help page's needle); an empty query shows every
+/// playlist, a non-empty one only those whose title lowercased contains
+/// it; and each surviving playlist contributes the row
+/// `(playlist_id, title, count)` — the id through `playlist_pid`
+/// (`playlistId`, then `id`, then `""`, the object it is), the title with
+/// its `"Untitled"` default (the object it is), and the count as `""`
+/// when absent or falsy, `str(count)` when truthy (CPython's own `str()`
+/// — `__str__` and all — through the binding, so exotic counts render
+/// exactly as the reference renders them). A non-str title survives an
+/// empty query (the reference's `query and ...` short-circuits before
+/// `.lower()` runs) and is skipped by a non-empty one (where the
+/// reference would raise `AttributeError` — the engine stays total).
+/// The `"Create New"` sentinel row, the status line and the ListView
+/// calls stay on the Python side.
+#[pyfunction]
+#[pyo3(signature = (playlists, filter_text))]
+fn playlist_picker_rows<'py>(
+    py: Python<'py>,
+    playlists: &Bound<'py, PyList>,
+    filter_text: &str,
+) -> PyResult<Bound<'py, PyList>> {
+    // filter_text.strip().lower() — strip first, then lower.
+    let query = python_lower(python_strip(filter_text));
+    let mut rows: Vec<Bound<'py, PyAny>> = Vec::with_capacity(playlists.len());
+    for pl in playlists.iter() {
+        let title = field_get(
+            py,
+            &pl,
+            "title",
+            Some(PyString::new(py, "Untitled").into_any()),
+        )?;
+        // `if query and query not in title.lower(): continue` — the
+        // short-circuit keeps a non-str title through an empty query.
+        let matches = if query.is_empty() {
+            true
+        } else {
+            match title.downcast::<PyString>() {
+                Ok(t) => python_lower(&t.to_string_lossy()).contains(query.as_str()),
+                Err(_) => false,
+            }
+        };
+        if !matches {
+            continue;
+        }
+        let playlist_id = playlist_pid(py, &pl)?;
+        let raw_count = field_get(py, &pl, "count", Some(PyString::new(py, "").into_any()))?;
+        // `if track_count: track_count = str(track_count)` — the object
+        // itself when falsy, CPython's str() of it when truthy.
+        let count = if raw_count.is_truthy()? {
+            raw_count.str()?.into_any()
+        } else {
+            raw_count
+        };
+        let row = (playlist_id, title, count).into_pyobject(py)?;
+        rows.push(row.into_any());
+    }
+    PyList::new(py, rows)
+}
+
+/// The playlist-count status label behind `PlaylistPicker._populate_list`
+/// — the pure core of the picker's status line: `f"{count}
+/// playlist{'s' if count != 1 else ''}"`, so `"1 playlist"`, `"2
+/// playlists"`, and the empty-list `"0 playlists"` (the label the
+/// no-playlists branch never shows — the count branch owns it) all
+/// pluralise exactly as the reference's f-string does.
+#[pyfunction]
+fn playlist_picker_count_label(count: usize) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} playlist{plural}")
 }

@@ -156,9 +156,88 @@ ACTION_CATEGORIES: dict[str, list[Action]] = {
 }
 
 
+def _title_case_action_value(action_value: str) -> str:
+    """``action.value.replace("_", " ").title()`` — the name pipeline.
+
+    The body of the reference's ``_format_action_name``, kept as its own
+    helper so the fallback engine below composes from the same pipeline
+    the reference used.
+    """
+    return action_value.replace("_", " ").title()
+
+
 def _format_action_name(action: Action) -> str:
     """Convert an Action enum value to a human-readable name."""
-    return action.value.replace("_", " ").title()
+    return _title_case_action_value(action.value)
+
+
+def _rows_from_spec(
+    spec: list[tuple[str, str, str, list[str]]],
+) -> list[tuple[str, str, str, str]]:
+    """The all-rows list — the ``_build_rows`` engine.
+
+    The pure half of the help page's row assembly: each spec entry
+    ``(category, action_value, description, key_strs)`` becomes the row
+    ``(category, name, keys_str, description)`` — the name through the
+    ``replace("_", " ").title()`` pipeline, the keys as the ``" / "``
+    join of the formatted key strings, or ``"(unbound)"`` when the
+    action has no binding. The keymap walk that produces the spec (the
+    ``get_keys_for_action``/``format_key`` calls over
+    ``ACTION_CATEGORIES`` and ``ACTION_DESCRIPTIONS``) stays Python-side
+    next to the objects it reads.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.help_page_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    rows: list[tuple[str, str, str, str]] = []
+    for category, action_value, description, key_strs in spec:
+        name = _title_case_action_value(action_value)
+        keys_str = " / ".join(key_strs) if key_strs else "(unbound)"
+        rows.append((category, name, keys_str, description))
+    return rows
+
+
+def _visible_rows(
+    all_rows: list[tuple[str, str, str, str]],
+    filter_text: str,
+) -> list[tuple[bool, str, str, str, str]]:
+    """The filtered walk — the ``_populate_table`` engine.
+
+    The pure half of the help table's rebuild: the needle is
+    ``filter_text.lower().strip()`` (lowercased first, then stripped), an
+    empty needle filters nothing, and a non-empty one matches a row only
+    when it is a substring of the lowercased
+    ``"{category} {name} {keys} {desc}"`` haystack. A category header is
+    emitted whenever the category changes — starting from ``""``, so the
+    first category always earns one. Headers come back as
+    ``(True, category, "", "", "")`` and data rows as
+    ``(False, category, name, keys, description)``; the Textual markup
+    and the DataTable calls stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.help_page_visible_rows``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    needle = filter_text.lower().strip()
+    current_category = ""
+    out: list[tuple[bool, str, str, str, str]] = []
+
+    for category, name, keys, desc in all_rows:
+        # Apply filter if active.
+        if needle:
+            haystack = f"{category} {name} {keys} {desc}".lower()
+            if needle not in haystack:
+                continue
+
+        # Insert a category header row when the category changes.
+        if category != current_category:
+            current_category = category
+            out.append((True, category, "", "", ""))
+
+        out.append((False, category, name, keys, desc))
+
+    return out
 
 
 class HelpPage(Widget):
@@ -231,46 +310,32 @@ class HelpPage(Widget):
     def _build_rows(self) -> None:
         """Generate the full row list from the keymap, grouped by category."""
         keymap = get_keymap()
-        self._all_rows = []
+        spec: list[tuple[str, str, str, list[str]]] = []
 
         for category, actions in ACTION_CATEGORIES.items():
             for action in actions:
-                name = _format_action_name(action)
                 description = ACTION_DESCRIPTIONS.get(action, "")
                 key_seqs = keymap.get_keys_for_action(action)
-                keys_str = (
-                    " / ".join(keymap.format_key(seq) for seq in key_seqs)
-                    if key_seqs
-                    else "(unbound)"
-                )
-                self._all_rows.append((category, name, keys_str, description))
+                key_strs = [keymap.format_key(seq) for seq in key_seqs]
+                spec.append((category, action.value, description, key_strs))
+
+        self._all_rows = _rows_from_spec(spec)
 
     def _populate_table(self, filter_text: str = "") -> None:
         """Fill the DataTable, optionally filtering rows."""
         table = self.query_one("#help-table", DataTable)
         table.clear()
 
-        needle = filter_text.lower().strip()
-        current_category = ""
-
-        for category, name, keys, desc in self._all_rows:
-            # Apply filter if active.
-            if needle:
-                haystack = f"{category} {name} {keys} {desc}".lower()
-                if needle not in haystack:
-                    continue
-
-            # Insert a category header row when the category changes.
-            if category != current_category:
-                current_category = category
+        for is_header, category, name, keys, desc in _visible_rows(self._all_rows, filter_text):
+            if is_header:
                 table.add_row(
                     f"[b]{category}[/b]",
                     "",
                     "",
                     key=f"header_{category}",
                 )
-
-            table.add_row(name, keys, desc)
+            else:
+                table.add_row(name, keys, desc)
 
     # ── Filter management ─────────────────────────────────────────────
 
@@ -346,3 +411,36 @@ class HelpPage(Widget):
             case Action.GO_BOTTOM:
                 if table.row_count > 0:
                     table.move_cursor(row=table.row_count - 1)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same row engines; these bindings
+# override the pure-Python transcriptions above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        help_page_rows as _native_help_page_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        help_page_visible_rows as _native_help_page_visible_rows,
+    )
+except ImportError:
+    pass
+else:
+
+    def _rows_from_spec(  # noqa: F811
+        spec: list[tuple[str, str, str, list[str]]],
+    ) -> list[tuple[str, str, str, str]]:
+        """The all-rows list (native Rust engine)."""
+        return _native_help_page_rows(spec)
+
+    def _visible_rows(  # noqa: F811
+        all_rows: list[tuple[str, str, str, str]],
+        filter_text: str,
+    ) -> list[tuple[bool, str, str, str, str]]:
+        """The filtered walk (native Rust engine)."""
+        return _native_help_page_visible_rows(all_rows, filter_text)
