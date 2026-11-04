@@ -1,17 +1,26 @@
 """Play and search history tracking using async SQLite.
 
-The four pure cores of the play-history surface are dual-implemented:
-``_play_log_row`` (the skip gate and insert-row assembly behind
-``log_play``), ``_listened_delta`` (the stored-vs-new
+The pure cores of the history surface are dual-implemented. The four
+play-history engines: ``_play_log_row`` (the skip gate and insert-row
+assembly behind ``log_play``), ``_listened_delta`` (the stored-vs-new
 listened-seconds decision behind ``update_play_listened_seconds``),
 ``_stats_payload`` (the aggregate payload assembly behind
 ``get_stats``) and ``_row_dicts`` (the row materialisation behind
 every history read — the getters' ``fetchall()`` lists and the CLI's
-``_query_history`` alike) are implemented by the Rust extension
+``_query_history`` alike). The row-assembly peripherals: the
+``_suggestion_strings`` list build behind ``get_search_suggestions``,
+the ``_played_video_id_set`` set build behind ``get_played_video_ids``
+and the ``_play_insert_params`` / ``_play_stats_params`` parameter
+tuples ``log_play`` binds into its two INSERTs. All are implemented
+by the Rust extension
 (``_ytm_player_native.play_log_row`` /
 ``_ytm_player_native.listened_delta`` /
 ``_ytm_player_native.stats_payload`` /
-``_ytm_player_native.row_dicts``) when it is built and by the
+``_ytm_player_native.row_dicts`` /
+``_ytm_player_native.suggestion_strings`` /
+``_ytm_player_native.played_video_id_set`` /
+``_ytm_player_native.play_insert_params`` /
+``_ytm_player_native.play_stats_params``) when it is built and by the
 pure-Python transcriptions below otherwise; the manager's methods only
 perform the reads and writes around them.
 """
@@ -182,6 +191,92 @@ def _row_dicts(rows: Any) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _suggestion_strings(rows: Any) -> list[Any]:
+    """The autocomplete string list behind ``get_search_suggestions``.
+
+    The pure half of the suggestion read: the
+    ``[row["query"] for row in rows]`` comprehension — each fetched row
+    read through the subscript protocol (a missing key's ``KeyError``
+    propagating), the read values collected as the objects they are
+    into a fresh list. The input rows are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.suggestion_strings``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return [row["query"] for row in rows]
+
+
+def _played_video_id_set(rows: Any) -> set[Any]:
+    """The played-video-id set behind ``get_played_video_ids``.
+
+    The pure half of the Recently-Played filter read: the
+    ``{row["video_id"] for row in rows}`` set comprehension — each
+    fetched row read through the subscript protocol (a missing key's
+    ``KeyError`` propagating), each read value inserted into a fresh
+    set through CPython's own set-add: the value hashed first (an
+    unhashable value raises the hash protocol's own ``TypeError``),
+    then the identity-or-``==`` probe deciding membership, the FIRST
+    inserted of equal values the one the set keeps (``True`` and ``1``
+    alias one entry — whichever appeared first survives). The input
+    rows are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.played_video_id_set``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return {row["video_id"] for row in rows}
+
+
+def _play_insert_params(row: Any) -> tuple[Any, ...]:
+    """The parameter tuple the play-history INSERT binds.
+
+    The pure half of ``HistoryManager.log_play``'s first write: the
+    seven values the ``INSERT INTO play_history`` statement binds,
+    read from the engine row through the subscript protocol in the
+    reference's left-to-right order — ``video_id``, ``title``,
+    ``artist``, ``album``, ``duration``, ``listened_seconds``,
+    ``source`` (a missing key's ``KeyError`` propagating from exactly
+    the read that missed) — and passed through as the objects they
+    are into a fresh tuple. The input row is never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.play_insert_params``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return (
+        row["video_id"],
+        row["title"],
+        row["artist"],
+        row["album"],
+        row["duration"],
+        row["listened_seconds"],
+        row["source"],
+    )
+
+
+def _play_stats_params(row: Any) -> tuple[Any, ...]:
+    """The parameter tuple the play-stats upsert binds.
+
+    The pure half of ``HistoryManager.log_play``'s second write: the
+    four values the ``INSERT INTO play_stats ... ON CONFLICT``
+    statement binds — ``video_id``, ``title``, ``artist``,
+    ``listened_seconds`` — read through the subscript protocol in the
+    reference's left-to-right order and passed through as the objects
+    they are into a fresh tuple. The input row is never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.play_stats_params``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return (
+        row["video_id"],
+        row["title"],
+        row["artist"],
+        row["listened_seconds"],
+    )
+
+
 class HistoryManager:
     """Manages play and search history in a local SQLite database."""
 
@@ -309,7 +404,13 @@ class HistoryManager:
             return _row_dicts(rows)
 
     async def get_search_suggestions(self, prefix: str, limit: int = 10) -> list[str]:
-        """Return matching query strings for autocomplete."""
+        """Return matching query strings for autocomplete.
+
+        The string-list build is resolved by the ``_suggestion_strings``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs
+        the query.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute(
@@ -323,7 +424,7 @@ class HistoryManager:
             (prefix, limit),
         ) as cursor:
             rows = await cursor.fetchall()
-            return [row["query"] for row in rows]
+            return _suggestion_strings(rows)
 
     async def clear_search_history(self) -> None:
         """Delete all search history records."""
@@ -354,9 +455,11 @@ class HistoryManager:
         exceeds the minimum threshold. The skip gate and the insert-row
         assembly are resolved by the ``_play_log_row`` engine (native
         when the Rust extension is built, the pure-Python transcription
-        otherwise); this method performs the writes. The engine runs
-        ahead of the initialised-DB check, so with a well-formed track
-        an uninitialised manager raises exactly the reference's
+        otherwise), and the two INSERT parameter tuples by the
+        ``_play_insert_params`` and ``_play_stats_params`` engines;
+        this method performs the writes. The engines run ahead of the
+        initialised-DB check, so with a well-formed track an
+        uninitialised manager raises exactly the reference's
         ``RuntimeError`` — only a junk track on an uninitialised manager
         surfaces its own ``KeyError`` first, a doubly-unreachable
         combination.
@@ -376,15 +479,7 @@ class HistoryManager:
                      listened_seconds, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    row["video_id"],
-                    row["title"],
-                    row["artist"],
-                    row["album"],
-                    row["duration"],
-                    row["listened_seconds"],
-                    row["source"],
-                ),
+                _play_insert_params(row),
             )
 
             await self._db.execute(
@@ -399,7 +494,7 @@ class HistoryManager:
                     total_listened_seconds = total_listened_seconds + excluded.total_listened_seconds,
                     last_played = datetime('now')
                 """,
-                (row["video_id"], row["title"], row["artist"], row["listened_seconds"]),
+                _play_stats_params(row),
             )
 
             await self._db.commit()
@@ -509,12 +604,17 @@ class HistoryManager:
         Used by the Recently Played page to filter TUI plays out of the
         YT Music tab — the account feed mixes genuine online plays with
         plays this app synced there (sync_history_to_ytmusic).
+
+        The video-id set build is resolved by the
+        ``_played_video_id_set`` engine (native when the Rust
+        extension is built, the pure-Python transcription otherwise);
+        this method performs the query.
         """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         async with self._db.execute("SELECT DISTINCT video_id FROM play_history") as cursor:
             rows = await cursor.fetchall()
-            return {row["video_id"] for row in rows}
+            return _played_video_id_set(rows)
 
     # ------------------------------------------------------------------
     # Stats
@@ -616,13 +716,25 @@ try:
         listened_delta as _native_listened_delta,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        play_insert_params as _native_play_insert_params,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         play_log_row as _native_play_log_row,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        play_stats_params as _native_play_stats_params,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        played_video_id_set as _native_played_video_id_set,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         row_dicts as _native_row_dicts,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         stats_payload as _native_stats_payload,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        suggestion_strings as _native_suggestion_strings,
     )
 except ImportError:
     pass
@@ -631,3 +743,7 @@ else:
     _listened_delta = _native_listened_delta  # type: ignore[assignment]
     _stats_payload = _native_stats_payload  # type: ignore[assignment]
     _row_dicts = _native_row_dicts  # type: ignore[assignment]
+    _suggestion_strings = _native_suggestion_strings  # type: ignore[assignment]
+    _played_video_id_set = _native_played_video_id_set  # type: ignore[assignment]
+    _play_insert_params = _native_play_insert_params  # type: ignore[assignment]
+    _play_stats_params = _native_play_stats_params  # type: ignore[assignment]

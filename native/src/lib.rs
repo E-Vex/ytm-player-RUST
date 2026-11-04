@@ -530,6 +530,35 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // clamp — with the Rich Text assembly, the BiDi reorder/isolate
     // calls and the state icon staying Python-side in the widget.
     module.add_function(pyo3::wrap_pyfunction!(track_info_widths, module)?)?;
+
+    // Audio-cache LRU eviction engine (services/cache.py equivalent):
+    // the eviction walk behind CacheManager.evict — which entries fall
+    // out of an over-budget cache, LRU-first, the budget re-checked
+    // before each entry (the entry that brings the running total
+    // exactly to the limit is the last evicted) and the total
+    // decremented through the reference's `total -= file_size`
+    // augmented assignment — answering the (video_id, file_path,
+    // file_size) triples to unlink in eviction order, with the SUM
+    // read, the file unlinking, the index DELETE and the commit
+    // staying Python-side in the manager.
+    module.add_function(pyo3::wrap_pyfunction!(eviction_plan, module)?)?;
+
+    // History row-assembly peripherals (services/history.py
+    // equivalents): the remaining pure cores around the four ported
+    // history engines — the autocomplete string list behind
+    // get_search_suggestions ([row["query"] for row in rows]), the
+    // played-video-id set behind get_played_video_ids
+    // ({row["video_id"] for row in rows} — CPython set-insertion
+    // semantics: hash-first, identity-or-== membership, the first of
+    // equal values the one kept), and the two parameter tuples
+    // log_play binds (the seven-value play_history INSERT tuple and
+    // the four-value play_stats upsert tuple, each read through the
+    // reference's left-to-right subscript order) — with the SQL
+    // itself staying Python-side in the manager.
+    module.add_function(pyo3::wrap_pyfunction!(suggestion_strings, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(played_video_id_set, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_insert_params, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_stats_params, module)?)?;
     Ok(())
 }
 
@@ -11371,4 +11400,223 @@ fn track_info_widths(bar_width: i64, title: &str, artist: &str) -> (i64, i64, i6
     // max(0, album_w) clamp at the truncate call site.
     let album_w = (max_w - title_w - artist_w - 8).max(0);
     (title_w, artist_w, album_w)
+}
+
+// ── Audio-cache LRU eviction engine ────────────────────────────────────
+
+/// The `total -= file_size` of the eviction walk — CPython's in-place
+/// subtraction, replicated protocol step for protocol step. The
+/// augmented assignment reads the `__isub__` slot from the operand's
+/// TYPE (an instance-attribute `__isub__` never runs — the operator
+/// protocol reads the type) and uses its result unless it answers
+/// `NotImplemented`; otherwise the binary subtraction runs — the very
+/// `PyNumber_Subtract` the reference's `x - y` would run, subclass
+/// reflection and all — and its result is what the assignment stores
+/// back. Ints carry no `__isub__` (the production walk's int total,
+/// straight from SQLite's SUM, always takes the binary path), and
+/// where every slot misses, the binary failure's canonical
+/// "unsupported operand type(s) for -" message is respelled with the
+/// in-place protocol's own `-=` — the one shape the binary API cannot
+/// spell.
+fn py_inplace_sub<'py>(
+    lhs: &Bound<'py, PyAny>,
+    rhs: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = lhs.py();
+    let not_implemented = py.NotImplemented();
+    if let Ok(in_place) = lhs.get_type().getattr("__isub__") {
+        let result = in_place.call1((lhs, rhs))?;
+        if !result.is(&not_implemented) {
+            return Ok(result);
+        }
+    }
+    match lhs.sub(rhs) {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            if err.is_instance_of::<PyTypeError>(py) {
+                let message = err.value(py).str()?.to_string_lossy().into_owned();
+                if let Some(rest) = message.strip_prefix("unsupported operand type(s) for -: ") {
+                    return Err(PyTypeError::new_err(format!(
+                        "unsupported operand type(s) for -=: {rest}"
+                    )));
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+/// The LRU eviction walk behind `CacheManager.evict` from
+/// `services/cache.py` — the pure core of the audio cache's overflow
+/// handling.
+///
+/// Mirrors the pure-Python reference (`_eviction_plan`): *rows* is
+/// walked in the caller's LRU order (oldest access first — the order
+/// the reference's `ORDER BY last_accessed ASC` fetched), and before
+/// each row the running total is compared against the budget —
+/// `total_size <= max_bytes` through CPython's own `<=`, its
+/// `TypeError` for an incomparable pair propagating — so an entry is
+/// evicted only while the total is still over budget, exactly the
+/// reference's check-then-evict shape: the entry that brings the total
+/// exactly to the budget is the LAST evicted (the next check breaks).
+/// The iteration begins before the first budget check — the reference's
+/// `for` fetched the first row before its `if` ran — so a
+/// non-iterable *rows* raises the iteration protocol's own `TypeError`
+/// even when the total already fits. Each evicted row is read through
+/// CPython's own subscript in the reference's read order —
+/// `file_path` (the unlink's read), then `video_id` (the append's),
+/// then `file_size` (the subtraction's) — and the three values pass
+/// through into the returned `(video_id, file_path, file_size)` triple
+/// as the objects they are; the running total is decremented through
+/// the reference's augmented assignment (`total -= file_size`, see
+/// `py_inplace_sub`). The result is a fresh list of fresh triples in
+/// eviction order; the input rows are never mutated, and no file is
+/// touched — the plan is computed before the first unlink (the
+/// reference unlinked mid-walk; with SQLite rows, the only production
+/// input, no read can fail, and the index — the source of truth — is
+/// untouched either way), with the unlinking, the index DELETE and the
+/// commit staying in the manager.
+#[pyfunction]
+#[pyo3(signature = (total_size, max_bytes, rows))]
+fn eviction_plan<'py>(
+    py: Python<'py>,
+    total_size: &Bound<'py, PyAny>,
+    max_bytes: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut total = total_size.clone();
+    let out = PyList::empty(py);
+    for row in rows.try_iter()? {
+        let row = row?;
+        // if total <= max_bytes: break — the check before each entry.
+        if total.le(max_bytes)? {
+            break;
+        }
+        // The reference's read order: the unlink's file_path, the
+        // append's video_id, the subtraction's file_size. The triple
+        // and the subtraction share the read object — a clone here is
+        // the same Python object, never a copy.
+        let file_path = row.get_item("file_path")?;
+        let video_id = row.get_item("video_id")?;
+        let file_size = row.get_item("file_size")?;
+        let triple = PyTuple::new(py, [video_id, file_path, file_size.clone()])?;
+        out.append(triple)?;
+        // total -= file_size — the augmented assignment's own semantics.
+        total = py_inplace_sub(&total, &file_size)?;
+    }
+    Ok(out)
+}
+
+// ── History row-assembly peripherals ───────────────────────────────────
+
+/// The autocomplete string list behind
+/// `HistoryManager.get_search_suggestions` — the pure core of the
+/// suggestion read.
+///
+/// Mirrors the pure-Python reference (`_suggestion_strings`): the
+/// `[row["query"] for row in rows]` comprehension — *rows* walked
+/// through Python's iteration protocol (a non-iterable raises
+/// CPython's own `TypeError`; an `__iter__` that itself raises keeps
+/// its own error), each yielded row read through CPython's own
+/// subscript (`row["query"]`, its `KeyError` wart included), and the
+/// read values collected — as the objects they are — into a fresh
+/// list. The input rows are never mutated.
+#[pyfunction]
+#[pyo3(signature = (rows))]
+fn suggestion_strings<'py>(
+    py: Python<'py>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for row in rows.try_iter()? {
+        out.append(row?.get_item("query")?)?;
+    }
+    Ok(out)
+}
+
+/// The played-video-id set behind `HistoryManager.get_played_video_ids`
+/// — the pure core of the Recently-Played filter read.
+///
+/// Mirrors the pure-Python reference (`_played_video_id_set`): the
+/// `{row["video_id"] for row in rows}` set comprehension — *rows*
+/// walked through Python's iteration protocol (a non-iterable raises
+/// CPython's own `TypeError`; an `__iter__` that itself raises keeps
+/// its own error), each yielded row read through CPython's own
+/// subscript (`row["video_id"]`, its `KeyError` wart included), and
+/// each read value inserted — as the object it is — into a fresh set
+/// through CPython's own set-add: the value hashed first (an
+/// unhashable value raises the hash protocol's own `TypeError`), then
+/// the identity-or-`==` probe deciding membership, the FIRST inserted
+/// of equal values the one the set keeps (`True` and `1` alias one
+/// entry — whichever appeared first survives; the very same NaN
+/// object collapses with itself, two distinct NaNs are two entries).
+/// The input rows are never mutated.
+#[pyfunction]
+#[pyo3(signature = (rows))]
+fn played_video_id_set<'py>(
+    py: Python<'py>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PySet>> {
+    let out = PySet::empty(py)?;
+    for row in rows.try_iter()? {
+        out.add(row?.get_item("video_id")?)?;
+    }
+    Ok(out)
+}
+
+/// The parameter tuple the play-history INSERT binds — the row
+/// assembly behind `HistoryManager.log_play`'s first write.
+///
+/// Mirrors the pure-Python reference (`_play_insert_params`): the
+/// seven values the `INSERT INTO play_history` statement binds, read
+/// from the engine row through CPython's own subscript in the
+/// reference's left-to-right order — `video_id`, `title`, `artist`,
+/// `album`, `duration`, `listened_seconds`, `source` (a missing key's
+/// `KeyError` propagating from exactly the read that missed) — and
+/// passed through as the objects they are into a fresh tuple. The
+/// input row is never mutated.
+#[pyfunction]
+#[pyo3(signature = (row))]
+fn play_insert_params<'py>(
+    py: Python<'py>,
+    row: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(
+        py,
+        [
+            row.get_item("video_id")?,
+            row.get_item("title")?,
+            row.get_item("artist")?,
+            row.get_item("album")?,
+            row.get_item("duration")?,
+            row.get_item("listened_seconds")?,
+            row.get_item("source")?,
+        ],
+    )
+}
+
+/// The parameter tuple the play-stats upsert binds — the row assembly
+/// behind `HistoryManager.log_play`'s second write.
+///
+/// Mirrors the pure-Python reference (`_play_stats_params`): the four
+/// values the `INSERT INTO play_stats ... ON CONFLICT` statement binds
+/// — `video_id`, `title`, `artist`, `listened_seconds` — read through
+/// CPython's own subscript in the reference's left-to-right order and
+/// passed through as the objects they are into a fresh tuple. The
+/// input row is never mutated.
+#[pyfunction]
+#[pyo3(signature = (row))]
+fn play_stats_params<'py>(
+    py: Python<'py>,
+    row: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    PyTuple::new(
+        py,
+        [
+            row.get_item("video_id")?,
+            row.get_item("title")?,
+            row.get_item("artist")?,
+            row.get_item("listened_seconds")?,
+        ],
+    )
 }

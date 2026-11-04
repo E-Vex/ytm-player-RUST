@@ -1,4 +1,13 @@
-"""Audio file cache with LRU eviction."""
+"""Audio file cache with LRU eviction.
+
+The pure core of the eviction surface is dual-implemented: the LRU
+eviction walk — which entries fall out of an over-budget cache, LRU
+first, the budget re-checked before each entry — behind
+``CacheManager.evict`` is implemented by the Rust extension
+(``_ytm_player_native.eviction_plan``) when it is built and by the
+pure-Python ``_eviction_plan`` transcription below otherwise; the
+manager's method only performs the reads and the writes around it.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +16,7 @@ import logging
 import shutil
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -33,6 +43,57 @@ class CacheError(OSError):
 
 
 _COMMIT_EVERY = 10  # Commit after this many cache hits instead of every one.
+
+
+def _eviction_plan(
+    total_size: Any,
+    max_bytes: Any,
+    rows: Any,
+) -> list[tuple[Any, Any, Any]]:
+    """The entries an over-budget cache evicts — LRU first, until it fits.
+
+    The pure half of ``CacheManager.evict``: the walk over the
+    LRU-ordered index rows (oldest access first — the order the
+    reference's ``ORDER BY last_accessed ASC`` fetched). Before each
+    entry the running total is compared against the budget —
+    ``total_size <= max_bytes`` — so an entry is evicted only while
+    the total is still over budget, exactly the reference's
+    check-then-evict shape: the entry that brings the total exactly to
+    the budget is the LAST evicted, and a total already within budget
+    answers an empty plan (the manager's own pre-walk gate makes that
+    combination unreachable in production — the walk only runs when
+    the SUM exceeded the limit). Each evicted row is read through the
+    subscript protocol — ``file_path`` first (the unlink's read),
+    then ``video_id`` (the append's), then ``file_size`` (the
+    subtraction's) — the reference's own read order, and the three
+    values pass through into the returned ``(video_id, file_path,
+    file_size)`` triple as the objects they are; the running total is
+    decremented through the reference's augmented assignment
+    (``total_size -= file_size``). The plan is computed before any
+    file is touched — the reference unlinked mid-walk, so a read that
+    raised would leave its earlier files already gone; with SQLite
+    rows (the only production input) no read can fail, and the index
+    — the source of truth — is untouched either way. The iteration
+    begins before the first budget check, exactly like the reference's
+    ``for`` (its first row was fetched before the ``if`` ran), so a
+    non-iterable *rows* raises even when the total already fits. The
+    result is a fresh list of fresh triples in eviction order; the
+    input rows are never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.eviction_plan``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    evicted: list[tuple[Any, Any, Any]] = []
+    for row in rows:
+        if total_size <= max_bytes:
+            break
+        file_path = row["file_path"]
+        video_id = row["video_id"]
+        file_size = row["file_size"]
+        evicted.append((video_id, file_path, file_size))
+        total_size -= file_size
+    return evicted
 
 
 class CacheManager:
@@ -217,7 +278,14 @@ class CacheManager:
         }
 
     async def evict(self) -> None:
-        """Remove least-recently-accessed files until total size is within limits."""
+        """Remove least-recently-accessed files until total size is within limits.
+
+        The LRU eviction walk — which entries fall out, LRU-first,
+        until the running total fits the budget — is resolved by the
+        ``_eviction_plan`` engine (native when the Rust extension is
+        built, the pure-Python transcription otherwise); this method
+        performs the reads and the writes around it.
+        """
         if self._db is None:
             raise RuntimeError("Database not initialized")
         max_bytes = self._max_size_mb * 1024 * 1024
@@ -239,16 +307,13 @@ class CacheManager:
             ) as cursor:
                 rows = await cursor.fetchall()
 
-            evict_ids: list[str] = []
-            for row in rows:
-                if total <= max_bytes:
-                    break
-                Path(row["file_path"]).unlink(missing_ok=True)
-                evict_ids.append(row["video_id"])
-                total -= row["file_size"]
-                logger.debug("Evicted %s (%d bytes)", row["video_id"], row["file_size"])
+            evicted = _eviction_plan(total, max_bytes, rows)
+            for video_id, file_path, file_size in evicted:
+                Path(file_path).unlink(missing_ok=True)
+                logger.debug("Evicted %s (%d bytes)", video_id, file_size)
 
-            if evict_ids:
+            if evicted:
+                evict_ids = [video_id for video_id, _, _ in evicted]
                 placeholders = ",".join("?" for _ in evict_ids)
                 await self._db.execute(
                     f"DELETE FROM cache_index WHERE video_id IN ({placeholders})",
@@ -286,3 +351,19 @@ class CacheManager:
         except (OSError, sqlite3.Error) as exc:
             logger.warning("Cache index write failed for %s: %s", video_id, exc)
             raise CacheError(f"Failed to index {video_id} in cache: {exc}") from exc
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        eviction_plan as _native_eviction_plan,
+    )
+except ImportError:
+    pass
+else:
+    _eviction_plan = _native_eviction_plan  # type: ignore[assignment]

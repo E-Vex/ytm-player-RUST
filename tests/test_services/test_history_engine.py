@@ -38,9 +38,13 @@ import pytest
 
 from ytm_player.services.history import (
     _listened_delta,
+    _play_insert_params,
     _play_log_row,
+    _play_stats_params,
+    _played_video_id_set,
     _row_dicts,
     _stats_payload,
+    _suggestion_strings,
 )
 
 try:
@@ -70,6 +74,30 @@ class GetItemOnly:
 
     def __getitem__(self, key: str) -> str:
         return "VID"
+
+
+class ReadLogRow:
+    """A row-shaped object recording the order its keys were read."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+        self.reads: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        self.reads.append(key)
+        return self._data[key]
+
+
+def _sql_rows(columns: list[str], data: list[tuple]) -> list[sqlite3.Row]:
+    """The production row shape: sqlite3.Row lists from an in-memory table."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"CREATE TABLE t ({', '.join(columns)})")
+    conn.executemany(
+        f"INSERT INTO t VALUES ({', '.join('?' * len(columns))})",
+        data,
+    )
+    return conn.execute("SELECT * FROM t").fetchall()
 
 
 class TestPlayLogRowGate:
@@ -549,6 +577,315 @@ class TestRowDicts:
         assert rows == [{"a": 1}, [("b", 2)]]
 
 
+class TestSuggestionStrings:
+    """The autocomplete string list behind ``get_search_suggestions``."""
+
+    def test_sqlite_rows_become_the_query_list(self):
+        rows = _sql_rows(["query"], [("never gonna",), ("never mind",), ("other",)])
+        assert _suggestion_strings(rows) == ["never gonna", "never mind", "other"]
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        sentinel = object()
+        assert _suggestion_strings([{"query": sentinel}])[0] is sentinel
+
+    def test_result_is_a_list(self):
+        assert type(_suggestion_strings([])) is list
+
+    def test_empty_rows(self):
+        assert _suggestion_strings([]) == []
+
+    def test_dict_rows(self):
+        rows = [{"query": "a"}, {"query": "b"}]
+        assert _suggestion_strings(rows) == ["a", "b"]
+
+    def test_duck_rows(self):
+        assert _suggestion_strings([DuckGet({"query": "duck"})]) == ["duck"]
+
+    def test_generator_input_is_consumed(self):
+        rows = iter([{"query": "a"}, {"query": "b"}])
+        assert _suggestion_strings(rows) == ["a", "b"]
+
+    def test_missing_query_key_raises_keyerror(self):
+        with pytest.raises(KeyError, match="query"):
+            _suggestion_strings([{"other": "x"}])
+
+    def test_non_subscriptable_row_raises_typeerror(self):
+        with pytest.raises(TypeError, match="not subscriptable"):
+            _suggestion_strings([5])
+
+    def test_non_iterable_rows_raises_typeerror(self):
+        with pytest.raises(TypeError, match="object is not iterable"):
+            _suggestion_strings(5)
+
+    def test_raising_getitem_keeps_its_own_error(self):
+        class Boom:
+            def __getitem__(self, key):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _suggestion_strings([Boom()])
+
+    def test_raising_iter_keeps_its_own_error(self):
+        class BadIter:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _suggestion_strings(BadIter())
+
+    def test_fresh_list_every_call(self):
+        rows = [{"query": "a"}]
+        first = _suggestion_strings(rows)
+        second = _suggestion_strings(rows)
+        assert first is not second
+        assert first == second
+
+    def test_input_rows_never_mutated(self):
+        rows = [{"query": "a"}, {"query": "b"}]
+        _suggestion_strings(rows)
+        assert rows == [{"query": "a"}, {"query": "b"}]
+
+
+class TestPlayedVideoIdSet:
+    """The played-video-id set behind ``get_played_video_ids``."""
+
+    def test_sqlite_rows_become_the_id_set(self):
+        rows = _sql_rows(["video_id"], [("v1",), ("v2",)])
+        assert _played_video_id_set(rows) == {"v1", "v2"}
+
+    def test_duplicates_collapse(self):
+        rows = _sql_rows(["video_id"], [("v1",), ("v1",), ("v2",)])
+        assert _played_video_id_set(rows) == {"v1", "v2"}
+
+    def test_true_and_one_alias_one_entry_first_inserted_survives(self):
+        first = _played_video_id_set([{"video_id": True}, {"video_id": 1}])
+        assert first == {True}
+        assert next(iter(first)) is True  # the first inserted is the one kept
+        second = _played_video_id_set([{"video_id": 1}, {"video_id": True}])
+        assert second == {1}
+        one = 1
+        assert next(iter(second)) is one  # the int object that was inserted first
+
+    def test_same_nan_object_collapses_distinct_nans_do_not(self):
+        nan1 = float("nan")
+        nan2 = float("nan")
+        same = _played_video_id_set([{"video_id": nan1}, {"video_id": nan1}])
+        assert len(same) == 1  # the identity probe collapses it with itself
+        assert next(iter(same)) is nan1
+        distinct = _played_video_id_set([{"video_id": nan1}, {"video_id": nan2}])
+        assert len(distinct) == 2  # NaN != NaN: two entries
+
+    def test_custom_eq_ids_collapse_first_inserted_kept(self):
+        class Id:
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+            def __eq__(self, other: object) -> bool:
+                return isinstance(other, Id) and other.label == self.label
+
+            def __hash__(self) -> int:
+                return hash(self.label)
+
+        a = Id("v1")
+        b = Id("v1")
+        result = _played_video_id_set([{"video_id": a}, {"video_id": b}])
+        assert len(result) == 1
+        assert next(iter(result)) is a
+
+    def test_unhashable_video_id_raises_typeerror(self):
+        with pytest.raises(TypeError, match="unhashable type"):
+            _played_video_id_set([{"video_id": ["nested"]}])
+
+    def test_raising_hash_keeps_its_own_error(self):
+        class RaisingHash:
+            def __hash__(self) -> int:
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _played_video_id_set([{"video_id": RaisingHash()}])
+
+    def test_missing_video_id_key_raises_keyerror(self):
+        with pytest.raises(KeyError, match="video_id"):
+            _played_video_id_set([{"other": "x"}])
+
+    def test_non_subscriptable_row_raises_typeerror(self):
+        with pytest.raises(TypeError, match="not subscriptable"):
+            _played_video_id_set([5])
+
+    def test_non_iterable_rows_raises_typeerror(self):
+        with pytest.raises(TypeError, match="object is not iterable"):
+            _played_video_id_set(5)
+
+    def test_result_is_a_set(self):
+        assert type(_played_video_id_set([])) is set
+
+    def test_empty_rows(self):
+        assert _played_video_id_set([]) == set()
+
+    def test_fresh_set_every_call(self):
+        rows = [{"video_id": "v1"}]
+        first = _played_video_id_set(rows)
+        second = _played_video_id_set(rows)
+        assert first is not second
+        assert first == second
+
+    def test_input_rows_never_mutated(self):
+        rows = [{"video_id": "v1"}, {"video_id": "v2"}]
+        _played_video_id_set(rows)
+        assert rows == [{"video_id": "v1"}, {"video_id": "v2"}]
+
+
+_FULL_PLAY_ROW = {
+    "video_id": "dQw4w9WgXcQ",
+    "title": "Never Gonna Give You Up",
+    "artist": "Rick Astley",
+    "album": "Whenever You Need Somebody",
+    "duration": 213,
+    "listened_seconds": 30,
+    "source": "tui",
+}
+
+
+class TestPlayInsertParams:
+    """The seven-value parameter tuple behind ``log_play``'s INSERT."""
+
+    def test_full_row_read_in_the_reference_order(self):
+        row = ReadLogRow(dict(_FULL_PLAY_ROW))
+        assert _play_insert_params(row) == (
+            "dQw4w9WgXcQ",
+            "Never Gonna Give You Up",
+            "Rick Astley",
+            "Whenever You Need Somebody",
+            213,
+            30,
+            "tui",
+        )
+        assert row.reads == [
+            "video_id",
+            "title",
+            "artist",
+            "album",
+            "duration",
+            "listened_seconds",
+            "source",
+        ]
+
+    def test_result_is_a_tuple(self):
+        assert type(_play_insert_params(dict(_FULL_PLAY_ROW))) is tuple
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        sentinel = object()
+        row = dict(_FULL_PLAY_ROW)
+        row["video_id"] = sentinel
+        row["duration"] = True  # the bool object, never 1
+        row["listened_seconds"] = 10**30  # bigint, never truncated
+        result = _play_insert_params(row)
+        assert result[0] is sentinel
+        assert result[4] is True
+        assert type(result[4]) is bool
+        assert result[5] == 10**30
+        assert type(result[5]) is int
+
+    def test_missing_key_raises_from_the_read_that_missed(self):
+        row = {k: v for k, v in _FULL_PLAY_ROW.items() if k != "duration"}
+        with pytest.raises(KeyError, match="duration"):
+            _play_insert_params(row)
+        row = {k: v for k, v in _FULL_PLAY_ROW.items() if k != "video_id"}
+        with pytest.raises(KeyError, match="video_id"):
+            _play_insert_params(row)
+
+    def test_duck_row(self):
+        assert _play_insert_params(DuckGet(dict(_FULL_PLAY_ROW))) == (
+            "dQw4w9WgXcQ",
+            "Never Gonna Give You Up",
+            "Rick Astley",
+            "Whenever You Need Somebody",
+            213,
+            30,
+            "tui",
+        )
+
+    def test_non_subscriptable_row_raises_typeerror(self):
+        with pytest.raises(TypeError, match="not subscriptable"):
+            _play_insert_params(object())
+
+    def test_raising_getitem_keeps_its_own_error(self):
+        class Boom:
+            def __getitem__(self, key):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _play_insert_params(Boom())
+
+    def test_fresh_tuple_every_call(self):
+        row = dict(_FULL_PLAY_ROW)
+        first = _play_insert_params(row)
+        second = _play_insert_params(row)
+        assert first is not second
+        assert first == second
+
+    def test_input_row_never_mutated(self):
+        row = dict(_FULL_PLAY_ROW)
+        snapshot = dict(row)
+        _play_insert_params(row)
+        assert row == snapshot
+
+
+class TestPlayStatsParams:
+    """The four-value parameter tuple behind ``log_play``'s upsert."""
+
+    def test_four_values_read_in_the_reference_order(self):
+        row = ReadLogRow(dict(_FULL_PLAY_ROW))
+        assert _play_stats_params(row) == (
+            "dQw4w9WgXcQ",
+            "Never Gonna Give You Up",
+            "Rick Astley",
+            30,
+        )
+        # Exactly four reads — album, duration and source are never
+        # touched by the upsert.
+        assert row.reads == ["video_id", "title", "artist", "listened_seconds"]
+
+    def test_result_is_a_tuple(self):
+        assert type(_play_stats_params(dict(_FULL_PLAY_ROW))) is tuple
+
+    def test_missing_listened_seconds_raises_from_the_fourth_read(self):
+        row = {k: v for k, v in _FULL_PLAY_ROW.items() if k != "listened_seconds"}
+        with pytest.raises(KeyError, match="listened_seconds"):
+            _play_stats_params(row)
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        row = dict(_FULL_PLAY_ROW)
+        row["listened_seconds"] = True
+        result = _play_stats_params(row)
+        assert result[3] is True  # the bool object, never 1
+
+    def test_duck_row(self):
+        assert _play_stats_params(DuckGet(dict(_FULL_PLAY_ROW))) == (
+            "dQw4w9WgXcQ",
+            "Never Gonna Give You Up",
+            "Rick Astley",
+            30,
+        )
+
+    def test_non_subscriptable_row_raises_typeerror(self):
+        with pytest.raises(TypeError, match="not subscriptable"):
+            _play_stats_params(object())
+
+    def test_fresh_tuple_every_call(self):
+        row = dict(_FULL_PLAY_ROW)
+        first = _play_stats_params(row)
+        second = _play_stats_params(row)
+        assert first is not second
+        assert first == second
+
+    def test_input_row_never_mutated(self):
+        row = dict(_FULL_PLAY_ROW)
+        snapshot = dict(row)
+        _play_stats_params(row)
+        assert row == snapshot
+
+
 # ── Native vs fallback parity ──────────────────────────────────────────
 # The matrices below are shared with the child interpreter as JSON, so
 # every value must be JSON-round-trippable: plain dict tracks, JSON
@@ -767,6 +1104,116 @@ _ROWS_PARITY_CASES = [
     {"t": "keys_not_callable"},
 ]
 
+# Suggestion-string cases: the same row grammar, read through the
+# ``query`` key.
+_SUGGESTIONS_PARITY_CASES = [
+    # The production shape: sqlite3.Row lists.
+    {"t": "sql", "columns": ["query"], "data": [["never gonna"], ["never mind"]]},
+    {"t": "sql", "columns": ["query"], "data": [["ü"], [""], [None]]},
+    {"t": "sql", "columns": ["query"], "data": []},
+    # Dict rows with the JSON-transportable value zoo.
+    {"t": "list", "items": []},
+    {"t": "list", "items": [{"query": "a"}, {"query": "b"}, {"query": "a"}]},
+    {"t": "list", "items": [{"query": 1}, {"query": None}, {"query": True}]},
+    # Duck-typed rows through the subscript protocol.
+    {"t": "duck", "items": [{"query": "duck"}]},
+    # A generator input.
+    {"t": "gen", "items": [{"query": "a"}, {"query": "b"}]},
+    # Error shapes: a missing key, a non-subscriptable row, a raising
+    # __getitem__, a non-iterable rows input.
+    {"t": "list", "items": [{"query": "a"}, {}]},
+    {"t": "list", "items": [5]},
+    {"t": "raising_getitem"},
+    {"t": "int"},
+]
+
+# Played-video-id cases: the same row grammar, read through the
+# ``video_id`` key and inserted into a set (the outcome records the
+# sorted reprs of the survivors — the order-independent witness of
+# which values the set kept).
+_VIDEOIDS_PARITY_CASES = [
+    # The production shape: sqlite3.Row lists.
+    {"t": "sql", "columns": ["video_id"], "data": [["v1"], ["v2"]]},
+    {"t": "sql", "columns": ["video_id"], "data": [["v1"], ["v1"]]},  # collapse
+    {"t": "sql", "columns": ["video_id"], "data": []},
+    {"t": "sql", "columns": ["video_id"], "data": [["v1"], [None], [""]]},
+    # Dict rows: True/1 alias one entry — the first inserted survives.
+    {"t": "list", "items": [{"video_id": True}, {"video_id": 1}]},
+    {"t": "list", "items": [{"video_id": 1}, {"video_id": True}]},
+    {"t": "list", "items": [{"video_id": "v1"}, {"video_id": "v1"}]},
+    # An unhashable video_id — the set-add's own TypeError.
+    {"t": "list", "items": [{"video_id": ["nested"]}]},
+    # A generator input.
+    {"t": "gen", "items": [{"video_id": "v1"}]},
+    # Error shapes: a missing key, a non-subscriptable row, a raising
+    # __getitem__, a non-iterable rows input.
+    {"t": "list", "items": [{"video_id": "v1"}, {}]},
+    {"t": "list", "items": [5]},
+    {"t": "raising_getitem"},
+    {"t": "int"},
+]
+
+# Play-parameter cases: the track/row grammar (the same specs
+# _build_track builds), read through the INSERT's left-to-right key
+# order.
+_INSERT_PARAMS_PARITY_CASES = [
+    {"t": "dict", "d": dict(_FULL_PLAY_ROW)},
+    {
+        "t": "dict",
+        "d": {
+            "video_id": "夜に駆ける",
+            "title": None,
+            "artist": None,
+            "album": None,
+            "duration": 0,
+            "listened_seconds": True,
+            "source": "",
+        },
+    },
+    {"t": "dict", "d": {"title": "no id"}},  # KeyError video_id (first read)
+    # KeyError source — the last of the seven reads.
+    {
+        "t": "dict",
+        "d": {
+            "video_id": "v1",
+            "title": "T",
+            "artist": "A",
+            "album": "B",
+            "duration": 1,
+            "listened_seconds": 2,
+        },
+    },
+    {"t": "duck", "d": dict(_FULL_PLAY_ROW)},
+    {"t": "getitem_only"},  # every read answers "VID"
+    {"t": "no_get"},  # not subscriptable
+    {"t": "list", "v": ["v1", "t"]},  # list indices TypeError
+    {"t": "override"},  # a dict subclass row — only video_id present
+]
+
+# Stats-parameter cases: the same grammar, read through the upsert's
+# four-key order.
+_STATS_PARAMS_PARITY_CASES = [
+    {"t": "dict", "d": dict(_FULL_PLAY_ROW)},
+    # Only four of the seven keys are ever read by the upsert.
+    {
+        "t": "dict",
+        "d": {
+            "video_id": "v1",
+            "title": "T",
+            "artist": "A",
+            "album": "never read",
+            "duration": "never read",
+            "listened_seconds": 9,
+            "source": "never read",
+        },
+    },
+    # KeyError listened_seconds — the fourth read.
+    {"t": "dict", "d": {"video_id": "v1", "title": "T", "artist": "A"}},
+    {"t": "duck", "d": dict(_FULL_PLAY_ROW)},
+    {"t": "getitem_only"},
+    {"t": "no_get"},
+]
+
 
 class RowDuck:
     """A row-shaped object steering ``dict()`` through the mapping
@@ -830,6 +1277,13 @@ def _build_rows(spec: dict) -> object:
             keys = 5
 
         return [KeysNotCallable()]
+    if kind == "raising_getitem":
+
+        class RaisingGetItem:
+            def __getitem__(self, key):
+                raise RuntimeError("boom")
+
+        return [RaisingGetItem()]
     raise AssertionError(kind)
 
 
@@ -865,6 +1319,27 @@ def _outcome(fn: object, *args: object) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+def _set_outcome(fn: object, *args: object) -> dict:
+    try:
+        result = fn(*args)  # type: ignore[operator]
+        # A set is not JSON-transportable — the sorted reprs pin which
+        # values survived (True vs 1, "" vs None), the
+        # order-independent witness of the set's contents.
+        return {"ok": sorted(repr(x) for x in result)}  # type: ignore[operator]
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _tuple_outcome(fn: object, *args: object) -> dict:
+    try:
+        result = fn(*args)  # type: ignore[operator]
+        # Tuples flatten to lists on the JSON wire — normalise the
+        # native side the same way.
+        return {"ok": list(result)}  # type: ignore[operator]
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 # The child interpreter runs this program with the case matrices on
 # stdin and prints the reference engines' outcomes as JSON.
 _CHILD_PROG = """
@@ -876,9 +1351,13 @@ sys.modules['ytm_player.utils._ytm_player_native'] = None
 
 from ytm_player.services.history import (
     _listened_delta,
+    _played_video_id_set,
+    _play_insert_params,
     _play_log_row,
+    _play_stats_params,
     _row_dicts,
     _stats_payload,
+    _suggestion_strings,
 )
 
 
@@ -975,12 +1454,34 @@ def build_rows(spec):
             keys = 5
 
         return [KeysNotCallable()]
+    if kind == "raising_getitem":
+        class RaisingGetItem:
+            def __getitem__(self, key):
+                raise RuntimeError("boom")
+
+        return [RaisingGetItem()]
     raise AssertionError(kind)
 
 
 def outcome(fn, *args):
     try:
         return {"ok": fn(*args)}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def set_outcome(fn, *args):
+    try:
+        result = fn(*args)
+        return {"ok": sorted(repr(x) for x in result)}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def tuple_outcome(fn, *args):
+    try:
+        result = fn(*args)
+        return {"ok": list(result)}
     except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
         return {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -993,8 +1494,30 @@ rows = [
 deltas = [outcome(_listened_delta, old, listened) for old, listened in payload["deltas"]]
 stats = [outcome(_stats_payload, *case) for case in payload["stats"]]
 row_dicts = [outcome(_row_dicts, build_rows(spec)) for spec in payload["row_dicts"]]
+suggestions = [
+    outcome(_suggestion_strings, build_rows(spec)) for spec in payload["suggestions"]
+]
+video_ids = [
+    set_outcome(_played_video_id_set, build_rows(spec)) for spec in payload["video_ids"]
+]
+insert_params = [
+    tuple_outcome(_play_insert_params, build_track(spec))
+    for spec in payload["insert_params"]
+]
+stats_params = [
+    tuple_outcome(_play_stats_params, build_track(spec)) for spec in payload["stats_params"]
+]
 json.dump(
-    {"rows": rows, "deltas": deltas, "stats": stats, "row_dicts": row_dicts},
+    {
+        "rows": rows,
+        "deltas": deltas,
+        "stats": stats,
+        "row_dicts": row_dicts,
+        "suggestions": suggestions,
+        "video_ids": video_ids,
+        "insert_params": insert_params,
+        "stats_params": stats_params,
+    },
     sys.stdout,
 )
 """
@@ -1009,6 +1532,10 @@ def _fallback_outcomes() -> dict:
             "deltas": _DELTA_PARITY_CASES,
             "stats": _STATS_PARITY_CASES,
             "row_dicts": _ROWS_PARITY_CASES,
+            "suggestions": _SUGGESTIONS_PARITY_CASES,
+            "video_ids": _VIDEOIDS_PARITY_CASES,
+            "insert_params": _INSERT_PARAMS_PARITY_CASES,
+            "stats_params": _STATS_PARAMS_PARITY_CASES,
         }
     )
     result = subprocess.run(
@@ -1029,7 +1556,30 @@ def _native_outcomes() -> dict:
     deltas = [_outcome(_listened_delta, old, listened) for old, listened in _DELTA_PARITY_CASES]
     stats = [_outcome(_stats_payload, *case) for case in _STATS_PARITY_CASES]
     row_dicts = [_outcome(_row_dicts, _build_rows(spec)) for spec in _ROWS_PARITY_CASES]
-    return {"rows": rows, "deltas": deltas, "stats": stats, "row_dicts": row_dicts}
+    suggestions = [
+        _outcome(_suggestion_strings, _build_rows(spec)) for spec in _SUGGESTIONS_PARITY_CASES
+    ]
+    video_ids = [
+        _set_outcome(_played_video_id_set, _build_rows(spec)) for spec in _VIDEOIDS_PARITY_CASES
+    ]
+    insert_params = [
+        _tuple_outcome(_play_insert_params, _build_track(spec))
+        for spec in _INSERT_PARAMS_PARITY_CASES
+    ]
+    stats_params = [
+        _tuple_outcome(_play_stats_params, _build_track(spec))
+        for spec in _STATS_PARAMS_PARITY_CASES
+    ]
+    return {
+        "rows": rows,
+        "deltas": deltas,
+        "stats": stats,
+        "row_dicts": row_dicts,
+        "suggestions": suggestions,
+        "video_ids": video_ids,
+        "insert_params": insert_params,
+        "stats_params": stats_params,
+    }
 
 
 class TestNativeParity:
@@ -1103,3 +1653,53 @@ class TestNativeParity:
                     f"native:   {native_keys!r}\n"
                     f"fallback: {fallback_keys!r}"
                 )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_suggestion_strings_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(
+            _SUGGESTIONS_PARITY_CASES, native["suggestions"], fallback["suggestions"]
+        ):
+            assert n == f, (
+                f"native and fallback suggestion outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_played_video_id_set_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(_VIDEOIDS_PARITY_CASES, native["video_ids"], fallback["video_ids"]):
+            assert n == f, (
+                f"native and fallback video-id outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_play_insert_params_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(
+            _INSERT_PARAMS_PARITY_CASES, native["insert_params"], fallback["insert_params"]
+        ):
+            assert n == f, (
+                f"native and fallback insert-param outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_play_stats_params_matches_fallback(self):
+        native = _native_outcomes()
+        fallback = _fallback_outcomes()
+        for case, n, f in zip(
+            _STATS_PARAMS_PARITY_CASES, native["stats_params"], fallback["stats_params"]
+        ):
+            assert n == f, (
+                f"native and fallback stats-param outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
