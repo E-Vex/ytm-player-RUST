@@ -8,10 +8,13 @@ The render engines — the WCAG colour math behind the placeholder's
 note glyph (``_relative_luminance``, ``_contrast_ratio`` and
 ``_readable_on``), the half-block cell extraction from the resized
 thumbnail's raw RGB buffer (``_half_block_cells``) and the two
-no-image row plans (``_placeholder_rows`` and ``_empty_rows``) — are
-dual-implemented: the Rust extension
-(``_ytm_player_native.wcag_relative_luminance`` & co.) implements the
-engines when it is built, and the pure-Python transcriptions below run
+no-image row plans (``_placeholder_rows`` and ``_empty_rows``) — and
+the module-level art cache's LRU bookkeeping (``_ArtCacheCore``: the
+hit promotion, the insert that keeps an existing key's position, the
+overflow eviction, the guarded delete) are dual-implemented: the Rust
+extension (``_ytm_player_native.wcag_relative_luminance`` & co.,
+``_ytm_player_native.ArtCacheCore``) implements the engines when it
+is built, and the pure-Python transcriptions below run
 otherwise. The widget itself stays glue: it downloads and decodes the
 thumbnail (Pillow), resizes it, and assembles the Rich ``Text`` from
 the segments the engines compute.
@@ -22,7 +25,7 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 from io import BytesIO
-from typing import cast
+from typing import Any, Protocol, cast
 from urllib.request import urlopen
 
 from PIL import Image
@@ -43,9 +46,21 @@ _BLOCK_BOTTOM = "\u2584"  # Lower half block ▄
 _BLOCK_FULL = "\u2588"  # Full block █
 _NOTE = "\u266b"  # Beamed eighth notes ♫
 
-# Module-level thumbnail cache: URL -> rendered Text.
-_ART_CACHE: OrderedDict[str, Text] = OrderedDict()
+# Module-level thumbnail cache: URL -> rendered Text. The LRU
+# bookkeeping lives in an ``ArtCacheCore`` — the Rust engine from the
+# native extension (imported above) when it is built, the pure-Python
+# ``_ArtCacheCore`` transcription below otherwise.
 _ART_CACHE_MAX = 20
+
+# Try to load the native Rust art-cache engine via PyO3. If the compiled
+# extension is unavailable (e.g. during development without a Rust
+# toolchain), fall back to the pure-Python core defined below.
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ArtCacheCore as _NativeArtCacheCore,
+    )
+except ImportError:
+    _NativeArtCacheCore = None
 
 _DOWNLOAD_TIMEOUT = 5
 
@@ -231,6 +246,77 @@ def _empty_rows(width: int, height: int, muted: str) -> list[list[tuple[str, str
     return rows
 
 
+class ArtCacheLike(Protocol):
+    """The art-cache LRU-bookkeeping contract both implementations satisfy.
+
+    The widget calls these from its download worker; the renders are
+    held as the very objects the renderer assembled (never copied).
+    """
+
+    def get(self, url: str) -> Text | None: ...
+    def insert(self, url: str, value: Text) -> tuple[str, Text] | None: ...
+    def remove(self, url: str) -> bool: ...
+    def clear(self) -> None: ...
+    def length(self) -> int: ...
+
+
+def _new_art_cache() -> ArtCacheLike:
+    """Build the best available album-art cache core."""
+    if _NativeArtCacheCore is not None:
+        return _NativeArtCacheCore(_ART_CACHE_MAX)
+    return _ArtCacheCore(_ART_CACHE_MAX)
+
+
+class _ArtCacheCore:
+    """Pure-Python album-art cache LRU engine (fallback for the native
+    Rust core).
+
+    A transcription of the reference's module-level ``OrderedDict``
+    bookkeeping: the entries are ordered least-recent first, ``get``
+    fuses the ``in`` probe + ``move_to_end`` + the value read into one
+    hit promotion (the cache never holds ``None`` — the renderer always
+    returns a ``Text`` — so ``None`` answers a miss), ``insert`` fuses
+    the ``__setitem__`` store with the single-pop overflow eviction
+    (an existing key's value updated in place, its position KEPT — this
+    engine never promotes on insert; the shuffle-preferences engine
+    does, because *its* reference promoted — answering the evicted
+    pair), and ``remove`` is the resize invalidation's guarded delete.
+    """
+
+    def __init__(self, max_entries: int) -> None:
+        self._cache: OrderedDict[Any, Any] = OrderedDict()
+        self._max_entries = max_entries
+
+    def get(self, url: Any) -> Any:
+        if url in self._cache:
+            self._cache.move_to_end(url)
+            return self._cache[url]
+        return None
+
+    def insert(self, url: Any, value: Any) -> tuple[Any, Any] | None:
+        self._cache[url] = value
+        if len(self._cache) > self._max_entries:
+            return self._cache.popitem(last=False)
+        return None
+
+    def remove(self, url: Any) -> bool:
+        if url in self._cache:
+            del self._cache[url]
+            return True
+        return False
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def length(self) -> int:
+        return len(self._cache)
+
+
+# The module-level art cache — the factory picks the native Rust core
+# when the extension is built, the pure-Python transcription otherwise.
+_ART_CACHE: ArtCacheLike = _new_art_cache()
+
+
 class AlbumArt(Widget):
     """Displays album art in the terminal using half-block Unicode rendering.
 
@@ -282,10 +368,10 @@ class AlbumArt(Widget):
         """Download thumbnail and convert to half-block art."""
         import asyncio
 
-        # Check cache first.
-        if url in _ART_CACHE:
-            _ART_CACHE.move_to_end(url)
-            self._rendered = _ART_CACHE[url]
+        # Check cache first — the hit promotes the URL to most-recent.
+        cached = _ART_CACHE.get(url)
+        if cached is not None:
+            self._rendered = cached
             self.refresh()
             return
 
@@ -298,9 +384,7 @@ class AlbumArt(Widget):
             rendered = await asyncio.to_thread(self._image_to_half_blocks, img_bytes, w, h)
 
             # Cache it.
-            _ART_CACHE[url] = rendered
-            if len(_ART_CACHE) > _ART_CACHE_MAX:
-                _ART_CACHE.popitem(last=False)
+            _ART_CACHE.insert(url, rendered)
 
             self._rendered = rendered
             self.refresh()
@@ -396,8 +480,7 @@ class AlbumArt(Widget):
             return
         url = self.thumbnail_url
         # If the URL is in cache, invalidate and re-fetch at new size.
-        if url in _ART_CACHE:
-            del _ART_CACHE[url]
+        _ART_CACHE.remove(url)
         self.run_worker(self._load_thumbnail(url), exclusive=True, group="album-art")
 
     def set_track(self, thumbnail_url: str = "") -> None:

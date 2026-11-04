@@ -491,6 +491,45 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(album_art_half_block_cells, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(album_art_placeholder_rows, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(album_art_empty_rows, module)?)?;
+
+    // Shuffle-preferences LRU engine (services/shuffle_prefs.py
+    // equivalent): the ordered {context_id: shuffle} map — the get
+    // promotion, the set with its move_to_end and evict-while-over walk,
+    // the clear, the hand-edited-file ingestion (the dict gate, the
+    // str-key filter, the bool(v) truthiness coercion and the for k, v
+    // unpacking contract), and the lock-held snapshot +
+    // json.dumps(..., indent=2) serialisation behind _save — with the
+    // thread lock and the file I/O staying Python-side in the facade.
+    module.add_class::<ShufflePrefsCore>()?;
+
+    // Album-art cache LRU engine (ui/widgets/album_art.py equivalent):
+    // the ordered URL→Text map behind the module-level art cache — the
+    // hit promotion of the cache-check path, the insert that keeps an
+    // existing key's position (OrderedDict __setitem__ semantics — this
+    // engine never promotes on insert) with its single-pop overflow
+    // eviction, and the guarded delete of the resize invalidation, the
+    // renders themselves held as the Python objects they are.
+    module.add_class::<ArtCacheCore>()?;
+
+    // Mutation-failure classifier (services/ytmusic.py equivalent): the
+    // exception-to-kind mapping behind every mutation call's except arm
+    // — the reference's isinstance chain in its exact order (KeyError,
+    // the two timeout classes, requests' RequestException,
+    // YTMusicUserError, YTMusicServerError) with the classes resolved
+    // from the running interpreter at call time, and the
+    // YTMusicServerError arm's HTTP-status prefix match (CPython's \d
+    // and \b semantics on str patterns, Unicode digits and their int()
+    // values included) deciding auth_expired from server_error.
+    module.add_function(pyo3::wrap_pyfunction!(classify_mutation_failure, module)?)?;
+
+    // Playback-bar track-info width engine (ui/playback_bar.py
+    // equivalent): the halves-and-thirds width split behind the
+    // one-line title/artist/album render — the max(10, width - 30)
+    // budget, the min(len, //2) and min(len, //3) fragment widths, and
+    // the remainder-minus-separators album width with its max(0, ...)
+    // clamp — with the Rich Text assembly, the BiDi reorder/isolate
+    // calls and the state icon staying Python-side in the widget.
+    module.add_function(pyo3::wrap_pyfunction!(track_info_widths, module)?)?;
     Ok(())
 }
 
@@ -10809,4 +10848,527 @@ fn album_art_empty_rows(width: i64, height: i64, muted: &str) -> Vec<Vec<(String
         rows.push(segments);
     }
     rows
+}
+
+// ── LRU bookkeeping engines (shuffle prefs + album-art cache) ───────────
+
+/// CPython's `\w` character set for `str` patterns, as a one-character
+/// test: the alphanumeric union behind `str.isalnum()` — the letter
+/// categories `L*` and every numeric category `N*` (decimal `Nd`, letter
+/// numbers `Nl` like the Roman numerals, and other numerics `No` like
+/// the circled digits and vulgar fractions, the sets CPython's
+/// ISALPHA/ISDECIMAL/ISDIGIT/ISNUMERIC union admits) — plus the
+/// underscore. Deliberately NOT the regex crate's own `\w` (which adds
+/// the combining marks `M*`, the connector punctuation `Pc` and the
+/// join-control characters): the mutation-failure classifier's HTTP
+/// status boundary must break exactly where Python's breaks — a
+/// combining mark after the third digit is a boundary (Python: not a
+/// word character), while a circled digit or a fraction after it is not
+/// (Python: alphanumeric).
+static PY_WORD_CHAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[\p{L}\p{N}_]$").expect("python \\w character set"));
+
+/// One-character `\w` test for the classifier's word boundary — see
+/// `PY_WORD_CHAR_RE`.
+fn py_is_word_char(c: char) -> bool {
+    let mut buf = [0u8; 4];
+    PY_WORD_CHAR_RE.is_match(c.encode_utf8(&mut buf))
+}
+
+/// Position of *key* in *entries* under CPython's own dict-lookup rule:
+/// the identity shortcut first (`stored is key`), then `==` (so keys
+/// with no consistent `__eq__` — float NaN looked up through its own
+/// object — still hit exactly the way the hash bucket's shortcut makes
+/// them). The caller hashes *key* up front, so unhashable lookups raise
+/// the reference's `TypeError` before any comparison runs — the order
+/// the dict/OrderedDict protocol methods the engines replace follow. A
+/// linear walk replaces the hash bucket scan: the same hit for every
+/// key whose `__hash__`/`__eq__` honour the Python data model (the
+/// documented contract those methods assume), and the walk preserves
+/// the insertion order the OrderedDict engines are about.
+fn py_key_position<'py, V>(
+    py: Python<'py>,
+    entries: &[(Py<PyAny>, V)],
+    key: &Bound<'py, PyAny>,
+) -> PyResult<Option<usize>> {
+    for (i, (stored, _)) in entries.iter().enumerate() {
+        let stored = stored.bind(py);
+        if std::ptr::eq(stored.as_ptr(), key.as_ptr()) {
+            return Ok(Some(i));
+        }
+        if stored.eq(key)? {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// The `for k, v in seq` unpacking of the shuffle-preferences ingestion
+/// comprehension: a 2-tuple yields its halves; anything else goes through
+/// CPython's UNPACK_SEQUENCE contract — the iterator protocol for
+/// non-tuples (so a two-character string unpacks into its characters),
+/// `ValueError` with CPython's own not-enough/too-many message for a
+/// wrong-shaped yield, and the iterator protocol's own `TypeError` for
+/// an uniterable item.
+fn py_unpack_pair<'py>(
+    item: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let unpack_err = |got: usize| {
+        if got > 2 {
+            // CPython 3.12's too-many shape: no got-count suffix.
+            PyValueError::new_err("too many values to unpack (expected 2)")
+        } else {
+            PyValueError::new_err(format!(
+                "not enough values to unpack (expected 2, got {got})"
+            ))
+        }
+    };
+    if let Ok(tuple) = item.downcast::<PyTuple>() {
+        return match tuple.len() {
+            2 => Ok((tuple.get_item(0)?, tuple.get_item(1)?)),
+            n => Err(unpack_err(n)),
+        };
+    }
+    let mut got: Vec<Bound<'py, PyAny>> = Vec::new();
+    for value in item.try_iter()? {
+        got.push(value?);
+        if got.len() > 2 {
+            break;
+        }
+    }
+    match got.len() {
+        2 => Ok((got.remove(0), got.remove(0))),
+        n => Err(unpack_err(n)),
+    }
+}
+
+/// The LRU bookkeeping engine behind
+/// `services/shuffle_prefs.py`'s `ShufflePreferences` — the ordered
+/// `{context_id: shuffle}` map. Mirrors the pure-Python reference's
+/// `OrderedDict` state exactly:
+///
+/// - `get` — the lookup key hashed first (`dict.get`'s own TypeError for
+///   an unhashable), then the identity-or-`==` scan; a hit promotes the
+///   entry to most-recent (the reference's `move_to_end`) and returns
+///   its value, a miss leaves the state untouched and answers `None`.
+/// - `set` — the key hashed first (`__setitem__`'s own TypeError), an
+///   existing entry's value updated in place (the stored key object kept,
+///   never replaced — the reference's assignment semantics) and then
+///   promoted to most-recent (the reference's explicit `move_to_end`),
+///   a fresh key appended at the end; then the eviction walk —
+///   `while len > max: popitem(last=False)` — the oldest entries dropped
+///   until the cap holds.
+/// - `clear` — the state emptied.
+/// - `load` — the hand-edited-file ingestion: a non-dict payload leaves
+///   the state untouched (the reference's `isinstance(data, dict)`
+///   gate), a dict is walked through its own `items()` method (a
+///   subclass override steers this walk exactly like it steered the
+///   comprehension) with the non-str keys dropped (`isinstance(k, str)`),
+///   every surviving value coerced through Python truthiness (`bool(v)`
+///   — `is_truthy`, CPython's own `__bool__`/`__len__` protocol), each
+///   item unpacked through the `for k, v in ...` contract (see
+///   `py_unpack_pair`), and the whole mapping built before the state is
+///   swapped — a mid-walk failure leaves the old state in place, exactly
+///   like the reference's partially-built (and then discarded)
+///   OrderedDict.
+/// - `dump_json` — the lock-held snapshot + serialisation of the
+///   reference's `_save` (`dict(self._prefs)` then
+///   `json.dumps(data, indent=2)`): the LRU order rendered through the
+///   already-ported `json_dumps` engine with the reference's `indent=2`,
+///   so every key coercion (int keys stringified, bool/None keys
+///   rendered as the JSON encoder does) and every escape is CPython's
+///   own; a non-coercible key raises the encoder's own `TypeError`.
+///
+/// The thread lock and the file I/O stay in the Python facade; the
+/// cap is the reference's `_MAX_ENTRIES` (1000). A negative cap clamps
+/// to zero — the reference's own negative-cap loop would pop from an
+/// empty dict and crash with KeyError, an input the constant never
+/// produces.
+#[pyclass]
+struct ShufflePrefsCore {
+    /// The ordered `(key, value)` pairs, least-recent first.
+    entries: Vec<(Py<PyAny>, bool)>,
+    /// The entry cap (`_MAX_ENTRIES`).
+    max_entries: usize,
+}
+
+#[pymethods]
+impl ShufflePrefsCore {
+    #[new]
+    fn new(max_entries: i64) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: max_entries.max(0) as usize,
+        }
+    }
+
+    /// The saved shuffle state for *context_id*, or `None` — promoted to
+    /// most-recent on a hit (the reference's `move_to_end`).
+    fn get<'py>(
+        &mut self,
+        py: Python<'py>,
+        context_id: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<bool>> {
+        // dict.get hashes the lookup key before anything else.
+        let _ = context_id.hash()?;
+        match py_key_position(py, &self.entries, context_id)? {
+            Some(i) => {
+                let value = self.entries[i].1;
+                // move_to_end — the hit becomes most-recent.
+                let entry = self.entries.remove(i);
+                self.entries.push(entry);
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist *shuffle* for *context_id* — the entry promoted to
+    /// most-recent, the overflow evicted oldest-first.
+    fn set<'py>(
+        &mut self,
+        py: Python<'py>,
+        context_id: &Bound<'py, PyAny>,
+        shuffle: bool,
+    ) -> PyResult<()> {
+        // __setitem__ hashes the key before anything else.
+        let _ = context_id.hash()?;
+        match py_key_position(py, &self.entries, context_id)? {
+            Some(i) => {
+                // The assignment updates the value in place (the stored
+                // key object kept), then move_to_end promotes the entry.
+                self.entries[i].1 = shuffle;
+                let entry = self.entries.remove(i);
+                self.entries.push(entry);
+            }
+            None => self.entries.push((context_id.clone().unbind(), shuffle)),
+        }
+        // while len(self._prefs) > _MAX_ENTRIES: popitem(last=False)
+        while self.entries.len() > self.max_entries {
+            if self.entries.is_empty() {
+                break;
+            }
+            self.entries.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Empty the state (`clear`).
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Ingest the parsed prefs file (see the class docs). Not a dict →
+    /// no state change.
+    fn load<'py>(&mut self, data: &Bound<'py, PyAny>) -> PyResult<()> {
+        if !data.is_instance_of::<PyDict>() {
+            return Ok(());
+        }
+        // The comprehension's data.items() — the method call, so a
+        // subclass override steers the walk.
+        let items = data.call_method0("items")?;
+        let mut fresh: Vec<(Py<PyAny>, bool)> = Vec::new();
+        for item in items.try_iter()? {
+            let item = item?;
+            let (k, v) = py_unpack_pair(&item)?;
+            // if isinstance(k, str) — the non-str keys are dropped
+            // before the value is ever coerced.
+            if !k.is_instance_of::<PyString>() {
+                continue;
+            }
+            // bool(v) — Python truthiness.
+            fresh.push((k.clone().unbind(), v.is_truthy()?));
+        }
+        // The comprehension built the whole mapping before the
+        // assignment; a failure above leaves the old state intact.
+        self.entries = fresh;
+        Ok(())
+    }
+
+    /// The `_save` snapshot + serialisation: the LRU order rendered as
+    /// `json.dumps(dict(self._prefs), indent=2)` renders it (through the
+    /// ported JSON encoder, so every key coercion and escape is
+    /// CPython's own).
+    fn dump_json(&self, py: Python) -> PyResult<String> {
+        let snapshot = PyDict::new(py);
+        for (k, v) in &self.entries {
+            snapshot.set_item(k.bind(py), *v)?;
+        }
+        json_dumps(py, snapshot.as_any(), Some(2))
+    }
+
+    /// The number of live entries.
+    fn length(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// The LRU bookkeeping engine behind the album-art widget's module-level
+/// URL→render cache — the ordered map of thumbnail URLs to the assembled
+/// Rich `Text` objects. The values are held as the Python objects they
+/// are; the bookkeeping mirrors the reference's `OrderedDict` exactly,
+/// which differs from the shuffle-prefs engine in exactly the ways the
+/// two Python originals differ:
+///
+/// - `get` fuses the reference's cache-check path — `url in _ART_CACHE`
+///   plus `move_to_end` plus the value read — into one promotion: the
+///   lookup key hashed first (`in`'s own TypeError for an unhashable),
+///   then the identity-or-`==` scan; a hit promotes the URL to
+///   most-recent and hands back the cached render, a miss leaves the
+///   state untouched. (The cache never holds `None` — the renderer
+///   always returns a `Text` — so `None` answers a miss.)
+/// - `insert` fuses the reference's store path — `_ART_CACHE[url] =
+///   rendered` plus the overflow check — with the `OrderedDict`
+///   `__setitem__` semantics: an existing key's value is updated in
+///   place and its position KEPT (this engine never promotes on insert;
+///   the shuffle engine does), a fresh key appended at the end; then the
+///   reference's single `if len > max: popitem(last=False)` — one
+///   oldest-entry eviction, the `if` shape rather than the shuffle
+///   engine's `while` walk. The evicted pair is returned (or `None`
+///   when nothing was evicted) so tests can pin which render fell out.
+/// - `remove` fuses the resize invalidation's `if url in _ART_CACHE:
+///   del _ART_CACHE[url]` — the key hashed first, deleted if present,
+///   answering whether it was.
+/// - `clear` and `length` complete the protocol.
+///
+/// The lock-free single-threaded contract is the reference's own (the
+/// cache lives and dies with the event loop's worker exclusivity); the
+/// cap is `_ART_CACHE_MAX` (20). A negative cap clamps to zero, the
+/// unreachable corner of the constant's own.
+#[pyclass]
+struct ArtCacheCore {
+    /// The ordered `(url, render)` pairs, least-recent first.
+    entries: Vec<(Py<PyAny>, Py<PyAny>)>,
+    /// The entry cap (`_ART_CACHE_MAX`).
+    max_entries: usize,
+}
+
+#[pymethods]
+impl ArtCacheCore {
+    #[new]
+    fn new(max_entries: i64) -> Self {
+        Self {
+            entries: Vec::new(),
+            max_entries: max_entries.max(0) as usize,
+        }
+    }
+
+    /// The cached render for *url* — promoted to most-recent on a hit.
+    fn get<'py>(
+        &mut self,
+        py: Python<'py>,
+        url: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        // `url in _ART_CACHE` hashes the key before anything else.
+        let _ = url.hash()?;
+        match py_key_position(py, &self.entries, url)? {
+            Some(i) => {
+                let value = self.entries[i].1.clone_ref(py);
+                // move_to_end — the hit becomes most-recent.
+                let entry = self.entries.remove(i);
+                self.entries.push(entry);
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store *value* for *url* — the existing position kept, the
+    /// overflow evicted oldest-first — answering the evicted pair.
+    fn insert<'py>(
+        &mut self,
+        py: Python<'py>,
+        url: &Bound<'py, PyAny>,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+        // `od[url] = value` hashes the key before anything else.
+        let _ = url.hash()?;
+        match py_key_position(py, &self.entries, url)? {
+            Some(i) => {
+                // __setitem__ on an existing key: the value updated in
+                // place, the position kept — never a promotion.
+                self.entries[i].1 = value.clone().unbind();
+            }
+            None => self
+                .entries
+                .push((url.clone().unbind(), value.clone().unbind())),
+        }
+        // if len(_ART_CACHE) > _ART_CACHE_MAX: popitem(last=False) — the
+        // single-pop shape of the reference.
+        if self.entries.len() > self.max_entries {
+            let evicted = self.entries.remove(0);
+            return Ok(Some(evicted));
+        }
+        Ok(None)
+    }
+
+    /// Delete *url* if cached, answering whether it was (the resize
+    /// invalidation's guarded delete).
+    fn remove<'py>(&mut self, py: Python<'py>, url: &Bound<'py, PyAny>) -> PyResult<bool> {
+        // The `in` probe hashes the key before anything else.
+        let _ = url.hash()?;
+        match py_key_position(py, &self.entries, url)? {
+            Some(i) => {
+                self.entries.remove(i);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Empty the cache.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The number of cached renders.
+    fn length(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+// ── Mutation-failure classifier ────────────────────────────────────────
+
+/// The `_HTTP_STATUS_RE.match(str(exc))` of the mutation-failure
+/// classifier — the pure core of `_classify_mutation_failure`'s
+/// YTMusicServerError arm: the literal prefix `Server returned HTTP `
+/// (ASCII, anchored at the start of the message like the reference's
+/// `^`), then exactly three Unicode decimal digits (CPython's `\d` on
+/// `str` patterns — category Nd, any script, so Arabic-Indic ٤٠١ and
+/// Devanagari ४०३ are three-digit codes), then the word boundary `\b`:
+/// the end of the message, or a next character that is not CPython's
+/// `\w` (alphanumeric-or-underscore — see `py_is_word_char`; a combining
+/// mark after the digits is a boundary, a circled digit or a vulgar
+/// fraction is not, exactly where Python's own `\b` breaks). Fewer
+/// than three digits, or a fourth word character, fails the match —
+/// the fixed-count group has no shorter retry under the anchored
+/// literal prefix. The three digits then parse through `int()`'s own
+/// decimal-digit acceptance (every Nd trio is a valid int — ٤٠١ is
+/// 401), so a Unicode-digit 401/403 classifies auth_expired exactly
+/// like an ASCII one.
+fn server_http_status(message: &str) -> Option<i64> {
+    let rest = message.strip_prefix("Server returned HTTP ")?;
+    let mut value: i64 = 0;
+    let mut chars = rest.chars();
+    // Three `\d`s — fewer available is the match failure.
+    for _ in 0..3 {
+        let c = chars.next()?;
+        value = value * 10 + i64::from(nd_digit_value(c)?);
+    }
+    // `\b` — the end of the message or the next character is not a
+    // word character.
+    match chars.next() {
+        None => Some(value),
+        Some(c) if !py_is_word_char(c) => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// The mutation-failure classifier behind `services/ytmusic.py`'s
+/// `_classify_mutation_failure` — the pure core that maps an exception
+/// raised by a mutation call to its `MutationResult` kind, never
+/// "success".
+///
+/// Mirrors the reference's isinstance chain in its exact order
+/// (`KeyError` → parser drift is a server-side problem; the two timeout
+/// classes → no confirmation in time, the write may have landed;
+/// `requests`' `RequestException` → network; `YTMusicUserError` → no
+/// auth set up; `YTMusicServerError` → the HTTP status parsed out of
+/// the message, 401/403 an expired session, anything else a
+/// server-side problem), with every class resolved from the running
+/// interpreter at call time — `asyncio.TimeoutError` is whatever that
+/// attribute is on the running Python (the builtin `TimeoutError` on
+/// 3.11+, asyncio's own class before), `requests.exceptions` and
+/// `ytmusicapi.exceptions` the very modules the reference imported at
+/// its own module scope. The YTMusicServerError arm renders the
+/// exception through `str()` and matches the HTTP-status prefix (see
+/// `server_http_status`); anything else falls through to
+/// "server_error", the reference's own unreachable-in-practice safety
+/// default. The inputs are never mutated.
+#[pyfunction]
+fn classify_mutation_failure(py: Python, exc: &Bound<'_, PyAny>) -> PyResult<&'static str> {
+    // isinstance(exc, KeyError) — parser drift classifies server_error.
+    let builtins = py.import("builtins")?;
+    let key_error = builtins.getattr("KeyError")?;
+    if exc.is_instance(&key_error)? {
+        return Ok("server_error");
+    }
+    // isinstance(exc, (asyncio.TimeoutError, requests.ReadTimeout))
+    let requests_exceptions = py.import("requests.exceptions")?;
+    let asyncio_timeout = py.import("asyncio")?.getattr("TimeoutError")?;
+    let read_timeout = requests_exceptions.getattr("ReadTimeout")?;
+    if exc.is_instance(&asyncio_timeout)? || exc.is_instance(&read_timeout)? {
+        return Ok("timeout");
+    }
+    // isinstance(exc, requests.RequestException)
+    let request_exception = requests_exceptions.getattr("RequestException")?;
+    if exc.is_instance(&request_exception)? {
+        return Ok("network");
+    }
+    // isinstance(exc, YTMusicUserError)
+    let ytmusic_exceptions = py.import("ytmusicapi.exceptions")?;
+    let user_error = ytmusic_exceptions.getattr("YTMusicUserError")?;
+    if exc.is_instance(&user_error)? {
+        return Ok("auth_required");
+    }
+    // isinstance(exc, YTMusicServerError) — the HTTP status prefix
+    // decides auth_expired vs server_error.
+    let server_error = ytmusic_exceptions.getattr("YTMusicServerError")?;
+    if exc.is_instance(&server_error)? {
+        // str(exc) — rendered through CPython's own __str__ (a raising
+        // __str__ propagates, exactly like the reference's str() call);
+        // the lossy read replaces lone surrogates with U+FFFD, which
+        // moves no boundary (a surrogate is not \w, and neither is the
+        // replacement character — the only positions the match reads).
+        let message = exc.str()?.to_string_lossy().into_owned();
+        if let Some(status) = server_http_status(&message) {
+            if status == 401 || status == 403 {
+                return Ok("auth_expired");
+            }
+        }
+        return Ok("server_error");
+    }
+    // The reference's unreachable-in-practice safety default.
+    Ok("server_error")
+}
+
+// ── Playback-bar track-info width engine ───────────────────────────────
+
+/// The width-splitting engine behind the playback bar's `_TrackInfo`
+/// render — the pure core of the one-line title/artist/album split from
+/// `ui/playback_bar.py`: the available width for the three text
+/// fragments and the per-fragment truncation widths.
+///
+/// Mirrors the reference's arithmetic exactly: `max_w = max(10, bar_width
+/// - 30)` (the reserved tail — volume, repeat, shuffle, heart — plus the
+/// state icon's 3 columns, floored at 10 for the narrowest terminals);
+/// `title_w = min(len(title), max_w // 2)` and `artist_w =
+/// min(len(artist), max_w // 3)` (the halves-and-thirds split of the
+/// reference, floor division — `max_w` is at least 10, so the division
+/// never goes negative); and `album_w = max_w - title_w - artist_w - 8`
+/// (the two em-dash separators — 3 columns each — and the icon again),
+/// clamped at the reference's own `max(0, album_w)` at the truncate
+/// call. The album's own length never enters the split — the reference
+/// gives the album whatever remains, no matter how long it is — so the
+/// engine takes no album; the lens are CPython's `len()` — code points,
+/// computed on the original (pre-reorder, pre-truncation) strings
+/// exactly like the reference computes them. The Rich `Text` assembly,
+/// the BiDi reorder/isolate calls and the state icon stay Python-side
+/// in the widget.
+#[pyfunction]
+#[pyo3(signature = (bar_width, title, artist))]
+fn track_info_widths(bar_width: i64, title: &str, artist: &str) -> (i64, i64, i64) {
+    // max_w = max(10, self.size.width - 30) — floored at 10.
+    let max_w = 10.max(bar_width - 30);
+    // len() counts code points.
+    let title_len = title.chars().count() as i64;
+    let artist_len = artist.chars().count() as i64;
+    // title_w = min(len(title), max_w // 2); artist_w = min(len(artist),
+    // max_w // 3) — floor division on the at-least-10 budget.
+    let title_w = title_len.min(max_w / 2);
+    let artist_w = artist_len.min(max_w / 3);
+    // album_w = max_w - title_w - artist_w - 8 — the reference's
+    // max(0, album_w) clamp at the truncate call site.
+    let album_w = (max_w - title_w - artist_w - 8).max(0);
+    (title_w, artist_w, album_w)
 }

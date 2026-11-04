@@ -42,6 +42,36 @@ _ICON_SHUFFLE_ON = "\U0001f500"  # Same, coloured differently
 # ── Track info widget ─────────────────────────────────────────────
 
 
+def _track_info_widths(bar_width: int, title: str, artist: str) -> tuple[int, int, int]:
+    """The title/artist/album truncation widths — the width-splitting engine.
+
+    The pure core of ``_TrackInfo.render``: the available budget for the
+    three text fragments and the per-fragment widths the reference
+    truncates each through. ``max_w = max(10, bar_width - 30)`` (the
+    reserved tail — volume, repeat, shuffle, heart — plus the state
+    icon's 3 columns, floored at 10 for the narrowest terminals);
+    ``title_w = min(len(title), max_w // 2)`` and
+    ``artist_w = min(len(artist), max_w // 3)`` (the halves-and-thirds
+    split of the reference, floor division); and
+    ``album_w = max(0, max_w - title_w - artist_w - 8)`` (the two
+    em-dash separators — 3 columns each — and the icon again, clamped
+    at the reference's own ``max(0, album_w)`` at the truncate call).
+    The album's own length never enters the split — the reference
+    gives the album whatever remains — and the lens are CPython's
+    ``len()``: code points, computed on the original (pre-reorder,
+    pre-truncation) strings exactly like the reference computes them.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_info_widths``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    max_w = max(10, bar_width - 30)
+    title_w = min(len(title), max_w // 2)
+    artist_w = min(len(artist), max_w // 3)
+    album_w = max(0, max_w - title_w - artist_w - 8)
+    return title_w, artist_w, album_w
+
+
 class _TrackInfo(Widget):
     """Displays the current track title, artist, and album on a single line."""
 
@@ -71,10 +101,9 @@ class _TrackInfo(Widget):
             result.append(f" {_ICON_STOPPED} ", style=theme.muted_text)
 
         if self.title:
-            max_w = max(10, self.size.width - 30)
-            title_w = min(len(self.title), max_w // 2)
-            artist_w = min(len(self.artist), max_w // 3)
-            album_w = max_w - title_w - artist_w - 8
+            title_w, artist_w, album_w = _track_info_widths(
+                self.size.width, self.title, self.artist
+            )
 
             # FSI...PDI isolates each fragment so RTL titles don't pull
             # adjacent widgets (volume, repeat, shuffle) into the RTL BiDi
@@ -94,7 +123,7 @@ class _TrackInfo(Widget):
             if self.album:
                 result.append(" \u2014 ", style=theme.muted_text)
                 result.append(
-                    isolate_bidi(truncate(reorder_rtl_line(self.album), max(0, album_w))),
+                    isolate_bidi(truncate(reorder_rtl_line(self.album), album_w)),
                     style=theme.muted_text,
                 )
         else:
@@ -552,3 +581,26 @@ class FooterBar(Widget):
                 logger.debug(
                     "Failed to update footer button for action '%s'", action, exc_info=True
                 )
+
+
+# ── Native (Rust/PyO3) override, if available ───────────────────────────
+# The Rust extension implements the same width-splitting engine; this
+# binding overrides the pure-Python definition above when the extension
+# is importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_info_widths as _native_track_info_widths,
+    )
+except ImportError:
+    pass
+else:
+
+    def _track_info_widths(  # noqa: F811
+        bar_width: int, title: str, artist: str
+    ) -> tuple[int, int, int]:
+        """The title/artist/album truncation widths (native Rust engine)."""
+        return _native_track_info_widths(bar_width, title, artist)

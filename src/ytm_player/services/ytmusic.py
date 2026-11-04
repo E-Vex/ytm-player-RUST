@@ -99,6 +99,10 @@ def _classify_mutation_failure(exc: BaseException) -> MutationResult:
     monkey-patching ``_send_request`` to surface the status code. The format
     is stable in ytmusicapi 1.x but explicitly fall through to
     "server_error" if the regex doesn't match.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.classify_mutation_failure``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
     if isinstance(exc, KeyError):
         # ytmusicapi parser drift: YouTube changed a response shape. That's a
@@ -127,6 +131,23 @@ def _classify_mutation_failure(exc: BaseException) -> MutationResult:
         return "server_error"
     # Shouldn't be reached — caller filters to known types — but be safe.
     return "server_error"
+
+
+# Try to load the native Rust classifier via PyO3. If the compiled
+# extension is unavailable (e.g. during development without a Rust
+# toolchain), the pure-Python definition above stays.
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        classify_mutation_failure as _native_classify_mutation_failure,
+    )
+except ImportError:
+    pass
+else:
+
+    def _classify_mutation_failure(exc: BaseException) -> MutationResult:  # noqa: F811
+        """Map an exception raised by a mutation call to a MutationResult
+        (native Rust engine)."""
+        return _native_classify_mutation_failure(exc)
 
 
 # Suffix templates for the failure kinds. Cascade sites combine these with
