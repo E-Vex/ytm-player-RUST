@@ -1,4 +1,17 @@
-"""Background audio download service using yt-dlp."""
+"""Background audio download service using yt-dlp.
+
+The service's pure cores are dual-implemented: the base options dict
+``_base_opts`` (the nine-key yt-dlp configuration behind
+``DownloadService._build_opts``, before the configured extras) and
+the candidate-name build ``_candidate_names`` (the five probe
+filenames behind ``_download_sync``'s publication walk and
+``get_path``'s lookup). Both are implemented by the Rust extension
+(``_ytm_player_native.download_base_opts`` /
+``_ytm_player_native.download_candidates``) when it is built and by
+the pure-Python transcriptions below otherwise; the staging, the
+yt-dlp invocation, the atomic publication and the thread ownership
+stay Python-side in the service.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +31,61 @@ logger = logging.getLogger(__name__)
 
 # Quality presets for downloading (prefer opus for smaller size).
 _DOWNLOAD_FORMAT = "bestaudio[ext=webm]/bestaudio/best"
+
+# The extension probe order a completed download is looked up under —
+# opus first (the postprocessor's target), then the container/audio
+# extensions yt-dlp and FFmpeg may leave behind.
+_PROBE_EXTS = ("opus", "webm", "m4a", "mp3", "ogg")
+
+
+def _base_opts(output_path: str) -> dict:
+    """The yt-dlp options dict a download runs with.
+
+    The pure half of ``DownloadService._build_opts``: the nine-key
+    dict — the audio format selector, the staged ``outtmpl``, the
+    quiet/no-warning/noplaylist flags, the write gates and the
+    one-entry FFmpegExtractAudio postprocessor — before
+    ``apply_configured_yt_dlp_options`` layers the configured extras
+    on top. The output path passes through as the object the caller
+    assembled.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.download_base_opts``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    opts = {
+        "format": _DOWNLOAD_FORMAT,
+        "outtmpl": output_path,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        "writethumbnail": False,
+        "writeinfojson": False,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "opus",
+                "preferredquality": "128",
+            }
+        ],
+    }
+    return opts
+
+
+def _candidate_names(video_id: str) -> tuple[str, ...]:
+    """The five probe filenames a completed download is looked up under.
+
+    The pure half of ``DownloadService._download_sync``'s publication
+    walk and ``get_path``'s lookup: the ``<video_id>.<ext>`` names over
+    the probe order — opus first, then webm, m4a, mp3 and ogg — built
+    as a fresh tuple of fresh strings.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.download_candidates``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return tuple(f"{video_id}.{ext}" for ext in _PROBE_EXTS)
 
 
 @dataclass
@@ -46,25 +114,15 @@ class DownloadService:
         self._download_dir.mkdir(parents=True, exist_ok=True)
 
     def _build_opts(self, output_path: str) -> dict:
+        """Build yt-dlp options for a download.
+
+        The base options dict is resolved by the ``_base_opts`` engine
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise); this method layers the configured
+        extras on top.
+        """
         yt_dlp_settings = get_settings().yt_dlp
-        opts = {
-            "format": _DOWNLOAD_FORMAT,
-            "outtmpl": output_path,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extract_flat": False,
-            "writethumbnail": False,
-            "writeinfojson": False,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "opus",
-                    "preferredquality": "128",
-                }
-            ],
-        }
-        return apply_configured_yt_dlp_options(opts, yt_dlp_settings)
+        return apply_configured_yt_dlp_options(_base_opts(output_path), yt_dlp_settings)
 
     def _download_sync(self, video_id: str) -> DownloadResult:
         """Synchronous download (runs in a thread)."""
@@ -93,8 +151,8 @@ class DownloadService:
                     )
 
                 # Find the downloaded file (extension may vary).
-                for ext in ("opus", "webm", "m4a", "mp3", "ogg"):
-                    path = Path(stage) / f"{video_id}.{ext}"
+                for name in _candidate_names(video_id):
+                    path = Path(stage) / name
                     if path.is_file():
                         secure_chmod(path, SECURE_FILE_MODE)
                         dest = self._download_dir / path.name
@@ -188,11 +246,17 @@ class DownloadService:
         return video_id in self._active
 
     def get_path(self, video_id: str) -> Path | None:
-        """Return a completed download, never a file its worker may still be writing."""
+        """Return a completed download, never a file its worker may still be writing.
+
+        The probe filenames are resolved by the ``_candidate_names``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs the
+        lookups.
+        """
         if video_id in self._active:
             return None
-        for ext in ("opus", "webm", "m4a", "mp3", "ogg"):
-            path = self._download_dir / f"{video_id}.{ext}"
+        for name in _candidate_names(video_id):
+            path = self._download_dir / name
             try:
                 if path.exists():
                     return path
@@ -205,3 +269,24 @@ class DownloadService:
     @property
     def active_count(self) -> int:
         return len(self._active)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same download-service engines; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        download_base_opts as _native_download_base_opts,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        download_candidates as _native_download_candidates,
+    )
+except ImportError:
+    pass
+else:
+    _base_opts = _native_download_base_opts  # type: ignore[assignment]
+    _candidate_names = _native_download_candidates  # type: ignore[assignment]
