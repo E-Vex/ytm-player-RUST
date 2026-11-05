@@ -1,4 +1,30 @@
-"""Stream URL resolution using yt-dlp."""
+"""Stream URL resolution using yt-dlp.
+
+The resolver's pure cores are dual-implemented: the expiry gate
+``_is_stale`` (the buffered staleness verdict behind every cache read
+path), the available_at wait gate ``_wait_seconds`` (the pre-roll-ad
+wait behind ``StreamInfo.wait_seconds``), the quality-input gate
+``_validate_quality`` (the validation the resolver's ``quality``
+setter raises through), the base options dict ``_base_ydl_opts`` (the
+ten-key yt-dlp configuration behind ``_build_ydl_opts``, before the
+configured extras), the extract-info field assembly
+``_stream_info_fields`` (the ``info`` dict → the eight ``StreamInfo``
+field values behind ``_try_resolve``) and the DownloadError hint
+``_download_error_hint`` (the stale-cookiejar diagnostic the error
+handler appends). All are implemented by the Rust extension
+(``_ytm_player_native.is_stale`` /
+``_ytm_player_native.wait_seconds`` /
+``_ytm_player_native.validate_quality`` /
+``_ytm_player_native.stream_base_opts`` /
+``_ytm_player_native.stream_info_fields`` /
+``_ytm_player_native.download_error_hint``) when it is built and by
+the pure-Python transcriptions below otherwise; the YoutubeDL
+construction, the cookiejar vouching, the network extraction, the
+cache state and the pending-future bookkeeping stay Python-side in
+the resolver. The clock-reading engines resolve ``time.time()``
+through this module's own ``time`` name at call time, so a patched or
+frozen clock steers both backends identically.
+"""
 
 from __future__ import annotations
 
@@ -34,8 +60,28 @@ _EXPIRY_BUFFER_SECONDS = 300
 
 
 def _is_stale(expires_at: float) -> bool:
-    """True when a cached URL has passed, or is within the buffer of, expiry."""
+    """True when a cached URL has passed, or is within the buffer of, expiry.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.is_stale``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     return time.time() >= expires_at - _EXPIRY_BUFFER_SECONDS
+
+
+def _wait_seconds(available_at: float) -> float:
+    """Seconds until a stream URL behind a pre-roll ad can be fetched.
+
+    The pure half of ``StreamInfo.wait_seconds``: the ``max(0.0, ... )``
+    clamp over the distance from the module's own clock to
+    *available_at* — never negative, zero when the stream is
+    fetchable now.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.wait_seconds``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return max(0.0, available_at - time.time())
 
 
 def _detect_stream_cookies() -> str | None:
@@ -133,6 +179,120 @@ QUALITY_FORMATS = {
 }
 
 
+def _validate_quality(value: str) -> None:
+    """The quality-input gate the resolver's ``quality`` setter raises through.
+
+    Raises ``ValueError`` for a value outside ``QUALITY_FORMATS``, the
+    reference's f-string message naming the value and the valid tiers.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.validate_quality``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if value not in QUALITY_FORMATS:
+        raise ValueError(f"Unknown quality '{value}'. Choose from: {list(QUALITY_FORMATS)}")
+
+
+def _base_ydl_opts(quality: str, logger: Any) -> dict:
+    """The base yt-dlp options dict every resolve runs with.
+
+    The pure half of ``StreamResolver._build_ydl_opts``: the ten-key
+    dict — the quality's format selector (the ``QUALITY_FORMATS``
+    lookup with the ``"high"`` default), the quiet/no-warning flags,
+    the logger, the extraction gates and the Android-client
+    ``extractor_args`` — before ``apply_configured_yt_dlp_options``
+    layers the configured extras on top. The logger object passes
+    through as the object the caller built.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_base_opts``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    opts = {
+        "format": QUALITY_FORMATS.get(quality, QUALITY_FORMATS["high"]),
+        "quiet": True,
+        "no_warnings": True,
+        "logger": logger,
+        "extract_flat": False,
+        "noplaylist": True,
+        # Skip video-related processing.
+        "skip_download": True,
+        # Avoid writing any files to disk.
+        "writeinfojson": False,
+        "writethumbnail": False,
+        # Android client provides a non-PoT fallback path (legacy format 18)
+        # that unblocks madeForKids content which the default web client refuses.
+        "extractor_args": {"youtube": {"player_client": ["default", "android"]}},
+    }
+    return opts
+
+
+def _stream_info_fields(info: Any, video_id: str) -> tuple[Any, ...] | None:
+    """The eight ``StreamInfo`` field values behind a successful extraction.
+
+    The pure half of ``StreamResolver._try_resolve``: the stream-URL
+    read (the direct ``url`` key, the ``requested_formats`` fallback
+    walk when it is falsy, ``None`` when no URL survived), the
+    ``float(... or 0)`` available_at coercion, the acodec/audio-ext
+    format naming, the ``abr``/``tbr`` and ``duration`` integer
+    coercions, the bare ``thumbnail`` read and the module-clock
+    expiry stamp — the values in the dataclass's declared field order,
+    passed through as the objects they are; the ``StreamInfo``
+    construction stays with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_info_fields``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    stream_url: Any = info.get("url", "")
+    available_at = float(info.get("available_at") or 0)
+    if not stream_url:
+        # Some formats nest the URL under requested_formats.
+        formats = info.get("requested_formats") or []
+        for fmt in formats:
+            if fmt.get("vcodec") == "none" or fmt.get("acodec") != "none":
+                stream_url = fmt.get("url", "")
+                available_at = float(fmt.get("available_at") or 0)
+                break
+
+    if not stream_url:
+        return None
+
+    # Determine audio format and bitrate from the info dict.
+    acodec = info.get("acodec", "unknown")
+    audio_ext = info.get("audio_ext") or info.get("ext", "unknown")
+    abr = int(info.get("abr") or info.get("tbr") or 0)
+    duration = int(info.get("duration") or 0)
+    thumbnail = info.get("thumbnail")
+
+    # Pick a readable format name.
+    fmt_name = acodec if acodec != "none" else audio_ext
+
+    expires_at = time.time() + _CACHE_TTL_SECONDS
+
+    return (stream_url, video_id, fmt_name, abr, duration, expires_at, thumbnail, available_at)
+
+
+def _download_error_hint(message: str, session_cookiejar_active: bool) -> str:
+    """The stale-cookiejar diagnostic a signed-in DownloadError appends.
+
+    The pure half of ``StreamResolver._try_resolve``'s error handler:
+    the hint — with its leading blank and the ``ytm setup`` advice —
+    only when the session cookiejar is in use and the error text
+    matches the auth-related pattern (``sign in``, ``login_required``
+    or ``confirm you``, case-insensitively); the empty string
+    otherwise. The cookiejar-signature probe and the ``str(exc)``
+    conversion stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.download_error_hint``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if session_cookiejar_active and re.search(r"sign in|login_required|confirm you", message, re.I):
+        return " (stream cookiejar may be stale/revoked — try `ytm setup` to refresh it)"
+    return ""
+
+
 @dataclass(frozen=True, slots=True)
 class StreamInfo:
     """Resolved stream information for a YouTube Music track."""
@@ -149,8 +309,13 @@ class StreamInfo:
     available_at: float = 0.0
 
     def wait_seconds(self) -> float:
-        """Seconds until the stream URL can be fetched."""
-        return max(0.0, self.available_at - time.time())
+        """Seconds until the stream URL can be fetched.
+
+        The wait computation is resolved by the ``_wait_seconds``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise).
+        """
+        return _wait_seconds(self.available_at)
 
 
 class StreamResolver:
@@ -198,31 +363,21 @@ class StreamResolver:
 
     @quality.setter
     def quality(self, value: str) -> None:
-        if value not in QUALITY_FORMATS:
-            raise ValueError(f"Unknown quality '{value}'. Choose from: {list(QUALITY_FORMATS)}")
+        _validate_quality(value)
         if value != self._quality:
             self._quality = value
             self._reset_ydl()
 
     def _build_ydl_opts(self) -> dict:
-        """Build yt-dlp options for audio extraction."""
+        """Build yt-dlp options for audio extraction.
+
+        The base options dict — the ten keys every resolve runs with —
+        is resolved by the ``_base_ydl_opts`` engine (native when the
+        Rust extension is built, the pure-Python transcription
+        otherwise); this method layers the configured extras on top.
+        """
         settings = get_settings().yt_dlp
-        opts = {
-            "format": QUALITY_FORMATS.get(self._quality, QUALITY_FORMATS["high"]),
-            "quiet": True,
-            "no_warnings": True,
-            "logger": _YtDlpLogger(),
-            "extract_flat": False,
-            "noplaylist": True,
-            # Skip video-related processing.
-            "skip_download": True,
-            # Avoid writing any files to disk.
-            "writeinfojson": False,
-            "writethumbnail": False,
-            # Android client provides a non-PoT fallback path (legacy format 18)
-            # that unblocks madeForKids content which the default web client refuses.
-            "extractor_args": {"youtube": {"player_client": ["default", "android"]}},
-        }
+        opts = _base_ydl_opts(self._quality, _YtDlpLogger())
         return apply_configured_yt_dlp_options(opts, settings)
 
     def _build_ydl(self, opts: dict) -> tuple[Any, tuple[Any, ...] | None]:
@@ -366,7 +521,15 @@ class StreamResolver:
         return None
 
     def _try_resolve(self, url: str, video_id: str, attempt: int) -> StreamInfo | None:
-        """Single resolution attempt."""
+        """Single resolution attempt.
+
+        The extract-info field assembly is resolved by the
+        ``_stream_info_fields`` engine (native when the Rust extension
+        is built, the pure-Python transcription otherwise) and the
+        DownloadError hint by the ``_download_error_hint`` engine; the
+        extraction call, the active-resolve accounting and the logging
+        stay here.
+        """
         import yt_dlp  # Lazy import: needed for exception types
 
         try:
@@ -385,50 +548,15 @@ class StreamResolver:
             # Formats served behind a pre-roll ad carry yt-dlp's available_at;
             # googlevideo answers 403 until it passes. It is recorded on the
             # StreamInfo and resolve() waits for it, not this worker thread.
-            stream_url: str = info.get("url", "")
-            available_at = float(info.get("available_at") or 0)
-            if not stream_url:
-                # Some formats nest the URL under requested_formats.
-                formats = info.get("requested_formats") or []
-                for fmt in formats:
-                    if fmt.get("vcodec") == "none" or fmt.get("acodec") != "none":
-                        stream_url = fmt.get("url", "")
-                        available_at = float(fmt.get("available_at") or 0)
-                        break
-
-            if not stream_url:
+            fields = _stream_info_fields(info, video_id)
+            if fields is None:
                 logger.error("No stream URL found for video_id=%s", video_id)
                 return None
 
-            # Determine audio format and bitrate from the info dict.
-            acodec = info.get("acodec", "unknown")
-            audio_ext = info.get("audio_ext") or info.get("ext", "unknown")
-            abr = int(info.get("abr") or info.get("tbr") or 0)
-            duration = int(info.get("duration") or 0)
-            thumbnail = info.get("thumbnail")
-
-            # Pick a readable format name.
-            fmt_name = acodec if acodec != "none" else audio_ext
-
-            expires_at = time.time() + _CACHE_TTL_SECONDS
-
-            return StreamInfo(
-                url=stream_url,
-                video_id=video_id,
-                format=fmt_name,
-                bitrate=abr,
-                duration=duration,
-                expires_at=expires_at,
-                thumbnail_url=thumbnail,
-                available_at=available_at,
-            )
+            return StreamInfo(*fields)
 
         except yt_dlp.utils.DownloadError as exc:  # type: ignore[attr-defined]
-            hint = ""
-            if _session_cookiejar_signature() is not None and re.search(
-                r"sign in|login_required|confirm you", str(exc), re.I
-            ):
-                hint = " (stream cookiejar may be stale/revoked — try `ytm setup` to refresh it)"
+            hint = _download_error_hint(str(exc), _session_cookiejar_signature() is not None)
             logger.warning(
                 "yt-dlp download error for video_id=%s (attempt %d): %s%s",
                 video_id,
@@ -634,3 +762,40 @@ class StreamResolver:
             for vid in expired:
                 del self._cache[vid]
             return len(expired)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same resolver-glue engines; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        download_error_hint as _native_download_error_hint,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        is_stale as _native_is_stale,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_base_opts as _native_stream_base_opts,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_info_fields as _native_stream_info_fields,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        validate_quality as _native_validate_quality,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        wait_seconds as _native_wait_seconds,
+    )
+except ImportError:
+    pass
+else:
+    _is_stale = _native_is_stale  # type: ignore[assignment]
+    _wait_seconds = _native_wait_seconds  # type: ignore[assignment]
+    _validate_quality = _native_validate_quality  # type: ignore[assignment]
+    _base_ydl_opts = _native_stream_base_opts  # type: ignore[assignment]
+    _stream_info_fields = _native_stream_info_fields  # type: ignore[assignment]
+    _download_error_hint = _native_download_error_hint  # type: ignore[assignment]

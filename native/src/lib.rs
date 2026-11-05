@@ -659,6 +659,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(stats_unique_tracks_select, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(top_tracks_select, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(top_artists_select, module)?)?;
+
+    // Stream resolver-glue engines (services/stream.py equivalents): the
+    // yt-dlp resolver's pure cores — the expiry gate and the available_at
+    // wait gate (both reading the module's own `time` name, a frozen or
+    // patched clock included), the quality-input gate behind the
+    // resolver's setter, the base yt-dlp options dict behind
+    // _build_ydl_opts, the extract_info → StreamInfo field assembly
+    // behind _try_resolve, and the DownloadError hint. The YoutubeDL
+    // construction, the cookiejar vouching, the network extraction and
+    // the pending-future bookkeeping stay Python-side in the resolver.
+    module.add_function(pyo3::wrap_pyfunction!(is_stale, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(wait_seconds, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(validate_quality, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stream_base_opts, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stream_info_fields, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(download_error_hint, module)?)?;
     Ok(())
 }
 
@@ -13821,3 +13837,337 @@ fn top_artists_select<'py>(
     let params = PyTuple::new(py, [limit])?;
     Ok((sql, params))
 }
+
+// ── Stream resolver glue (services/stream.py) ─────────────────────────────
+
+/// The stream module's own clock — `time.time()` read through the
+/// module's `time` attribute, exactly like the reference's global
+/// lookup at call time. A test (or any caller) that swaps
+/// `ytm_player.services.stream`'s `time` for a frozen namespace steers
+/// the native engine exactly like the fallback: the clock the
+/// reference would read is the clock the engine reads.
+fn stream_module_clock(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let stream = PyModule::import(py, "ytm_player.services.stream")?;
+    let time_module = stream.getattr("time")?;
+    let clock = time_module.getattr("time")?;
+    clock.call0()
+}
+
+/// The stream module's `QUALITY_FORMATS` table, read through the
+/// module attribute — the very dict the fallback's own lookups run
+/// against, a patched table included.
+fn stream_quality_formats(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.services.stream")?.getattr("QUALITY_FORMATS")
+}
+
+/// `float(info.get(key) or 0)` — the truthiness gate feeding the
+/// interpreter's own `float()` (see `builtin_float`), so the string
+/// grammar, `__float__` dispatch and error shapes all come free.
+fn truthy_or_float_zero<'py>(
+    py: Python<'py>,
+    info: &Bound<'py, PyAny>,
+    key: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let raw = field_get(py, info, key, None)?;
+    let inner = if raw.is_truthy()? {
+        raw
+    } else {
+        0i64.into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any()
+    };
+    builtin_float(py, &inner)
+}
+
+/// The cached-URL staleness gate — `services/stream.py`'s `_is_stale`,
+/// applied by every read path (`_get_cached`, `is_expired`).
+///
+/// Mirrors the reference's one expression exactly: the clock read
+/// through the module's own `time` name first (the left operand), the
+/// `_EXPIRY_BUFFER_SECONDS` (300) subtraction through CPython's `-`
+/// (its `__sub__` protocol — a non-numeric *expires_at* raises the
+/// operator's own `TypeError`), and the `>=` through CPython's own
+/// comparison, the verdict the comparison's truthiness. A cached URL
+/// is stale once the clock has passed, or is within the buffer of,
+/// its expiry — so playback is never handed a URL that dies
+/// mid-stream.
+#[pyfunction]
+#[pyo3(signature = (expires_at))]
+fn is_stale<'py>(py: Python<'py>, expires_at: &Bound<'py, PyAny>) -> PyResult<bool> {
+    let now = stream_module_clock(py)?;
+    let buffer = 300i64.into_py_any(py)?;
+    let deadline = expires_at.sub(&buffer)?;
+    now.ge(&deadline)
+}
+
+/// The available_at wait gate — the pure half of `StreamInfo.wait_seconds`
+/// (`services/stream.py`), the pre-roll-ad wait `resolve()` sleeps through.
+///
+/// Mirrors the reference's `max(0.0, available_at - time.time())`:
+/// the subtraction (through CPython's `-`, its `__sub__` protocol) is
+/// evaluated first — the clock read through the module's own `time`
+/// name on its right — and `max` walks its two operands exactly like
+/// the reference's call: the `0.0` literal starts as the running
+/// maximum and the subtraction replaces it only when it compares
+/// strictly greater (CPython's `>`), so a NaN or negative wait answers
+/// the `0.0` arm and an equal wait keeps the literal's value. The
+/// answer is whichever operand won — the subtraction's own object
+/// when it won, a fresh `0.0` float otherwise.
+#[pyfunction]
+#[pyo3(signature = (available_at))]
+fn wait_seconds<'py>(
+    py: Python<'py>,
+    available_at: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let now = stream_module_clock(py)?;
+    let elapsed = available_at.sub(&now)?;
+    let zero = PyFloat::new(py, 0.0).into_any();
+    if elapsed.gt(&zero)? {
+        Ok(elapsed)
+    } else {
+        Ok(zero)
+    }
+}
+
+/// The quality-input gate — `services/stream.py`'s
+/// `_validate_quality`, the validation the resolver's `quality`
+/// setter raises through.
+///
+/// Mirrors the reference: the membership test through CPython's own
+/// `in` (the containment slot — hash/eq membership over the module's
+/// own `QUALITY_FORMATS` table, read through the module attribute so a
+/// patched table steers both backends identically), and the rejection
+/// a `ValueError` carrying the reference's f-string message — the
+/// value interpolated through `str()` and the tier list through the
+/// interpreter's own `list()` then `str()` (the setter's value is
+/// typed `str`, so the interpolation spells the same text either way).
+#[pyfunction]
+#[pyo3(signature = (value))]
+fn validate_quality(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    let table = stream_quality_formats(py)?;
+    if table.contains(value)? {
+        return Ok(());
+    }
+    // f"Unknown quality '{value}'. Choose from: {list(QUALITY_FORMATS)}"
+    let list_type = py.import("builtins")?.getattr("list")?;
+    let keys = list_type.call1((table,))?;
+    let mut message = String::from("Unknown quality '");
+    message.push_str(&py_str(value)?);
+    message.push_str("'. Choose from: ");
+    message.push_str(&py_str(&keys)?);
+    Err(PyValueError::new_err(message))
+}
+
+/// The base yt-dlp options dict — `services/stream.py`'s
+/// `_base_ydl_opts`, the pure half of `StreamResolver._build_ydl_opts`.
+///
+/// Mirrors the reference's dict literal key for key, insertion order
+/// included: the `format` selector through the module's own
+/// `QUALITY_FORMATS` table — `.get(quality, QUALITY_FORMATS["high"])`,
+/// the default read eagerly before the lookup runs, the lookup the
+/// dict's own `.get` method (hash/eq membership, a patched table
+/// included) — the `quiet`/`no_warnings`/`noplaylist`/`skip_download`
+/// `True` flags, the `logger` object passed through as the very
+/// object the caller built, the `extract_flat`/`writeinfojson`/
+/// `writethumbnail` `False` flags, and the nested `extractor_args`
+/// mapping (`{"youtube": {"player_client": ["default", "android"]}}`,
+/// fresh containers every call). The configured extras — `cookiefile`,
+/// the CA bundle's `compat_opts`, `remote_components`, `js_runtimes`
+/// — stay in the caller's `apply_configured_yt_dlp_options` pass.
+#[pyfunction]
+#[pyo3(signature = (quality, logger))]
+fn stream_base_opts<'py>(
+    py: Python<'py>,
+    quality: &Bound<'py, PyAny>,
+    logger: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let table = stream_quality_formats(py)?;
+    // QUALITY_FORMATS["high"] — evaluated before .get runs, exactly
+    // like the reference's argument evaluation.
+    let default = table.get_item("high")?;
+    // QUALITY_FORMATS.get(quality, default) — the dict's own method.
+    let format = table.call_method1("get", (quality, default))?;
+
+    let opts = PyDict::new(py);
+    opts.set_item("format", format)?;
+    opts.set_item("quiet", true)?;
+    opts.set_item("no_warnings", true)?;
+    opts.set_item("logger", logger)?;
+    opts.set_item("extract_flat", false)?;
+    opts.set_item("noplaylist", true)?;
+    opts.set_item("skip_download", true)?;
+    opts.set_item("writeinfojson", false)?;
+    opts.set_item("writethumbnail", false)?;
+    let player_client = PyList::new(py, ["default", "android"])?;
+    let youtube = PyDict::new(py);
+    youtube.set_item("player_client", player_client)?;
+    let extractor_args = PyDict::new(py);
+    extractor_args.set_item("youtube", youtube)?;
+    opts.set_item("extractor_args", extractor_args)?;
+    Ok(opts)
+}
+
+/// The extract_info → StreamInfo field assembly —
+/// `services/stream.py`'s `_stream_info_fields`, the pure half of
+/// `StreamResolver._try_resolve`.
+///
+/// Mirrors the reference's post-extraction walk read for read: the
+/// direct `url` read (`info.get("url", "")`), the `available_at`
+/// read through the `float(... or 0)` truthiness gate (the
+/// interpreter's own `float()` — string grammar, `__float__`
+/// dispatch and error shapes included), the `requested_formats`
+/// fallback when the direct URL is falsy (the list read through its
+/// own `or []` gate, each format probed with the reference's
+/// `vcodec == "none" or acodec != "none"` condition — both
+/// comparisons through CPython's own operators — the first match's
+/// `url` and `available_at` replacing the direct reads, the walk
+/// stopping at the `break`), and the `None` verdict when no stream
+/// URL survived. The metadata reads follow the reference's own
+/// gates: `acodec` through `.get("acodec", "unknown")`, `audio_ext`
+/// through the `audio_ext`-or-`ext` chain (a falsy-but-present `ext`
+/// passes through as the object it is, exactly like the reference's
+/// `or` arm), `abr` through the `abr`-or-`tbr` chain with the
+/// interpreter's own `int()` over the winner (float truncation,
+/// decimal strings, `__int__`/`__index__` dispatch — a `0` int when
+/// both miss), `duration` the same over its own single-key chain,
+/// and `thumbnail` the bare `.get` read. The format name is the
+/// acodec unless it compares equal to `"none"` (CPython's `!=`), in
+/// which case the audio extension; the expiry is the module clock
+/// plus the cache TTL (the interpreter's own `+`). The answer is the
+/// eight `StreamInfo` field values in the dataclass's declared
+/// order — `url`, `video_id`, `format`, `bitrate`, `duration`,
+/// `expires_at`, `thumbnail_url`, `available_at` — with every value
+/// passed through as the object it is; the `StreamInfo` construction
+/// stays Python-side in the caller. Where the reference would raise —
+/// a `.get`-less info or format object — the field reads stay total
+/// (the `format_search_result` precedent); the info dict is yt-dlp's
+/// own dict on every production path.
+#[pyfunction]
+#[pyo3(signature = (info, video_id))]
+fn stream_info_fields<'py>(
+    py: Python<'py>,
+    info: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    // stream_url = info.get("url", "")
+    let empty = PyString::new(py, "").into_any();
+    let mut stream_url = field_get(py, info, "url", Some(empty))?;
+    // available_at = float(info.get("available_at") or 0)
+    let mut available_at = truthy_or_float_zero(py, info, "available_at")?;
+
+    if !stream_url.is_truthy()? {
+        // formats = info.get("requested_formats") or []
+        let formats = match first_truthy_get(py, info, &["requested_formats"])? {
+            Some(value) => value,
+            None => PyList::empty(py).into_any(),
+        };
+        for fmt in formats.try_iter()? {
+            let fmt = fmt?;
+            // fmt.get("vcodec") == "none" or fmt.get("acodec") != "none"
+            let vcodec = field_get(py, &fmt, "vcodec", None)?;
+            let acodec = field_get(py, &fmt, "acodec", None)?;
+            let vcodec_none = vcodec.eq("none")?;
+            let acodec_not_none = acodec.ne("none")?;
+            if vcodec_none || acodec_not_none {
+                stream_url = field_get(py, &fmt, "url", Some(PyString::new(py, "").into_any()))?;
+                available_at = truthy_or_float_zero(py, &fmt, "available_at")?;
+                break;
+            }
+        }
+    }
+
+    if !stream_url.is_truthy()? {
+        return Ok(None);
+    }
+
+    // acodec = info.get("acodec", "unknown")
+    let acodec = field_get(
+        py,
+        info,
+        "acodec",
+        Some(PyString::new(py, "unknown").into_any()),
+    )?;
+    // audio_ext = info.get("audio_ext") or info.get("ext", "unknown")
+    let audio_ext = match first_truthy_get(py, info, &["audio_ext"])? {
+        Some(value) => value,
+        None => field_get(
+            py,
+            info,
+            "ext",
+            Some(PyString::new(py, "unknown").into_any()),
+        )?,
+    };
+    // abr = int(info.get("abr") or info.get("tbr") or 0)
+    let abr = match first_truthy_get(py, info, &["abr", "tbr"])? {
+        Some(value) => builtin_int(py, &value)?,
+        None => 0i64
+            .into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any(),
+    };
+    // duration = int(info.get("duration") or 0)
+    let duration = match first_truthy_get(py, info, &["duration"])? {
+        Some(value) => builtin_int(py, &value)?,
+        None => 0i64
+            .into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any(),
+    };
+    // thumbnail = info.get("thumbnail")
+    let thumbnail = field_get(py, info, "thumbnail", None)?;
+    // fmt_name = acodec if acodec != "none" else audio_ext
+    let fmt_name = if acodec.ne("none")? {
+        acodec
+    } else {
+        audio_ext
+    };
+    // expires_at = time.time() + _CACHE_TTL_SECONDS
+    let now = stream_module_clock(py)?;
+    let ttl = 18000i64.into_py_any(py)?;
+    let expires_at = now.add(&ttl)?;
+
+    Ok(Some(PyTuple::new(
+        py,
+        [
+            stream_url,
+            video_id.clone(),
+            fmt_name,
+            abr,
+            duration,
+            expires_at,
+            thumbnail,
+            available_at,
+        ],
+    )?))
+}
+
+/// The DownloadError hint — `services/stream.py`'s
+/// `_download_error_hint`, the diagnostic the resolver's error
+/// handler appends when a signed-in resolve failed looking
+/// auth-related.
+///
+/// Mirrors the reference's gate: the hint only when the session
+/// cookiejar is in use AND the error message matches the
+/// `sign in|login_required|confirm you` pattern case-insensitively
+/// (the regex crate's Unicode-aware `(?i)` — simple case folding over
+/// the same ASCII keywords `re.I` folds, identical on every practical
+/// message), the exact hint text with its leading blank and the
+/// `ytm setup` advice, and the empty string otherwise. The
+/// `_session_cookiejar_signature()` probe and the `str(exc)`
+/// conversion stay Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (message, session_cookiejar_active))]
+fn download_error_hint(message: &str, session_cookiejar_active: bool) -> String {
+    if session_cookiejar_active && DOWNLOAD_HINT_RE.is_match(message) {
+        " (stream cookiejar may be stale/revoked — try `ytm setup` to refresh it)".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The auth-related error-text pattern behind the DownloadError hint —
+/// `re.search(r"sign in|login_required|confirm you", …, re.I)`'s
+/// three literal branches, case-insensitive.
+static DOWNLOAD_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)sign in|login_required|confirm you").expect("valid download hint regex")
+});
