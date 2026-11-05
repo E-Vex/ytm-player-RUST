@@ -1824,6 +1824,9 @@ try:
         build_record as _native_build_record,
     )
     from ytm_player.utils._ytm_player_native import (
+        build_stream_cookiejar as _native_build_stream_cookiejar,
+    )
+    from ytm_player.utils._ytm_player_native import (
         candidate_payload as _native_candidate_payload,
     )
     from ytm_player.utils._ytm_player_native import (
@@ -1831,6 +1834,9 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         identity_from_record as _native_identity_from_record,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        normalize_raw_headers as _native_normalize_raw_headers,
     )
     from ytm_player.utils._ytm_player_native import (
         owner_of as _native_owner_of,
@@ -1885,3 +1891,6 @@ else:
         return _native_vouch_failure(
             auth.data, auth.error, record.data, record.error, jar.data, jar.error
         )
+
+    _build_stream_cookiejar = _native_build_stream_cookiejar  # type: ignore[assignment]
+    _normalize_raw_headers = _native_normalize_raw_headers  # type: ignore[assignment]

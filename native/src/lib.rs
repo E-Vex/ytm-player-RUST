@@ -582,9 +582,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // tree, the account_menu channel-id extraction (the defensive walk
     // that fails closed), the canonical header serialisation with its
     // candidate-slot variant, the record assembly with its fresh
-    // revision, and the SHA-256 hex primitive — with the file reads,
-    // the session locking and the atomic writes staying Python-side in
-    // the manager.
+    // revision, and the SHA-256 hex primitive; the manual-paste header
+    // normalization (the ^[E/alternating/standard paste formats, the
+    // Chrome decoded-protobuf block stripping and the pseudo-header
+    // drops); and the stream cookiejar builder (the youtube.com/
+    // google.com domain filter with its control-char gate, and the
+    // yt-dlp Netscape serialisation with the jar's own cookie
+    // ordering) — with the file reads, the session locking and the
+    // atomic writes staying Python-side in the manager.
     module.add_function(pyo3::wrap_pyfunction!(parse_record, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(identity_from_record, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(owner_of, module)?)?;
@@ -597,6 +602,8 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(candidate_payload, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(build_record, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(sha256_hex, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(normalize_raw_headers, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(build_stream_cookiejar, module)?)?;
     Ok(())
 }
 
@@ -12860,4 +12867,399 @@ fn build_record<'py>(
 #[pyo3(signature = (payload))]
 fn sha256_hex(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<String> {
     sha256_hex_impl(py, payload)
+}
+
+// ── Manual-paste header normalization (services/auth.py) ─────────────────
+
+/// The HTTP/2 pseudo-headers Chrome DevTools prefixes its request
+/// listings with — dropped from every paste format (mirrors
+/// `auth._PSEUDO_HEADERS`, exact string membership).
+const PSEUDO_HEADERS: [&str; 5] = [":authority", ":method", ":path", ":scheme", ":status"];
+
+/// Drop Chrome's decoded-protobuf annotation for ``x-client-data``
+/// (mirrors `auth._strip_decoded_blocks`): every ``Decoded:`` line
+/// with a matching bare ``}`` line later in the input drops both ends
+/// and everything between; an unterminated block is left untouched
+/// (dropping to end-of-input would discard real headers, and the
+/// caller degrades better on a parity shift than on missing lines).
+/// Both markers compare after `str.strip()` (CPython's own whitespace
+/// set — see `py_strip`).
+fn strip_decoded_blocks(lines: Vec<&str>) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if py_strip(lines[i]) != "Decoded:" {
+            out.push(lines[i]);
+            i += 1;
+            continue;
+        }
+        // next(j for j in range(i + 1, len(lines)) if … == "}") — the
+        // first closing brace strictly after the opener.
+        match (i + 1..lines.len()).find(|&j| py_strip(lines[j]) == "}") {
+            None => {
+                out.push(lines[i]);
+                i += 1;
+            }
+            Some(close) => i = close + 1,
+        }
+    }
+    out
+}
+
+/// The manual-paste header pre-processing — `services/auth.py`'s
+/// `_normalize_raw_headers`, behind `_setup_manual`'s paste loop.
+///
+/// Mirrors the reference's three paste formats read for read: the
+/// single-line terminal paste split on its escape separator (the
+/// literal ``^[E`` winning over the real ``ESC E`` over the bare
+/// ``ESC``, whatever the paste actually carried), paired two-by-two
+/// into ``Name: Value`` lines with the empty names and HTTP/2
+/// pseudo-headers dropped; the multi-line walk with blank lines
+/// filtered out (blank after CPython's own `str.strip()` — a wider
+/// set than the crate's `trim`) and Chrome's decoded-protobuf blocks
+/// stripped, classified as alternating name/value lines when more
+/// than two lines survive and fewer than a fifth contain ``": "`` —
+/// the same `len * 0.2` float threshold — paired two-by-two with only
+/// the pseudo-headers dropped (an empty name still pairs here, the
+/// reference's asymmetry); and the standard ``Name: Value`` pass that
+/// keeps every surviving line stripped, minus the leading-colon
+/// pseudo-headers. Every strip is `py_strip`, every join a plain
+/// ``\n`` join (the empty list answering the empty string).
+#[pyfunction]
+#[pyo3(signature = (raw))]
+fn normalize_raw_headers(raw: &str) -> String {
+    let has_caret = raw.contains("^[E");
+    let has_esc_e = raw.contains("\u{1b}E");
+    if has_caret || has_esc_e || raw.contains('\u{1b}') {
+        // "^[E" if "^[E" in raw else ("\x1bE" if … else "\x1b")
+        let sep = if has_caret {
+            "^[E"
+        } else if has_esc_e {
+            "\u{1b}E"
+        } else {
+            "\u{1b}"
+        };
+        let parts: Vec<&str> = raw.split(sep).collect();
+        let mut lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i + 1 < parts.len() {
+            let name = py_strip(parts[i]);
+            let value = py_strip(parts[i + 1]);
+            i += 2;
+            if name.is_empty() || PSEUDO_HEADERS.contains(&name) {
+                continue;
+            }
+            lines.push(format!("{name}: {value}"));
+        }
+        return lines.join("\n");
+    }
+
+    let raw_lines = strip_decoded_blocks(
+        raw.split('\n')
+            .filter(|line| !py_strip(line).is_empty())
+            .collect(),
+    );
+    let colon_lines = raw_lines.iter().filter(|line| line.contains(": ")).count();
+    // len(raw_lines) > 2 and colon_lines < len(raw_lines) * 0.2 — the
+    // int-times-float product and the int-vs-float comparison both at
+    // f64 width, exactly like the reference's.
+    let is_alternating = raw_lines.len() > 2 && (colon_lines as f64) < raw_lines.len() as f64 * 0.2;
+
+    if is_alternating {
+        let mut lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i + 1 < raw_lines.len() {
+            let name = py_strip(raw_lines[i]);
+            let value = py_strip(raw_lines[i + 1]);
+            i += 2;
+            if PSEUDO_HEADERS.contains(&name) {
+                continue;
+            }
+            lines.push(format!("{name}: {value}"));
+        }
+        return lines.join("\n");
+    }
+
+    let mut result: Vec<&str> = Vec::new();
+    for line in &raw_lines {
+        let stripped = py_strip(line);
+        if stripped.starts_with(':') {
+            continue;
+        }
+        result.push(stripped);
+    }
+    result.join("\n")
+}
+
+// ── Stream cookiejar builder (services/auth.py) ──────────────────────────
+
+/// yt-dlp's own Netscape jar header — `YoutubeDLCookieJar._HEADER`. The
+/// reference saves through yt-dlp's subclass, not stdlib's
+/// `MozillaCookieJar`, so this two-line header (not stdlib's four-line
+/// `NETSCAPE_HEADER_TEXT`) is what the file starts with.
+const YTDLP_JAR_HEADER: &str =
+    "# Netscape HTTP Cookie File\n# This file is generated by yt-dlp.  Do not edit.\n\n";
+
+/// `CookieJar.__iter__` — stdlib `deepvalues` over the nested
+/// `{domain: {path: {name: cookie}}}` store: depth-first, each level's
+/// entries in the running interpreter's own order — plain insertion
+/// order on 3.11+, and the `sorted(mapping.keys())` walk while 3.10
+/// still sorted (gh-86232 changed `deepvalues` mid-3.11 development),
+/// so the jar bytes always match what the fallback of the interpreter
+/// that loaded the engine would have written. The walk recurses into
+/// the store's own dict levels only — the cookie objects it reaches
+/// never carry `.items` the way the reference's `obj.items` probe
+/// requires of a nested mapping, so both walks agree on every store
+/// this engine can build.
+fn jar_cookies<'py>(
+    py: Python<'py>,
+    store: &Bound<'py, PyDict>,
+    sorted_fn: &Bound<'py, PyAny>,
+) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let mut out = Vec::new();
+    jar_walk_level(py, store, py.version_info() < (3, 11), sorted_fn, &mut out)?;
+    Ok(out)
+}
+
+fn jar_walk_level<'py>(
+    py: Python<'py>,
+    level: &Bound<'py, PyDict>,
+    sorted_jar: bool,
+    sorted_fn: &Bound<'py, PyAny>,
+    out: &mut Vec<Bound<'py, PyAny>>,
+) -> PyResult<()> {
+    if sorted_jar {
+        // values = map(adict.get, sorted(adict.keys())) — the keys
+        // ordered through CPython's own sorted (its TypeError for an
+        // unorderable pair kept), each read through the dict's own
+        // subscript; a key vanishing mid-walk reads as None, which
+        // deepvalues then yields as a value — reproduced here.
+        let keys = level.getattr("keys")?.call0()?;
+        let sorted = sorted_fn.call1((keys,))?;
+        for key in sorted.try_iter()? {
+            let key = key?;
+            match level.get_item(&key)? {
+                Some(value) => jar_walk_value(py, value, sorted_jar, sorted_fn, out)?,
+                None => out.push(py.None().into_bound(py)),
+            }
+        }
+    } else {
+        // list(mapping.values()) — each level in plain insertion order.
+        for (_, value) in level.iter() {
+            jar_walk_value(py, value, sorted_jar, sorted_fn, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn jar_walk_value<'py>(
+    py: Python<'py>,
+    value: Bound<'py, PyAny>,
+    sorted_jar: bool,
+    sorted_fn: &Bound<'py, PyAny>,
+    out: &mut Vec<Bound<'py, PyAny>>,
+) -> PyResult<()> {
+    if let Ok(sub) = value.downcast::<PyDict>() {
+        jar_walk_level(py, sub, sorted_jar, sorted_fn, out)?;
+    } else {
+        out.push(value);
+    }
+    Ok(())
+}
+
+/// The wide stream cookiejar builder — `services/auth.py`'s
+/// `_build_stream_cookiejar`, behind `_commit_session`'s first write.
+///
+/// Mirrors the reference read for read. The filter loop walks *jar*
+/// through Python's iteration protocol, each cookie's domain through
+/// its own `lstrip(".")`, the exact-family membership
+/// (`bare in ("youtube.com", "google.com")` — CPython's own `in`, so a
+/// confusable like `notyoutube.com` fails the equality before the
+/// suffix arm admits it) and the suffix arm through the object's own
+/// `endswith` tuple call; a kept cookie's value read through the
+/// reference's `or ""` truthiness gate and its name and value walked
+/// through the `ch in value` containment of the control-char gate
+/// (`"\t"`/`"\n"`/`"\r"`, name first — an embedded control character
+/// would corrupt the line-oriented file). Survivors enter the jar's
+/// own nested `{domain: {path: {name: cookie}}}` store — plain dicts,
+/// so the reference `set_cookie`'s CPython semantics hold: hash/eq
+/// membership, the first position of a repeated key with its last
+/// object.
+///
+/// The save is yt-dlp's `YoutubeDLCookieJar.save` (the subclass the
+/// reference instantiates), `ignore_discard`/`ignore_expires` both on
+/// so neither gate ever bites: first the session-cookie pass that
+/// assigns `expires = 0` to every kept cookie still carrying `None`
+/// (the caller's own Cookie objects, mutated exactly like the
+/// reference's shared references), then the line pass — the domain
+/// through its own `startswith(".")`, the path, the secure flag's
+/// truthiness, the expires through the interpreter's own `str()`
+/// (never `None` after the first pass, so a session cookie renders
+/// `"0"`), the name/value pair swapped when the value is `None`
+/// (`Set-Cookie: foo`'s Netscape spelling), all seven columns joined
+/// by `"\t".join` — CPython's own join, its TypeError for a non-str
+/// column included — and the line written through `'{}\n'.format`.
+/// The jar's cookie order is the interpreter's own `deepvalues` walk
+/// (see `jar_cookies`), the buffer assembled by `"".join` and encoded
+/// through the text object's own `encode("utf-8")` — its
+/// `UnicodeEncodeError` shape kept. The `yt_dlp.cookies` import and
+/// the StringIO buffer stay Python-side in the fallback only.
+#[pyfunction]
+#[pyo3(signature = (jar))]
+fn build_stream_cookiejar<'py>(py: Python<'py>, jar: &Bound<'py, PyAny>) -> PyResult<Py<PyBytes>> {
+    let dot = PyString::new(py, ".");
+    let empty_str = PyString::new(py, "");
+    let exact_domains = PyTuple::new(py, ["youtube.com", "google.com"])?.into_any();
+    let suffix_domains = PyTuple::new(py, [".youtube.com", ".google.com"])?;
+    let builtins = py.import("builtins")?;
+    let str_fn = builtins.getattr("str")?;
+    let sorted_fn = builtins.getattr("sorted")?;
+
+    // stream_jar = YoutubeDLCookieJar() — the nested store starts
+    // empty, exactly like the fresh jar the reference builds.
+    let store = PyDict::new(py);
+
+    for cookie in jar.try_iter()? {
+        let cookie = cookie?;
+        // bare = cookie.domain.lstrip(".")
+        let domain = cookie.getattr("domain")?;
+        let bare = domain.getattr("lstrip")?.call1((dot.clone(),))?;
+        // if bare in ("youtube.com", "google.com") or bare.endswith(…)
+        let keep = exact_domains.contains(&bare)?
+            || bare
+                .getattr("endswith")?
+                .call1((suffix_domains.clone(),))?
+                .is_truthy()?;
+        if !keep {
+            continue;
+        }
+        // value = cookie.value or ""
+        let value = cookie.getattr("value")?;
+        let checked = if value.is_truthy()? {
+            value
+        } else {
+            empty_str.clone().into_any()
+        };
+        // if _has_control_chars(cookie.name, value): continue — name
+        // first, then the gated value, each against \t/\n/\r through
+        // CPython's own `in`.
+        let name = cookie.getattr("name")?;
+        let mut control = false;
+        for v in [&name, &checked] {
+            for ch in ["\t", "\n", "\r"] {
+                if v.contains(PyString::new(py, ch))? {
+                    control = true;
+                    break;
+                }
+            }
+            if control {
+                break;
+            }
+        }
+        if control {
+            continue;
+        }
+        // set_cookie(cookie) — the reference's own store walk, each
+        // level created on miss and the (domain, path) attrs read
+        // again exactly where set_cookie reads them.
+        let cookie_domain = cookie.getattr("domain")?;
+        if !store.contains(&cookie_domain)? {
+            store.set_item(&cookie_domain, PyDict::new(py))?;
+        }
+        let paths = store
+            .get_item(&cookie_domain)?
+            .expect("the domain was just inserted or already present");
+        let paths = paths
+            .downcast::<PyDict>()
+            .expect("set_cookie only ever stores dicts");
+        let cookie_path = cookie.getattr("path")?;
+        if !paths.contains(&cookie_path)? {
+            paths.set_item(&cookie_path, PyDict::new(py))?;
+        }
+        let names = paths
+            .get_item(&cookie_path)?
+            .expect("the path was just inserted or already present");
+        let names = names
+            .downcast::<PyDict>()
+            .expect("set_cookie only ever stores dicts");
+        let cookie_name = cookie.getattr("name")?;
+        names.set_item(&cookie_name, cookie)?;
+    }
+
+    // The session-cookie pass — every kept cookie still carrying
+    // expires None is assigned the int 0, mutating the caller's own
+    // objects exactly like the reference's shared references.
+    for cookie in jar_cookies(py, &store, &sorted_fn)? {
+        if cookie.getattr("expires")?.is_none() {
+            cookie.setattr("expires", 0i64)?;
+        }
+    }
+
+    // The line pass — yt-dlp's _HEADER, then one seven-column line per
+    // cookie in the jar's own order.
+    let tab = PyString::new(py, "\t");
+    let line_format = PyString::new(py, "{}\n");
+    let mut parts: Vec<Bound<'py, PyAny>> = Vec::new();
+    parts.push(PyString::new(py, YTDLP_JAR_HEADER).into_any());
+    for cookie in jar_cookies(py, &store, &sorted_fn)? {
+        let domain = cookie.getattr("domain")?;
+        let domain_dot = if domain
+            .getattr("startswith")?
+            .call1((dot.clone(),))?
+            .is_truthy()?
+        {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
+        let path = cookie.getattr("path")?;
+        let secure = if cookie.getattr("secure")?.is_truthy()? {
+            "TRUE"
+        } else {
+            "FALSE"
+        };
+        // str_or_none(cookie.expires, default="") — never None after
+        // the session-cookie pass, so the interpreter's own str().
+        let expires = cookie.getattr("expires")?;
+        let expires_col = if expires.is_none() {
+            empty_str.clone().into_any()
+        } else {
+            str_fn.call1((expires,))?
+        };
+        // name, value = cookie.name, cookie.value — the value read
+        // after the name, a None value swapping the pair.
+        let name = cookie.getattr("name")?;
+        let value = cookie.getattr("value")?;
+        let (name_col, value_col) = if value.is_none() {
+            (empty_str.clone().into_any(), name)
+        } else {
+            (name, value)
+        };
+        let cols = PyTuple::new(
+            py,
+            [
+                domain,
+                PyString::new(py, domain_dot).into_any(),
+                path,
+                PyString::new(py, secure).into_any(),
+                expires_col,
+                name_col,
+                value_col,
+            ],
+        )?;
+        let joined = tab.getattr("join")?.call1((cols,))?;
+        parts.push(line_format.getattr("format")?.call1((joined,))?);
+    }
+    // The StringIO's accumulated text, assembled and encoded through
+    // the str object's own methods.
+    let text = empty_str
+        .getattr("join")?
+        .call1((PyList::new(py, parts)?,))?;
+    let encoded = text
+        .getattr("encode")?
+        .call1((PyString::new(py, "utf-8"),))?;
+    let bytes = encoded
+        .downcast_into::<PyBytes>()
+        .expect("str.encode returns bytes");
+    Ok(bytes.unbind())
 }
