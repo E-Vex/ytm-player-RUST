@@ -621,6 +621,44 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // threshold all through the interpreter's own operators, so every
     // numeric shape and every error matches the reference exactly.
     module.add_function(pyo3::wrap_pyfunction!(get_orientation, module)?)?;
+
+    // History SQL-body engines (services/history.py equivalents): the
+    // nineteen statement texts and parameter tuples behind the
+    // HistoryManager's reads and writes — the schema DDL script and
+    // the retention prune behind init, the search-history upsert /
+    // selects / delete, the two log_play writes' statement texts
+    // (their parameter tuples are the play_insert_params /
+    // play_stats_params engines), the listened-seconds read and its
+    // two updates, the play-history and recently-played selects, the
+    // played-video-id read, the three aggregate reads behind
+    // get_stats, and the two top-list selects. Each engine returns
+    // the statement exactly as the fallback spells it (leading
+    // newline and indentation included) with the bound values passed
+    // through as the objects they are; the connection handling, the
+    // executescript/execute/commit calls and the fetches stay
+    // Python-side in the manager.
+    module.add_function(pyo3::wrap_pyfunction!(history_schema, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(history_retention_delete, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_upsert, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_history_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_suggestion_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(search_history_delete, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_history_insert_sql, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_stats_upsert_sql, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_listened_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_listened_update, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_stats_listened_update, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(play_history_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(recently_played_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(played_video_ids_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stats_total_plays_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        stats_total_listen_time_select,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stats_unique_tracks_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(top_tracks_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(top_artists_select, module)?)?;
     Ok(())
 }
 
@@ -13363,4 +13401,423 @@ fn get_orientation<'py>(
     } else {
         Ok("vertical")
     }
+}
+
+// ── History SQL bodies (services/history.py) ──────────────────────────────
+
+/// The schema DDL script behind `HistoryManager.init`'s
+/// `executescript` — the pure half of the database's first write.
+///
+/// Mirrors the pure-Python reference (`_history_schema`, returning the
+/// module's `_SCHEMA` constant): the search-history table with its
+/// unique query index, the play-history table and the play-stats
+/// table, leading newline and zero-indent lines included — the exact
+/// text the fallback returns, so a schema executes identically on
+/// either backend.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn history_schema() -> String {
+    "
+CREATE TABLE IF NOT EXISTS search_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    filter_mode TEXT DEFAULT 'music',
+    result_count INTEGER,
+    search_count INTEGER DEFAULT 1,
+    first_searched TEXT DEFAULT (datetime('now')),
+    last_searched TEXT DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_search_query
+    ON search_history(query, filter_mode);
+
+CREATE TABLE IF NOT EXISTS play_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    artist TEXT,
+    album TEXT,
+    duration_seconds INTEGER,
+    listened_seconds INTEGER,
+    source TEXT,
+    played_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS play_stats (
+    video_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    artist TEXT,
+    play_count INTEGER DEFAULT 0,
+    total_listened_seconds INTEGER DEFAULT 0,
+    last_played TEXT
+);
+"
+    .to_string()
+}
+
+/// The retention prune behind `HistoryManager.init`'s post-schema
+/// write — the statement and the bound retention limit.
+///
+/// Mirrors the pure-Python reference (`_history_retention_delete`):
+/// the statement text exactly as the fallback spells it (the
+/// reference's two adjacent literals joined into the one line they
+/// concatenate to), and the `max_history` value passed through as the
+/// object it is into the parameter tuple — `(sql, (max_history,))`,
+/// the shape `aiosqlite`'s `execute(*stmt)` unpacks.
+#[pyfunction]
+#[pyo3(signature = (max_history))]
+fn history_retention_delete<'py>(
+    py: Python<'py>,
+    max_history: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "DELETE FROM play_history WHERE rowid NOT IN (SELECT rowid FROM play_history ORDER BY played_at DESC LIMIT ?)"
+        .to_string();
+    let params = PyTuple::new(py, [max_history])?;
+    Ok((sql, params))
+}
+
+/// The search-history upsert behind `HistoryManager.log_search` — the
+/// statement and the three bound values.
+///
+/// Mirrors the pure-Python reference (`_search_upsert`): the statement
+/// text exactly as the fallback spells it (leading newline and
+/// eight-space indentation included — the reference's method-body
+/// spelling re-indented to the engine's module-level home, a spelling
+/// SQLite parses identically), and `query` / `filter_mode` /
+/// `result_count` passed through as the objects they are into the
+/// parameter tuple.
+#[pyfunction]
+#[pyo3(signature = (query, filter_mode, result_count))]
+fn search_upsert<'py>(
+    py: Python<'py>,
+    query: &Bound<'py, PyAny>,
+    filter_mode: &Bound<'py, PyAny>,
+    result_count: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        INSERT INTO search_history (query, filter_mode, result_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(query, filter_mode) DO UPDATE SET
+            search_count = search_count + 1,
+            result_count = excluded.result_count,
+            last_searched = datetime('now')
+        "
+    .to_string();
+    let params = PyTuple::new(py, [query, filter_mode, result_count])?;
+    Ok((sql, params))
+}
+
+/// The recent-searches select behind `HistoryManager.get_search_history`.
+///
+/// Mirrors the pure-Python reference (`_search_history_select`): the
+/// statement text exactly as the fallback spells it, and `limit`
+/// passed through as the object it is into the parameter tuple.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn search_history_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT query, filter_mode, result_count, search_count,
+               first_searched, last_searched
+        FROM search_history
+        ORDER BY last_searched DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
+}
+
+/// The autocomplete select behind
+/// `HistoryManager.get_search_suggestions`.
+///
+/// Mirrors the pure-Python reference (`_search_suggestion_select`):
+/// the statement text exactly as the fallback spells it, and `prefix`
+/// / `limit` passed through as the objects they are into the
+/// parameter tuple.
+#[pyfunction]
+#[pyo3(signature = (prefix, limit))]
+fn search_suggestion_select<'py>(
+    py: Python<'py>,
+    prefix: &Bound<'py, PyAny>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT query
+        FROM search_history
+        WHERE query LIKE ? || '%'
+        ORDER BY search_count DESC, last_searched DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [prefix, limit])?;
+    Ok((sql, params))
+}
+
+/// The clear-all statement behind
+/// `HistoryManager.clear_search_history`.
+///
+/// Mirrors the pure-Python reference (`_search_history_delete`): the
+/// bare statement text, no parameter tuple — the shape the reference
+/// hands `execute` as its single argument.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn search_history_delete() -> String {
+    "DELETE FROM search_history".to_string()
+}
+
+/// The play-history INSERT statement text behind
+/// `HistoryManager.log_play`'s first write.
+///
+/// Mirrors the pure-Python reference (`_play_history_insert_sql`):
+/// the statement text exactly as the fallback spells it. The seven
+/// bound values are the `play_insert_params` engine's tuple (ported
+/// earlier), so this engine returns the statement alone — the
+/// reference's `execute(sql, params)` two-argument shape stays the
+/// caller's to build.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn play_history_insert_sql() -> String {
+    "
+        INSERT INTO play_history
+            (video_id, title, artist, album, duration_seconds,
+             listened_seconds, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        "
+    .to_string()
+}
+
+/// The play-stats upsert statement text behind
+/// `HistoryManager.log_play`'s second write.
+///
+/// Mirrors the pure-Python reference (`_play_stats_upsert_sql`): the
+/// statement text exactly as the fallback spells it. The four bound
+/// values are the `play_stats_params` engine's tuple (ported
+/// earlier), so this engine returns the statement alone.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn play_stats_upsert_sql() -> String {
+    "
+        INSERT INTO play_stats (video_id, title, artist, play_count,
+                                total_listened_seconds, last_played)
+        VALUES (?, ?, ?, 1, ?, datetime('now'))
+        ON CONFLICT(video_id) DO UPDATE SET
+            title = excluded.title,
+            artist = excluded.artist,
+            play_count = play_count + 1,
+            total_listened_seconds = total_listened_seconds + excluded.total_listened_seconds,
+            last_played = datetime('now')
+        "
+    .to_string()
+}
+
+/// The stored-listening read behind
+/// `HistoryManager.update_play_listened_seconds` — the statement and
+/// the bound row id.
+///
+/// Mirrors the pure-Python reference (`_play_listened_select`): the
+/// statement text exactly as the fallback spells it, and `play_id`
+/// passed through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (play_id))]
+fn play_listened_select<'py>(
+    py: Python<'py>,
+    play_id: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "SELECT video_id, listened_seconds FROM play_history WHERE id = ?".to_string();
+    let params = PyTuple::new(py, [play_id])?;
+    Ok((sql, params))
+}
+
+/// The finalised-listen update behind
+/// `HistoryManager.update_play_listened_seconds` — the statement and
+/// the two bound values.
+///
+/// Mirrors the pure-Python reference (`_play_listened_update`): the
+/// statement text exactly as the fallback spells it, and
+/// `listened_seconds` / `play_id` passed through as the objects they
+/// are, in the statement's placeholder order.
+#[pyfunction]
+#[pyo3(signature = (listened_seconds, play_id))]
+fn play_listened_update<'py>(
+    py: Python<'py>,
+    listened_seconds: &Bound<'py, PyAny>,
+    play_id: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "UPDATE play_history SET listened_seconds = ? WHERE id = ?".to_string();
+    let params = PyTuple::new(py, [listened_seconds, play_id])?;
+    Ok((sql, params))
+}
+
+/// The stats-side listen accrual behind
+/// `HistoryManager.update_play_listened_seconds` — the statement and
+/// the two bound values.
+///
+/// Mirrors the pure-Python reference
+/// (`_play_stats_listened_update`): the statement text exactly as the
+/// fallback spells it, and `delta` / `video_id` passed through as the
+/// objects they are, in the statement's placeholder order.
+#[pyfunction]
+#[pyo3(signature = (delta, video_id))]
+fn play_stats_listened_update<'py>(
+    py: Python<'py>,
+    delta: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        UPDATE play_stats
+        SET total_listened_seconds = total_listened_seconds + ?,
+            last_played = datetime('now')
+        WHERE video_id = ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [delta, video_id])?;
+    Ok((sql, params))
+}
+
+/// The play-history select behind `HistoryManager.get_play_history`.
+///
+/// Mirrors the pure-Python reference (`_play_history_select`): the
+/// statement text exactly as the fallback spells it, and `limit`
+/// passed through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn play_history_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT video_id, title, artist, album, duration_seconds,
+               listened_seconds, source, played_at
+        FROM play_history
+        ORDER BY played_at DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
+}
+
+/// The deduplicated recently-played select behind
+/// `HistoryManager.get_recently_played` — the one min/max-aggregate
+/// statement whose bare columns read from the max row.
+///
+/// Mirrors the pure-Python reference (`_recently_played_select`): the
+/// statement text exactly as the fallback spells it, and `limit`
+/// passed through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn recently_played_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT video_id, title, artist, album, duration_seconds,
+               MAX(played_at) AS played_at
+        FROM play_history
+        GROUP BY video_id
+        ORDER BY played_at DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
+}
+
+/// The played-video-id read behind
+/// `HistoryManager.get_played_video_ids` — the Recently-Played
+/// filter's DISTINCT walk.
+///
+/// Mirrors the pure-Python reference (`_played_video_ids_select`):
+/// the bare statement text, no parameter tuple — the shape the
+/// reference hands `execute` as its single argument.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn played_video_ids_select() -> String {
+    "SELECT DISTINCT video_id FROM play_history".to_string()
+}
+
+/// The total-plays aggregate behind `HistoryManager.get_stats`.
+///
+/// Mirrors the pure-Python reference (`_stats_total_plays_select`):
+/// the bare statement text, no parameter tuple.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn stats_total_plays_select() -> String {
+    "SELECT COUNT(*) AS total_plays FROM play_history".to_string()
+}
+
+/// The total-listen-time aggregate behind
+/// `HistoryManager.get_stats`.
+///
+/// Mirrors the pure-Python reference
+/// (`_stats_total_listen_time_select`): the bare statement text, no
+/// parameter tuple.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn stats_total_listen_time_select() -> String {
+    "SELECT COALESCE(SUM(listened_seconds), 0) AS s FROM play_history".to_string()
+}
+
+/// The unique-tracks aggregate behind `HistoryManager.get_stats`.
+///
+/// Mirrors the pure-Python reference (`_stats_unique_tracks_select`):
+/// the bare statement text, no parameter tuple.
+#[pyfunction]
+#[pyo3(signature = ())]
+fn stats_unique_tracks_select() -> String {
+    "SELECT COUNT(*) AS c FROM play_stats".to_string()
+}
+
+/// The most-played-tracks select behind
+/// `HistoryManager.get_top_tracks`.
+///
+/// Mirrors the pure-Python reference (`_top_tracks_select`): the
+/// statement text exactly as the fallback spells it, and `limit`
+/// passed through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn top_tracks_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT video_id, title, artist, play_count,
+               total_listened_seconds, last_played
+        FROM play_stats
+        ORDER BY play_count DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
+}
+
+/// The most-played-artists select behind
+/// `HistoryManager.get_top_artists` — the artist-grouped ranking with
+/// its NULL/blank filter.
+///
+/// Mirrors the pure-Python reference (`_top_artists_select`): the
+/// statement text exactly as the fallback spells it, and `limit`
+/// passed through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn top_artists_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "
+        SELECT artist,
+               SUM(play_count) AS play_count,
+               SUM(total_listened_seconds) AS total_listened_seconds
+        FROM play_stats
+        WHERE artist IS NOT NULL AND artist != ''
+        GROUP BY artist
+        ORDER BY play_count DESC
+        LIMIT ?
+        "
+    .to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
 }
