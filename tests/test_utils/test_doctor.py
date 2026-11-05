@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -959,8 +960,10 @@ class TestDoctorReport:
         report = _doctor_report(
             **self._fields(config_path=Path("/x/config.toml"), crash_dir=Path("/x/crashes"))
         )
-        assert "config:   /x/config.toml" in report
-        assert "crashes:  /x/crashes" in report
+        # The report renders Path objects through str() — the expectation
+        # must spell them the same way str(Path) does on this platform.
+        assert f"config:   {Path('/x/config.toml')}" in report
+        assert f"crashes:  {Path('/x/crashes')}" in report
 
     def test_report_is_redacted(self):
         from ytm_player.utils.doctor import _doctor_report
@@ -2179,6 +2182,18 @@ class TestLibmpvStatusText:
 # ── The MPRIS import probe behind the MPRIS status line ────────────────
 
 
+def _cpython_unpack2_error(values: object) -> str:
+    """The exact ValueError this interpreter raises for a 2-unpack of
+    *values* — the spelling drifted across versions (3.14 appends
+    ", got N" to the too-many side), so the tests derive it instead of
+    hardcoding."""
+    try:
+        _k, _v = values
+    except ValueError as exc:
+        return str(exc)
+    raise AssertionError(f"2-unpack of {values!r} unexpectedly succeeded")
+
+
 class TestMprisStatusText:
     """The MPRIS availability probe — on whichever backend is loaded."""
 
@@ -2245,11 +2260,11 @@ class TestMprisStatusText:
             self._run(False, lambda: (_ for _ in ()).throw(RuntimeError("system broke")), None)
 
     def test_short_pair_is_a_value_error(self):
-        with pytest.raises(ValueError, match="not enough values to unpack \\(expected 2, got 1\\)"):
+        with pytest.raises(ValueError, match=re.escape(_cpython_unpack2_error(("name",)))):
             self._run(True, None, ("name",))
 
     def test_long_pair_is_a_value_error(self):
-        with pytest.raises(ValueError, match="too many values to unpack \\(expected 2\\)"):
+        with pytest.raises(ValueError, match=re.escape(_cpython_unpack2_error(("a", "b", "c")))):
             self._run(True, None, ("a", "b", "c"))
 
     def test_non_iterable_pair_is_a_type_error(self):

@@ -38,6 +38,7 @@ blocked) case for case.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -944,13 +945,18 @@ class TestDispatchRouteEngine:
         assert _dispatch_route("x", table)["branch"] == "hit"
 
     def test_row_unpack_arity_errors_match_cpython(self) -> None:
-        for row, message in [
-            ((), "not enough values to unpack \\(expected 3, got 0\\)"),
-            (("x",), "not enough values to unpack \\(expected 3, got 1\\)"),
-            (("x", "y"), "not enough values to unpack \\(expected 3, got 2\\)"),
-            (("x", "y", "z", "w"), "too many values to unpack \\(expected 3\\)"),
-        ]:
-            with pytest.raises(ValueError, match=message):
+        # The engine must raise exactly what this running CPython raises
+        # for the same 3-unpack — the spelling drifted across versions
+        # (3.14 appends ", got N" to the too-many side), so the expected
+        # message is derived from the interpreter, never hardcoded.
+        for row in ((), ("x",), ("x", "y"), ("x", "y", "z", "w")):
+            try:
+                _name, _branch, _page = row
+            except ValueError as exc:
+                expected = str(exc)
+            else:  # every row above has the wrong arity on purpose
+                raise AssertionError(f"3-unpack of {row!r} unexpectedly succeeded")
+            with pytest.raises(ValueError, match=re.escape(expected)):
                 _dispatch_route("x", [row])
 
     def test_non_iterable_row_message_matches_cpython(self) -> None:

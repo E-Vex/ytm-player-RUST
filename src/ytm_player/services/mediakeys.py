@@ -20,7 +20,7 @@ from ytm_player.services._dispatch import (
 logger = logging.getLogger(__name__)
 
 try:
-    from pynput.keyboard import Key, Listener
+    from pynput.keyboard import Key, Listener  # type: ignore[import-not-found]
 
     _PYNPUT_AVAILABLE = True
 except ImportError:

@@ -55,8 +55,13 @@ class TestExceptionChain:
     def test_builtin_timeout_error_is_a_timeout(self):
         # On 3.11+ asyncio.TimeoutError *is* the builtin TimeoutError —
         # the native engine resolves the class from the running
-        # interpreter, so this holds on either spelling.
-        assert _classify_mutation_failure(TimeoutError()) == "timeout"
+        # interpreter, so this holds on either spelling. On 3.10 the
+        # builtin is a distinct class the reference's chain never
+        # lists, so it falls through to the server_error default.
+        if sys.version_info >= (3, 11):
+            assert _classify_mutation_failure(TimeoutError()) == "timeout"
+        else:
+            assert _classify_mutation_failure(TimeoutError()) == "server_error"
 
     def test_read_timeout_is_a_timeout(self):
         assert _classify_mutation_failure(requests.exceptions.ReadTimeout("slow")) == "timeout"

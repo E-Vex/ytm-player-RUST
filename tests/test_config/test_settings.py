@@ -369,9 +369,8 @@ class TestFormatTomlValueEngine:
     def test_the_native_engine_really_answers(self):
         """The binding is live: the module's renderer is the native
         function itself when the extension is built."""
-        from ytm_player.utils._ytm_player_native import format_toml_value
-
         from ytm_player.config.settings import _format_toml_value
+        from ytm_player.utils._ytm_player_native import format_toml_value
 
         assert _format_toml_value is format_toml_value
 

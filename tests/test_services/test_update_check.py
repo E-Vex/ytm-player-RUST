@@ -448,9 +448,8 @@ class TestIsNewerNativeParity:
         """The production ``_is_newer`` wrapper probes the installed
         packaging once and passes the verdict down, so it answers exactly
         what the raw engine with the probed grammar shape answers."""
-        from ytm_player.utils._ytm_player_native import pep440_is_newer
-
         from ytm_player.services.update_check import _packaging_admits_unicode_folds
+        from ytm_player.utils._ytm_player_native import pep440_is_newer
 
         folds = _packaging_admits_unicode_folds()
         for latest, current in _FOLD_CASES + [

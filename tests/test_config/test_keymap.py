@@ -519,9 +519,8 @@ class TestKeyMapLoadPlanEngine:
     def test_the_native_engine_really_answers(self):
         """The binding is live: the module's plan builder delegates to
         the native function when the extension is built."""
-        from ytm_player.utils._ytm_player_native import keymap_load_plan
-
         from ytm_player.config.keymap import _keymap_load_plan
+        from ytm_player.utils._ytm_player_native import keymap_load_plan
 
         assert _keymap_load_plan({}) == []
         # The native engine is reachable through the wrapper (it returns

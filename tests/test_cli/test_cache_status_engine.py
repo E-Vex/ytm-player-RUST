@@ -48,9 +48,10 @@ class TestCacheStatusPayload:
     """The six-key status payload behind ``ytm cache status --json``."""
 
     def test_payload_carries_the_six_keys(self):
-        payload = _cache_status_payload(Path("/home/u/.cache/ytm/audio"), 3, 1049088, 4096)
+        cache_dir = Path("/home/u/.cache/ytm/audio")
+        payload = _cache_status_payload(cache_dir, 3, 1049088, 4096)
         assert payload == {
-            "cache_dir": "/home/u/.cache/ytm/audio",
+            "cache_dir": str(cache_dir),
             "file_count": 3,
             "total_bytes": 1049088,
             "total_human": "1.0 MB",
@@ -72,9 +73,10 @@ class TestCacheStatusPayload:
         ]
 
     def test_cache_dir_renders_through_str(self):
-        # str(Path) is its path text; a str passes through as itself; a
-        # Path subclass's own __str__ steers the rendering.
-        assert _cache_status_payload(Path("/a/b"), 0, 0, 0)["cache_dir"] == "/a/b"
+        # str(Path) is its path text — platform-spelled, so the expectation
+        # mirrors the same str(Path) rendering; a str passes through as
+        # itself; a Path subclass's own __str__ steers the rendering.
+        assert _cache_status_payload(Path("/a/b"), 0, 0, 0)["cache_dir"] == str(Path("/a/b"))
         assert _cache_status_payload("/a/b", 0, 0, 0)["cache_dir"] == "/a/b"
 
         class OddPath:
@@ -128,9 +130,10 @@ class TestCacheStatusText:
     """The four aligned human lines behind ``ytm cache status``."""
 
     def test_exact_layout(self):
-        text = _cache_status_text(Path("/home/u/.cache/ytm/audio"), 3, 1049088, 4096)
+        cache_dir = Path("/home/u/.cache/ytm/audio")
+        text = _cache_status_text(cache_dir, 3, 1049088, 4096)
         assert text == (
-            "Cache directory: /home/u/.cache/ytm/audio\n"
+            f"Cache directory: {cache_dir}\n"
             "Cached files:    3\n"
             "Total size:      1.0 MB\n"
             "Database size:   4.0 KB"

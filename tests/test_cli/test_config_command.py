@@ -57,10 +57,15 @@ class TestConfigEditorPlan:
     """The editor resolution behind ``ytm config`` — on whichever backend
     is loaded."""
 
+    # Path targets render through str() (the engine's documented
+    # contract), so the expectations below mirror the same str(Path(...))
+    # spelling instead of hardcoding the POSIX form — on Windows
+    # str(Path("/c/config.toml")) is backslashed, exactly like the plan.
+
     def test_editor_env_opens_the_config_file(self):
         calls, thunk = _counting_thunk("/usr/bin/xdg-open")
         plan = _config_editor_plan("vim", False, thunk, Path("/c/config.toml"), Path("/c/dir"))
-        assert plan == {"kind": "editor", "editor": "vim", "target": "/c/config.toml"}
+        assert plan == {"kind": "editor", "editor": "vim", "target": str(Path("/c/config.toml"))}
         # The PATH probe never runs when an EDITOR is set — the reference
         # only resolves xdg-open on the fallback branch.
         assert calls == []
@@ -76,13 +81,17 @@ class TestConfigEditorPlan:
         # the xdg branch runs.
         calls, thunk = _counting_thunk("/usr/bin/xdg-open")
         plan = _config_editor_plan("", False, thunk, Path("/c/config.toml"), Path("/c/dir"))
-        assert plan == {"kind": "editor", "editor": "/usr/bin/xdg-open", "target": "/c/dir"}
+        assert plan == {
+            "kind": "editor",
+            "editor": "/usr/bin/xdg-open",
+            "target": str(Path("/c/dir")),
+        }
         assert len(calls) == 1  # exactly one probe
 
     def test_win32_shell_opens_the_config_file(self):
         calls, thunk = _counting_thunk("/usr/bin/xdg-open")
         plan = _config_editor_plan(None, True, thunk, Path("/c/config.toml"), Path("/c/dir"))
-        assert plan == {"kind": "startfile", "target": "/c/config.toml"}
+        assert plan == {"kind": "startfile", "target": str(Path("/c/config.toml"))}
         assert calls == []
 
     def test_empty_editor_env_with_win32_still_shell_opens(self):
@@ -92,7 +101,11 @@ class TestConfigEditorPlan:
     def test_xdg_open_opens_the_config_directory(self):
         calls, thunk = _counting_thunk("/usr/bin/xdg-open")
         plan = _config_editor_plan(None, False, thunk, Path("/c/config.toml"), Path("/c/dir"))
-        assert plan == {"kind": "editor", "editor": "/usr/bin/xdg-open", "target": "/c/dir"}
+        assert plan == {
+            "kind": "editor",
+            "editor": "/usr/bin/xdg-open",
+            "target": str(Path("/c/dir")),
+        }
         assert len(calls) == 1
 
     def test_no_editor_no_xdg_is_the_manual_open_error(self):
@@ -100,7 +113,9 @@ class TestConfigEditorPlan:
         plan = _config_editor_plan(None, False, thunk, Path("/c/config.toml"), Path("/c/my dir"))
         assert plan == {
             "kind": "error",
-            "message": "No $EDITOR set and xdg-open not found. Open manually: /c/my dir",
+            "message": (
+                f"No $EDITOR set and xdg-open not found. Open manually: {Path('/c/my dir')}"
+            ),
         }
         assert len(calls) == 1
 
@@ -132,6 +147,9 @@ class TestConfigCommandFallbacks:
 
     def test_xdg_open_opens_config_dir_when_no_editor(self, isolated_config, monkeypatch):
         config_dir, _ = isolated_config
+        # Force the non-win32 branch — on a Windows runner the real
+        # sys.platform would take the os.startfile path and never probe.
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.delenv("EDITOR", raising=False)
         monkeypatch.setattr(
             shutil, "which", lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None
@@ -145,6 +163,9 @@ class TestConfigCommandFallbacks:
 
     def test_no_editor_no_xdg_exits_with_manual_open_error(self, isolated_config, monkeypatch):
         config_dir, _ = isolated_config
+        # Force the non-win32 branch — on a Windows runner the real
+        # sys.platform (and os.startfile) would turn this into a success.
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.delenv("EDITOR", raising=False)
         monkeypatch.setattr(shutil, "which", lambda name: None)
         captured = _patch_subprocess(monkeypatch)
