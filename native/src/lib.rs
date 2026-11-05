@@ -1,10 +1,14 @@
-use pyo3::exceptions::{PyImportError, PyIndexError, PyOSError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyImportError, PyIndexError, PyKeyError, PyOSError, PyRecursionError, PyTypeError,
+    PyUnicodeDecodeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{
     PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PySlice, PyString, PyTuple,
 };
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::LazyLock;
@@ -14,6 +18,12 @@ use unicode_bidi::bidi_class;
 /// Regex for validating YouTube video IDs.
 static VALID_VIDEO_ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_-]{1,64}$").expect("valid video id regex"));
+
+/// A YouTube channel ID — `UC` + 22 URL-safe base64 characters, the
+/// reference's `re.fullmatch` anchored at both ends (a trailing newline
+/// cannot match the class, so the anchored form is the fullmatch).
+static CHANNEL_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^UC[A-Za-z0-9_-]{22}$").expect("valid channel id regex"));
 
 /// Matches view-count pseudo-artist runs like "358K views", "3.8M views",
 /// "1,234 views". Used only when the track carries no `views` field.
@@ -559,6 +569,34 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(played_video_id_set, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(play_insert_params, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(play_stats_params, module)?)?;
+
+    // Auth session-record engines (services/auth.py equivalents): the
+    // trust machinery around auth.json and account.json — the record
+    // parser (the CPython JSON grammar over the decoded bytes, its
+    // rejections the engine's None, past-budget nesting the same
+    // RecursionError the reference raises), the recorded-identity
+    // validation (the False-singleton gate, the channel-id fullmatch,
+    // the Unicode-digit slot through the interpreter's own int()), the
+    // ownership snapshot (the auth hash and the record's revision
+    // bound to exactly those bytes), the stream-jar vouching decision
+    // tree, the account_menu channel-id extraction (the defensive walk
+    // that fails closed), the canonical header serialisation with its
+    // candidate-slot variant, the record assembly with its fresh
+    // revision, and the SHA-256 hex primitive — with the file reads,
+    // the session locking and the atomic writes staying Python-side in
+    // the manager.
+    module.add_function(pyo3::wrap_pyfunction!(parse_record, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(identity_from_record, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(owner_of, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(vouch_failure, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        channel_id_from_account_menu,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(serialize_headers, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(candidate_payload, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(build_record, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(sha256_hex, module)?)?;
     Ok(())
 }
 
@@ -7378,7 +7416,68 @@ fn json_dumps<'py>(
     }
     let indent_pad = " ".repeat(indent.map_or(0, |n| n.max(0) as usize));
     let pretty = indent.is_some();
+    json_encode(py, data, indent_pad, pretty, false, false)
+}
 
+/// `sorted(pairs)` with CPython's own tuple ordering — the rule the
+/// reference's `sort_keys` arm applies to a dict's `items()`: tuple `a <
+/// b` reads the first position through `==` (falling to the second only
+/// between equal keys, so equal keys compare their values), every
+/// ordering decision made through `<` exactly like `list.sort` (an
+/// unorderable pair raising `<`'s own `TypeError`), and pairs equal
+/// under neither `<` keeping their input order — `sorted` is stable.
+fn py_sorted_pairs<'py>(
+    mut pairs: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
+) -> PyResult<Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)>> {
+    // tuple a < b — key equality first, the value `<` only between
+    // equal keys, the key `<` otherwise.
+    fn tuple_lt(
+        a: &(Bound<'_, PyAny>, Bound<'_, PyAny>),
+        b: &(Bound<'_, PyAny>, Bound<'_, PyAny>),
+    ) -> PyResult<bool> {
+        if a.0.eq(&b.0)? {
+            a.1.lt(&b.1)
+        } else {
+            a.0.lt(&b.0)
+        }
+    }
+    let mut sort_err: Option<PyErr> = None;
+    pairs.sort_by(|a, b| {
+        if sort_err.is_some() {
+            // The outcome no longer matters — the error returns anyway.
+            return std::cmp::Ordering::Equal;
+        }
+        match (tuple_lt(a, b), tuple_lt(b, a)) {
+            (Ok(true), _) => std::cmp::Ordering::Less,
+            (Ok(false), Ok(true)) => std::cmp::Ordering::Greater,
+            (Ok(_), Ok(_)) => std::cmp::Ordering::Equal,
+            (Err(err), _) | (_, Err(err)) => {
+                sort_err = Some(err);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    match sort_err {
+        Some(err) => Err(err),
+        None => Ok(pairs),
+    }
+}
+
+/// The shared encode core behind `json_dumps` and the auth engines'
+/// canonical serialiser — the same iterative CPython-encoder walk, with
+/// the `sort_keys` and default-less arms parameterised: `sort_keys`
+/// collects the dict's `items()` and orders them through CPython's own
+/// tuple comparison (see `py_sorted_pairs`) instead of keeping
+/// insertion order, and `strict` replaces the `default=str` conversion
+/// with the reference's own `TypeError` for the unserialisable.
+fn json_encode<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    indent_pad: String,
+    pretty: bool,
+    sort_keys: bool,
+    strict: bool,
+) -> PyResult<String> {
     let mut out = String::new();
     // The ancestor-chain ids behind the circular-reference guard —
     // inserted when a container opens, removed when it closes.
@@ -7440,14 +7539,36 @@ fn json_dumps<'py>(
                         out.push_str(&indent_pad.repeat(stack.len() + 1));
                     }
                     // items() through the mapping protocol — the method
-                    // call both CPython encoders make.
+                    // call both CPython encoders make — with sort_keys
+                    // collecting the pairs and ordering them through
+                    // CPython's own tuple comparison (see
+                    // py_sorted_pairs) exactly like the reference
+                    // encoder's `sorted(dct.items())`, the ordered pairs
+                    // re-listed for the shared iteration.
                     let items = value.getattr("items")?.call0()?;
+                    let iter = if sort_keys {
+                        let mut pairs: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = Vec::new();
+                        for pair in items.try_iter()? {
+                            pairs.push(unpack_two(&pair?)?);
+                        }
+                        let pairs = py_sorted_pairs(pairs)?;
+                        PyList::new(py, pairs)?.try_iter()?
+                    } else {
+                        items.try_iter()?
+                    };
                     stack.push(JsonFrame::Dict {
-                        iter: items.try_iter()?,
+                        iter,
                         first: true,
                         id,
                     });
                 }
+            } else if strict {
+                // No default: the reference encoder's own TypeError for
+                // the unserialisable.
+                return Err(PyTypeError::new_err(format!(
+                    "Object of type {} is not JSON serializable",
+                    value.get_type().name()?
+                )));
             } else {
                 // default(o) — str, fetched from builtins at call time
                 // exactly like the reference's global lookup and called
@@ -11655,4 +11776,1088 @@ fn play_stats_params<'py>(
             row.get_item("listened_seconds")?,
         ],
     )
+}
+
+// ---------------------------------------------------------------------------
+// Auth session-record engines (services/auth.py)
+// ---------------------------------------------------------------------------
+
+/// `hashlib.sha256(payload).hexdigest()` — the hash primitive behind
+/// every session-record engine. Bytes (and their subclasses) digest
+/// through the Rust implementation of the same SHA-256; every other
+/// shape falls back to the interpreter's own
+/// `hashlib.sha256(payload).hexdigest()` call — a bytearray or
+/// memoryview hashes identically, a str payload raises hashlib's own
+/// `TypeError` ("Unicode-objects must be encoded before hashing")
+/// exactly like the reference's call would.
+fn sha256_hex_impl(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(bytes) = payload.downcast::<PyBytes>() {
+        let digest = Sha256::digest(bytes.as_bytes());
+        return Ok(hex_lower(&digest));
+    }
+    let hashlib = py.import("hashlib")?;
+    let digest = hashlib.getattr("sha256")?.call1((payload,))?;
+    digest.getattr("hexdigest")?.call0()?.extract::<String>()
+}
+
+/// Lowercase hex — `bytes.hex()`'s own spelling of a digest.
+fn hex_lower(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// A decode rejection — the two failure shapes `json.loads` surfaces
+/// through the engines. Every `JSONDecodeError` the scanner can raise
+/// collapses to `Reject`: the engines swallow the message (the
+/// reference's except arm answers `None`), so the accept/reject
+/// boundary is the whole observable contract and CPython's positions
+/// and spellings never surface. `Py` carries the errors the reference
+/// lets propagate — the `RecursionError` of past-budget nesting, an
+/// `int()` conversion's own `ValueError`.
+enum JsonReject {
+    /// A `json.JSONDecodeError`-shaped rejection.
+    Reject,
+    /// A propagating Python error raised during object construction.
+    Py(PyErr),
+}
+
+/// One decoded container frame — the explicit stack that keeps the
+/// walk free of Rust recursion: a payload nested past CPython's own
+/// recursion budget raises the interpreter's `RecursionError` through
+/// the depth counter instead of overflowing the Rust stack.
+enum JsonLoadFrame {
+    Array {
+        items: Vec<Py<PyAny>>,
+    },
+    Object {
+        pairs: Vec<(Py<PyAny>, Py<PyAny>)>,
+        /// The key whose value the scanner sits between `:` and.
+        pending_key: Option<Py<PyAny>>,
+    },
+}
+
+/// `json.loads(s)` over a decoded str's code points — CPython's own
+/// scanner grammar: the four whitespace characters (` `, `\t`, `\n`,
+/// `\r`) skipped between tokens; objects and arrays with their
+/// delimiter rules (a trailing comma rejected, an object key always a
+/// string); strings through the escape table (`\" \\ \/ \b \f \n \r
+/// \t`, `\uXXXX` with surrogate pairing — a high surrogate followed by
+/// a `\u` escape combines only with a low one, every other shape
+/// keeping its lone surrogate exactly like the scanner's slice-peek
+/// rule) and raw control characters rejected; the literals
+/// null/true/false/NaN/Infinity/-Infinity prefix-matched like the
+/// scanner's own slice equality, so trailing junk rejects at the
+/// delimiter exactly where the reference's does; numbers through the
+/// leading-zero rule with digit-required fraction and exponent,
+/// arbitrary-precision integers built through the interpreter's own
+/// `int()` and floats through the same correctly-rounded decimal
+/// conversion (an absurd exponent overflowing to `inf` silently);
+/// duplicate object keys keeping the first position with the last
+/// value through the dict store's own replace; and nesting counted
+/// against `sys.getrecursionlimit()` with the same `RecursionError`
+/// the reference's decoder raises for a past-budget payload — the
+/// reference's exact borderline sits at the interpreter's live
+/// recursion budget (the limit minus the frames already on the stack),
+/// so an input nested within a frame or two of the limit may accept
+/// here where the reference raises; every realistic depth answers
+/// identically.
+fn json_loads<'py>(
+    py: Python<'py>,
+    text: &Bound<'py, PyString>,
+) -> Result<Bound<'py, PyAny>, JsonReject> {
+    // The text's code points — the fast lane for every str (its UTF-8
+    // content), the surrogatepass round trip only for a str carrying
+    // lone surrogates (which a plain bytes.decode never produces; only
+    // a decode override could return one).
+    let cps: Vec<u32> = match text.to_str() {
+        Ok(s) => s.chars().map(|c| c as u32).collect(),
+        Err(_) => {
+            let bytes = text
+                .call_method1("encode", ("utf-8", "surrogatepass"))
+                .map_err(JsonReject::Py)?;
+            let bytes = bytes
+                .downcast::<PyBytes>()
+                .map_err(|_| JsonReject::Py(PyTypeError::new_err("encode did not return bytes")))?;
+            wtf8_code_points(bytes.as_bytes())
+        }
+    };
+    let limit: usize = py
+        .import("sys")
+        .and_then(|sys| sys.getattr("getrecursionlimit"))
+        .and_then(|f| f.call0())
+        .and_then(|v| v.extract::<usize>())
+        .map_err(JsonReject::Py)?;
+    let int_type = py
+        .import("builtins")
+        .and_then(|b| b.getattr("int"))
+        .map_err(JsonReject::Py)?;
+    let mut scanner = JsonScanner {
+        py,
+        cps,
+        i: 0,
+        depth: 0,
+        limit,
+        int_type,
+    };
+    scanner.scan()
+}
+
+/// The WTF-8 code-point reader — plain UTF-8 shapes plus the surrogate
+/// range as three-byte sequences, the mirror of the writer the
+/// `ensure_ascii` escaping already uses.
+fn wtf8_code_points(data: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0usize;
+    while i < data.len() {
+        let b = data[i];
+        let c = if b < 0x80 {
+            i += 1;
+            b as u32
+        } else if b >> 5 == 0b110 {
+            i += 2;
+            ((b & 0x1f) as u32) << 6 | (data[i - 1] & 0x3f) as u32
+        } else if b >> 4 == 0b1110 {
+            i += 3;
+            ((b & 0x0f) as u32) << 12
+                | ((data[i - 2] & 0x3f) as u32) << 6
+                | (data[i - 1] & 0x3f) as u32
+        } else {
+            i += 4;
+            ((b & 0x07) as u32) << 18
+                | ((data[i - 3] & 0x3f) as u32) << 12
+                | ((data[i - 2] & 0x3f) as u32) << 6
+                | (data[i - 1] & 0x3f) as u32
+        };
+        out.push(c);
+    }
+    out
+}
+
+/// The scanner state — the code points, the cursor, the nesting depth
+/// against the interpreter's recursion limit, and the `int` type for
+/// arbitrary-precision number construction.
+struct JsonScanner<'py> {
+    py: Python<'py>,
+    cps: Vec<u32>,
+    i: usize,
+    depth: usize,
+    limit: usize,
+    int_type: Bound<'py, PyAny>,
+}
+
+impl<'py> JsonScanner<'py> {
+    /// The scanner's whitespace: exactly ` `, `\t`, `\n`, `\r`.
+    fn ws(&mut self) {
+        while self.i < self.cps.len() && matches!(self.cps[self.i], 0x20 | 0x09 | 0x0a | 0x0d) {
+            self.i += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u32> {
+        self.cps.get(self.i).copied()
+    }
+
+    /// The scanner's literal match — a slice-equality prefix check that
+    /// consumes the word only when every character lines up, trailing
+    /// characters left for the delimiter rules to reject.
+    fn literal(&mut self, word: &[u8]) -> bool {
+        if self.i + word.len() > self.cps.len() {
+            return false;
+        }
+        for (k, b) in word.iter().enumerate() {
+            if self.cps[self.i + k] != *b as u32 {
+                return false;
+            }
+        }
+        self.i += word.len();
+        true
+    }
+
+    /// `Py_EnterRecursiveCall`'s counter — the nesting budget.
+    fn enter(&mut self) -> Result<(), JsonReject> {
+        self.depth += 1;
+        if self.depth > self.limit {
+            return Err(JsonReject::Py(PyRecursionError::new_err(
+                "maximum recursion depth exceeded while decoding a JSON object",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Four hex digits — the `\uXXXX` escape's own validation.
+    fn hex4(&mut self) -> Result<u32, JsonReject> {
+        if self.i + 4 > self.cps.len() {
+            return Err(JsonReject::Reject);
+        }
+        let mut v = 0u32;
+        for k in 0..4 {
+            let c = self.cps[self.i + k];
+            let d = match c {
+                0x30..=0x39 => c - 0x30,
+                0x41..=0x46 => c - 0x41 + 10,
+                0x61..=0x66 => c - 0x61 + 10,
+                _ => return Err(JsonReject::Reject),
+            };
+            v = v * 16 + d;
+        }
+        self.i += 4;
+        Ok(v)
+    }
+
+    /// One JSON string — the cursor sits on the opening quote. Escapes
+    /// through the scanner's table, `\uXXXX` with the pairing rule (a
+    /// high surrogate followed by a `\u` escape peeks the second; only
+    /// a low surrogate combines, anything else leaves the first escape
+    /// standing and the second scanned as its own), raw control
+    /// characters rejected, lone surrogates kept. The built str takes
+    /// the fast lane when every code point is a character and the
+    /// interpreter's own `surrogatepass` decode of the WTF-8 bytes
+    /// otherwise, so a lone `\ud800` escapes into the result exactly
+    /// like the reference's scanner would build it.
+    fn string(&mut self) -> Result<Bound<'py, PyString>, JsonReject> {
+        let py = self.py;
+        self.i += 1; // the opening quote
+        let mut out: Vec<u32> = Vec::new();
+        loop {
+            let c = match self.peek() {
+                Some(c) => c,
+                None => return Err(JsonReject::Reject), // unterminated
+            };
+            match c {
+                0x22 => {
+                    self.i += 1;
+                    break;
+                }
+                0x5c => {
+                    self.i += 1;
+                    let esc = match self.peek() {
+                        Some(e) => e,
+                        None => return Err(JsonReject::Reject),
+                    };
+                    match esc {
+                        0x22 | 0x5c | 0x2f => {
+                            out.push(esc);
+                            self.i += 1;
+                        }
+                        0x62 => {
+                            out.push(0x08);
+                            self.i += 1;
+                        }
+                        0x66 => {
+                            out.push(0x0c);
+                            self.i += 1;
+                        }
+                        0x6e => {
+                            out.push(0x0a);
+                            self.i += 1;
+                        }
+                        0x72 => {
+                            out.push(0x0d);
+                            self.i += 1;
+                        }
+                        0x74 => {
+                            out.push(0x09);
+                            self.i += 1;
+                        }
+                        0x75 => {
+                            self.i += 1;
+                            let hi = self.hex4()?;
+                            let mut uni = hi;
+                            if (0xd800..=0xdbff).contains(&hi)
+                                && self.i + 1 < self.cps.len()
+                                && self.cps[self.i] == 0x5c
+                                && self.cps[self.i + 1] == 0x75
+                            {
+                                // The scanner's peek: `s[end:end+2] == '\\u'`.
+                                let save = self.i;
+                                self.i += 2;
+                                let lo = self.hex4()?;
+                                if (0xdc00..=0xdfff).contains(&lo) {
+                                    uni = 0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00);
+                                } else {
+                                    // Not a low surrogate: the first escape
+                                    // stands alone, the second is its own.
+                                    self.i = save;
+                                }
+                            }
+                            out.push(uni);
+                        }
+                        _ => return Err(JsonReject::Reject), // invalid escape
+                    }
+                }
+                c if c < 0x20 => return Err(JsonReject::Reject), // control character
+                c => {
+                    out.push(c);
+                    self.i += 1;
+                }
+            }
+        }
+        if out.iter().all(|&c| char::from_u32(c).is_some()) {
+            let s: String = out.iter().filter_map(|&c| char::from_u32(c)).collect();
+            Ok(PyString::new(py, &s))
+        } else {
+            let mut bytes: Vec<u8> = Vec::with_capacity(out.len());
+            for &c in &out {
+                match char::from_u32(c) {
+                    Some(ch) => {
+                        let mut buf = [0u8; 4];
+                        bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                    None => {
+                        // A lone surrogate as its three-byte WTF-8 shape.
+                        bytes.push(0xed);
+                        bytes.push(0xa0 | (((c >> 6) & 0x1f) as u8));
+                        bytes.push(0x80 | (c & 0x3f) as u8);
+                    }
+                }
+            }
+            let b = PyBytes::new(py, &bytes);
+            let s = b
+                .call_method1("decode", ("utf-8", "surrogatepass"))
+                .map_err(JsonReject::Py)?;
+            s.downcast_into::<PyString>()
+                .map_err(|_| JsonReject::Py(PyTypeError::new_err("decode did not return str")))
+        }
+    }
+
+    /// One object key with its colon — the cursor sits before the key.
+    fn object_key(&mut self) -> Result<Bound<'py, PyString>, JsonReject> {
+        self.ws();
+        if self.peek() != Some(0x22) {
+            return Err(JsonReject::Reject); // expecting a property name
+        }
+        let key = self.string()?;
+        self.ws();
+        if self.peek() != Some(0x3a) {
+            return Err(JsonReject::Reject); // expecting ':'
+        }
+        self.i += 1;
+        Ok(key)
+    }
+
+    /// One number — the grammar's own shape: an optional sign, `0` or a
+    /// non-zero-leading digit run, a digit-required fraction, a
+    /// digit-required exponent. Integers build through the
+    /// interpreter's own `int()` (arbitrary precision, `-0` the int 0);
+    /// floats through the same correctly-rounded decimal conversion
+    /// (`1e999` the float `inf`, never an error).
+    fn number(&mut self) -> Result<Bound<'py, PyAny>, JsonReject> {
+        let start = self.i;
+        if self.peek() == Some(0x2d) {
+            self.i += 1;
+        }
+        match self.peek() {
+            Some(0x30) => self.i += 1,
+            Some(0x31..=0x39) => {
+                while matches!(self.peek(), Some(0x30..=0x39)) {
+                    self.i += 1;
+                }
+            }
+            _ => return Err(JsonReject::Reject),
+        }
+        let mut is_float = false;
+        if self.peek() == Some(0x2e) {
+            self.i += 1;
+            if !matches!(self.peek(), Some(0x30..=0x39)) {
+                return Err(JsonReject::Reject);
+            }
+            while matches!(self.peek(), Some(0x30..=0x39)) {
+                self.i += 1;
+            }
+            is_float = true;
+        }
+        if matches!(self.peek(), Some(0x65) | Some(0x45)) {
+            self.i += 1;
+            if matches!(self.peek(), Some(0x2b) | Some(0x2d)) {
+                self.i += 1;
+            }
+            if !matches!(self.peek(), Some(0x30..=0x39)) {
+                return Err(JsonReject::Reject);
+            }
+            while matches!(self.peek(), Some(0x30..=0x39)) {
+                self.i += 1;
+            }
+            is_float = true;
+        }
+        let token: String = self.cps[start..self.i]
+            .iter()
+            .map(|&c| char::from_u32(c).unwrap_or('\u{fffd}'))
+            .collect();
+        let py = self.py;
+        if is_float {
+            let v: f64 = token.parse().map_err(|_| JsonReject::Reject)?;
+            Ok(PyFloat::new(py, v).into_any())
+        } else {
+            Ok(self.int_type.call1((&token,)).map_err(JsonReject::Py)?)
+        }
+    }
+
+    /// The document walk — produce a value, consume it into the frame
+    /// stack, close containers on their delimiters, and answer the
+    /// single top-level value with the trailing-garbage rejection.
+    fn scan(&mut self) -> Result<Bound<'py, PyAny>, JsonReject> {
+        let py = self.py;
+        let mut stack: Vec<JsonLoadFrame> = Vec::new();
+        let mut current: Option<Bound<'py, PyAny>> = None;
+        loop {
+            // ── produce ── a value, an opened container, or a finished
+            // container's aggregate.
+            if current.is_none() {
+                self.ws();
+                let c = match self.peek() {
+                    Some(c) => c,
+                    None => return Err(JsonReject::Reject), // expecting a value
+                };
+                match c {
+                    0x7b => {
+                        self.i += 1;
+                        self.enter()?;
+                        self.ws();
+                        if self.peek() == Some(0x7d) {
+                            self.i += 1;
+                            self.depth -= 1;
+                            current = Some(PyDict::new(py).into_any());
+                        } else {
+                            let key = self.object_key()?;
+                            stack.push(JsonLoadFrame::Object {
+                                pairs: Vec::new(),
+                                pending_key: Some(key.unbind().into_any()),
+                            });
+                        }
+                    }
+                    0x5b => {
+                        self.i += 1;
+                        self.enter()?;
+                        self.ws();
+                        if self.peek() == Some(0x5d) {
+                            self.i += 1;
+                            self.depth -= 1;
+                            current = Some(PyList::empty(py).into_any());
+                        } else {
+                            stack.push(JsonLoadFrame::Array { items: Vec::new() });
+                        }
+                    }
+                    0x22 => {
+                        let s = self.string()?;
+                        current = Some(s.into_any());
+                    }
+                    0x74 => {
+                        if self.literal(b"true") {
+                            current = Some(PyBool::new(py, true).to_owned().into_any());
+                        } else {
+                            return Err(JsonReject::Reject);
+                        }
+                    }
+                    0x66 => {
+                        if self.literal(b"false") {
+                            current = Some(PyBool::new(py, false).to_owned().into_any());
+                        } else {
+                            return Err(JsonReject::Reject);
+                        }
+                    }
+                    0x6e => {
+                        if self.literal(b"null") {
+                            current = Some(py.None().into_bound(py));
+                        } else {
+                            return Err(JsonReject::Reject);
+                        }
+                    }
+                    0x4e => {
+                        if self.literal(b"NaN") {
+                            current = Some(PyFloat::new(py, f64::NAN).into_any());
+                        } else {
+                            return Err(JsonReject::Reject);
+                        }
+                    }
+                    0x49 => {
+                        if self.literal(b"Infinity") {
+                            current = Some(PyFloat::new(py, f64::INFINITY).into_any());
+                        } else {
+                            return Err(JsonReject::Reject);
+                        }
+                    }
+                    0x2d => {
+                        if self.cps.get(self.i + 1) == Some(&0x49) {
+                            if self.literal(b"-Infinity") {
+                                current = Some(PyFloat::new(py, f64::NEG_INFINITY).into_any());
+                            } else {
+                                return Err(JsonReject::Reject);
+                            }
+                        } else {
+                            let v = self.number()?;
+                            current = Some(v);
+                        }
+                    }
+                    0x30..=0x39 => {
+                        let v = self.number()?;
+                        current = Some(v);
+                    }
+                    _ => return Err(JsonReject::Reject),
+                }
+            }
+            // ── consume ── the produced value into the stack, or answer
+            // it at the top level.
+            if let Some(value) = current.take() {
+                if stack.is_empty() {
+                    self.ws();
+                    if self.i != self.cps.len() {
+                        return Err(JsonReject::Reject); // extra data
+                    }
+                    return Ok(value);
+                }
+                let is_object = matches!(stack.last(), Some(JsonLoadFrame::Object { .. }));
+                if is_object {
+                    let Some(JsonLoadFrame::Object { pairs, pending_key }) = stack.last_mut()
+                    else {
+                        unreachable!("frame kind checked above");
+                    };
+                    let key = pending_key.take().expect("object frame awaits its value");
+                    pairs.push((key, value.unbind()));
+                } else {
+                    let Some(JsonLoadFrame::Array { items }) = stack.last_mut() else {
+                        unreachable!("frame kind checked above");
+                    };
+                    items.push(value.unbind());
+                }
+                self.ws();
+                match self.peek() {
+                    Some(0x2c) => {
+                        self.i += 1;
+                        if is_object {
+                            let key = self.object_key()?;
+                            if let Some(JsonLoadFrame::Object { pending_key, .. }) =
+                                stack.last_mut()
+                            {
+                                *pending_key = Some(key.unbind().into_any());
+                            }
+                        }
+                    }
+                    Some(0x5d) | Some(0x7d) => {
+                        let closing_array = self.peek() == Some(0x5d);
+                        if closing_array == is_object {
+                            return Err(JsonReject::Reject); // wrong closer
+                        }
+                        self.i += 1;
+                        self.depth -= 1;
+                        let frame = stack.pop().expect("frame exists");
+                        current = Some(match frame {
+                            JsonLoadFrame::Array { items } => {
+                                PyList::new(py, items).map_err(JsonReject::Py)?.into_any()
+                            }
+                            JsonLoadFrame::Object { pairs, .. } => {
+                                let d = PyDict::new(py);
+                                // The dict store's own replace: a repeated
+                                // key keeps its first position and takes
+                                // the last value.
+                                for (k, v) in pairs {
+                                    d.set_item(k, v).map_err(JsonReject::Py)?;
+                                }
+                                d.into_any()
+                            }
+                        });
+                    }
+                    _ => return Err(JsonReject::Reject), // expecting a delimiter
+                }
+            }
+        }
+    }
+}
+
+/// The pure core of `services/auth.py`'s `_parse_record` — shared by
+/// the exported engine and the composite engines below.
+///
+/// Mirrors the pure-Python reference: `raw.decode("utf-8")` through the
+/// object's own decode method (a `UnicodeDecodeError` is the engine's
+/// `None`; a non-decodable payload's `AttributeError` propagates),
+/// `json.loads` over the decoded text (the scanner above — every
+/// `JSONDecodeError` shape the engine's `None`), then the schema gates:
+/// the top value must be a dict and its `schema_version` must compare
+/// equal to the constant through CPython's own `==` — so `1.0` and
+/// `True` pass exactly like they do in the reference. A decode override
+/// returning a non-str falls through to the interpreter's own
+/// `json.loads` call so that exotic path keeps the reference's exact
+/// behavior, its `JSONDecodeError`/`UnicodeDecodeError` answered with
+/// `None` and everything else propagating.
+fn parse_record_impl<'py>(
+    py: Python<'py>,
+    raw: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if raw.is_none() {
+        return Ok(None);
+    }
+    let decoded = match raw.getattr("decode").and_then(|d| d.call1(("utf-8",))) {
+        Ok(d) => d,
+        Err(err) => {
+            if err.is_instance_of::<PyUnicodeDecodeError>(py) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+    };
+    let value = match decoded.downcast::<PyString>() {
+        Ok(text) => match json_loads(py, text) {
+            Ok(v) => v,
+            Err(JsonReject::Reject) => return Ok(None),
+            Err(JsonReject::Py(err)) => return Err(err),
+        },
+        Err(_) => {
+            let json_module = py.import("json")?;
+            let loads = json_module.getattr("loads")?;
+            let jde_class = json_module.getattr("JSONDecodeError")?;
+            match loads.call1((decoded.clone(),)) {
+                Ok(v) => v,
+                Err(err) => {
+                    let is_json_error = jde_class.is_instance(err.value(py)).unwrap_or(false);
+                    if is_json_error || err.is_instance_of::<PyUnicodeDecodeError>(py) {
+                        return Ok(None);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    };
+    if !value.is_instance_of::<PyDict>() {
+        return Ok(None);
+    }
+    // data.get("schema_version") — the dict's own get, its None the
+    // missing-key answer, compared through CPython's `!=`.
+    let schema = value.getattr("get")?.call1(("schema_version",))?;
+    if schema.ne(1i64)? {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+/// The account.json record parser — the engine behind every read of
+/// the sign-in sidecar.
+///
+/// Mirrors the pure-Python reference (`_parse_record`): account.json
+/// bytes as a dict — or `None` when the file is missing (the `None`
+/// passthrough), malformed, of another schema, or undecodable — with
+/// the JSON grammar, the schema gate and the exact comparison quirks
+/// described on `parse_record_impl`. The file read stays Python-side
+/// in the manager.
+#[pyfunction]
+#[pyo3(signature = (raw))]
+fn parse_record<'py>(
+    py: Python<'py>,
+    raw: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    parse_record_impl(py, raw)
+}
+
+/// The recorded-identity validation — the engine behind the renewal
+/// gate that ties an automatic refresh to the account `ytm setup`
+/// chose.
+///
+/// Mirrors the pure-Python reference (`_identity_from_record`): the
+/// `verified` field read through CPython's own subscript and gated by
+/// identity with the `False` singleton — `is` semantics, so a `0` or
+/// any other falsy-but-not-`False` object passes exactly like it does
+/// in the reference; the `channel_id` read next, accepted only when it
+/// is a str whose whole value matches the channel-id pattern
+/// (a str carrying lone surrogates cannot match the class, answering
+/// like the reference's fullmatch); the `x-goog-authuser` slot read
+/// last, accepted only when it is a str of digits under CPython's own
+/// `str.isdigit()` rule (Unicode digits included) and converted
+/// through the interpreter's own `int()` — so `int('٣')` keeps its
+/// value and an isdigit-true, int-false spelling (a superscript digit)
+/// raises `int()`'s own `ValueError` exactly like the reference. The
+/// result is the `(slot, channel_id)` pair with both objects passed
+/// through as they are, or `None`.
+#[pyfunction]
+#[pyo3(signature = (record))]
+fn identity_from_record<'py>(
+    py: Python<'py>,
+    record: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    if record.is_none() {
+        return Ok(None);
+    }
+    let get = |key: &str| -> PyResult<Bound<'py, PyAny>> { record.getattr("get")?.call1((key,)) };
+    let verified = get("verified")?;
+    let false_singleton = PyBool::new(py, false).to_owned();
+    if verified.is(&false_singleton) {
+        return Ok(None);
+    }
+    let channel_id = get("channel_id")?;
+    let slot = get("x-goog-authuser")?;
+    let channel_ok = match channel_id.downcast::<PyString>() {
+        Ok(s) => s
+            .to_str()
+            .map(|t| CHANNEL_ID_RE.is_match(t))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if !channel_ok {
+        return Ok(None);
+    }
+    let slot_ok = match slot.downcast::<PyString>() {
+        Ok(s) => s.to_str().map(py_isdigit).unwrap_or(false),
+        Err(_) => false,
+    };
+    if !slot_ok {
+        return Ok(None);
+    }
+    let slot_int = py.import("builtins")?.getattr("int")?.call1((slot,))?;
+    Ok(Some(PyTuple::new(py, [slot_int, channel_id.clone()])?))
+}
+
+/// The ownership snapshot — the engine behind the commit guard that
+/// refuses an automatic renewal when the sign-in files changed while
+/// it was being renewed.
+///
+/// Mirrors the pure-Python reference (`_owner_of`): no auth.json means
+/// no owner (`None`); otherwise the record parses, the auth bytes hash
+/// through the SHA-256 primitive, and the record's `revision` is
+/// answered only when the record is truthy and its `auth_sha256`
+/// compares equal to that hash through CPython's own `==` — and only
+/// when the revision itself is a str. The result is the
+/// `(auth_sha256, revision)` pair (the revision `None` when absent),
+/// the hash a fresh hex str.
+#[pyfunction]
+#[pyo3(signature = (auth_bytes, record_raw))]
+fn owner_of<'py>(
+    py: Python<'py>,
+    auth_bytes: &Bound<'py, PyAny>,
+    record_raw: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    if auth_bytes.is_none() {
+        return Ok(None);
+    }
+    let record = parse_record_impl(py, record_raw)?;
+    let sha = PyString::new(py, &sha256_hex_impl(py, auth_bytes)?);
+    let revision = match &record {
+        Some(record) if record.is_truthy()? => {
+            let recorded = record.getattr("get")?.call1(("auth_sha256",))?;
+            if recorded.eq(&sha)? {
+                let revision = record.getattr("get")?.call1(("revision",))?;
+                if revision.is_instance_of::<PyString>() {
+                    revision
+                } else {
+                    py.None().into_bound(py)
+                }
+            } else {
+                py.None().into_bound(py)
+            }
+        }
+        _ => py.None().into_bound(py),
+    };
+    Ok(Some(PyTuple::new(py, [sha.into_any(), revision])?))
+}
+
+/// The stream-jar vouching decision tree — the engine behind
+/// `read_vouched_stream_jar`'s refusal reasons.
+///
+/// Mirrors the pure-Python reference (`_vouch_failure`) read for read:
+/// a jar without data (missing and unreadable alike) is unreadable; an
+/// auth.json error is unreadable; missing auth.json has no trust; an
+/// account.json error renders through the interpreter's own `str()`
+/// into its refusal reason; a missing record is the accepted legacy
+/// shape; a record that does not parse is malformed; a record whose
+/// `auth_sha256` does not compare equal to the hash of the auth bytes
+/// (CPython's own `!=`) does not describe them; a record without the
+/// `stream_sha256` key is the other accepted legacy shape; a null hash
+/// means the sign-in has no jar; and a hash that does not compare equal
+/// to the jar's is a mismatch. `None` vouches for the jar. The file
+/// reads (and their stat triples) stay Python-side in the caller.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)] // the three reads' flat (data, error) pairs
+#[pyo3(signature = (auth_data, auth_error, record_data, record_error, jar_data, jar_error))]
+fn vouch_failure<'py>(
+    py: Python<'py>,
+    auth_data: &Bound<'py, PyAny>,
+    auth_error: &Bound<'py, PyAny>,
+    record_data: &Bound<'py, PyAny>,
+    record_error: &Bound<'py, PyAny>,
+    jar_data: &Bound<'py, PyAny>,
+    jar_error: &Bound<'py, PyAny>,
+) -> PyResult<Option<String>> {
+    // The jar's error component is never read — the reference gates on
+    // the jar's data alone (missing and unreadable alike).
+    let _ = jar_error;
+    if jar_data.is_none() {
+        return Ok(Some("the stream cookie file is unreadable".to_string()));
+    }
+    if !auth_error.is_none() {
+        return Ok(Some("auth.json is unreadable".to_string()));
+    }
+    if auth_data.is_none() {
+        return Ok(Some("auth.json is missing".to_string()));
+    }
+    if !record_error.is_none() {
+        let rendered = py
+            .import("builtins")?
+            .getattr("str")?
+            .call1((record_error,))?;
+        let rendered: String = rendered.extract()?;
+        return Ok(Some(format!("account.json cannot be read ({rendered})")));
+    }
+    if record_data.is_none() {
+        return Ok(None);
+    }
+    let Some(record) = parse_record_impl(py, record_data)? else {
+        return Ok(Some("account.json is malformed".to_string()));
+    };
+    let auth_sha = PyString::new(py, &sha256_hex_impl(py, auth_data)?);
+    let recorded_sha = record.getattr("get")?.call1(("auth_sha256",))?;
+    if recorded_sha.ne(&auth_sha)? {
+        return Ok(Some(
+            "account.json does not describe the current auth.json".to_string(),
+        ));
+    }
+    if !record.contains("stream_sha256")? {
+        return Ok(None);
+    }
+    // record_dict["stream_sha256"] — the plain subscript the `in`
+    // check just vouched for.
+    let expected = record.get_item("stream_sha256")?;
+    if expected.is_none() {
+        return Ok(Some(
+            "the saved sign-in has no stream cookie file".to_string(),
+        ));
+    }
+    let jar_sha = PyString::new(py, &sha256_hex_impl(py, jar_data)?);
+    if expected.ne(&jar_sha)? {
+        return Ok(Some(
+            "the stream cookie file does not match the saved sign-in".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+/// The account_menu channel-id extraction — the engine behind the
+/// setup probe that learns which YouTube channel a browser slot's
+/// session belongs to.
+///
+/// Mirrors the pure-Python reference
+/// (`_channel_id_from_account_menu`): the lookup chain through
+/// CPython's own subscript with the reference's caught arms
+/// (`KeyError`, `IndexError`, `TypeError`) answered with `None` and
+/// every other error kept; the header gate (a non-dict menu, or an
+/// `activeAccountHeaderRenderer` missing from the header's own
+/// `in`); the items gate (exactly a list); then the defensive walk —
+/// each item's `compactLinkRenderer` fetched through the dict's own
+/// `get` when the item is a dict, the ACCOUNT_BOX icon, the
+/// navigation endpoint's browse endpoint, the browse id validated by
+/// the channel-id pattern, and the page type read through the
+/// reference's `(configs or {}).get(..., {}).get("pageType")` chain —
+/// the id check and the `==` compared with CPython's own operators,
+/// the page-type `==` evaluated only when the id matched (the
+/// reference's `and` chain short-circuits before it). Exactly one
+/// matching link answers its browse id; zero or several answer `None`
+/// — the caller fails closed.
+#[pyfunction]
+#[pyo3(signature = (response))]
+fn channel_id_from_account_menu<'py>(
+    py: Python<'py>,
+    response: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyString>>> {
+    let chain: PyResult<Option<Bound<'py, PyAny>>> = (|| {
+        let menu = response
+            .get_item("actions")?
+            .get_item(0)?
+            .get_item("openPopupAction")?
+            .get_item("popup")?
+            .get_item("multiPageMenuRenderer")?;
+        if !menu.is_instance_of::<PyDict>() {
+            return Ok(None);
+        }
+        let header = menu.get_item("header")?;
+        if !header.contains("activeAccountHeaderRenderer")? {
+            return Ok(None);
+        }
+        Ok(Some(
+            menu.get_item("sections")?
+                .get_item(0)?
+                .get_item("multiPageMenuSectionRenderer")?
+                .get_item("items")?,
+        ))
+    })();
+    let items = match chain {
+        Ok(Some(items)) => items,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            if err.is_instance_of::<PyKeyError>(py)
+                || err.is_instance_of::<PyIndexError>(py)
+                || err.is_instance_of::<PyTypeError>(py)
+            {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+    };
+    if !items.is_instance_of::<PyList>() {
+        return Ok(None);
+    }
+    let mut found: Vec<Bound<'py, PyString>> = Vec::new();
+    for item in items.try_iter()? {
+        let item = item?;
+        let link = if item.is_instance_of::<PyDict>() {
+            item.getattr("get")?.call1(("compactLinkRenderer",))?
+        } else {
+            py.None().into_bound(py)
+        };
+        if !link.is_instance_of::<PyDict>() {
+            continue;
+        }
+        let icon = link.getattr("get")?.call1(("icon",))?;
+        if !icon.is_instance_of::<PyDict>()
+            || icon
+                .getattr("get")?
+                .call1(("iconType",))?
+                .ne("ACCOUNT_BOX")?
+        {
+            continue;
+        }
+        let endpoint = link.getattr("get")?.call1(("navigationEndpoint",))?;
+        let browse = if endpoint.is_instance_of::<PyDict>() {
+            endpoint.getattr("get")?.call1(("browseEndpoint",))?
+        } else {
+            py.None().into_bound(py)
+        };
+        if !browse.is_instance_of::<PyDict>() {
+            continue;
+        }
+        let browse_id = browse.getattr("get")?.call1(("browseId",))?;
+        let configs = browse
+            .getattr("get")?
+            .call1(("browseEndpointContextSupportedConfigs",))?;
+        let configs = if configs.is_truthy()? {
+            configs
+        } else {
+            PyDict::new(py).into_any()
+        };
+        let music = configs
+            .getattr("get")?
+            .call1(("browseEndpointContextMusicConfig", PyDict::new(py)))?;
+        let page_type = music.getattr("get")?.call1(("pageType",))?;
+        if let Ok(id) = browse_id.downcast::<PyString>() {
+            if id
+                .to_str()
+                .map(|t| CHANNEL_ID_RE.is_match(t))
+                .unwrap_or(false)
+                && page_type.eq("MUSIC_PAGE_TYPE_USER_CHANNEL")?
+            {
+                found.push(id.clone());
+            }
+        }
+    }
+    if found.len() != 1 {
+        return Ok(None);
+    }
+    Ok(Some(found.into_iter().next().expect("len checked above")))
+}
+
+/// The canonical auth.json serialisation — the one byte spelling of a
+/// header dict, probed and committed as is.
+///
+/// Mirrors the pure-Python reference (`_serialize_headers`):
+/// `json.dumps(headers, ensure_ascii=True, indent=4, sort_keys=True)`
+/// — the strict encoder (the reference's own `TypeError` for an
+/// unserialisable value or an unorderable key), the sorted-key layout
+/// through CPython's own tuple comparison, the four-space indent with
+/// the `(',', ': ')` separators, and the ASCII escaping — encoded to
+/// UTF-8 bytes (the ASCII-only text's own encoding).
+#[pyfunction]
+#[pyo3(signature = (headers))]
+fn serialize_headers(py: Python<'_>, headers: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
+    let text = json_encode(py, headers, "    ".to_string(), true, true, true)?;
+    Ok(PyBytes::new(py, text.as_bytes()).unbind())
+}
+
+/// The candidate auth.json bytes for one browser slot — the payload
+/// the setup probe writes and commits unchanged.
+///
+/// Mirrors the pure-Python reference (`_candidate_payload`):
+/// `{**base_headers, "x-goog-authuser": str(slot)}` — the dict merge
+/// (a dict walked through its own storage, any other mapping through
+/// its `keys()`, a repeated key keeping its position with the new
+/// value), the slot rendered through the interpreter's own `str()`,
+/// then the canonical serialisation above.
+#[pyfunction]
+#[pyo3(signature = (base_headers, slot))]
+fn candidate_payload(
+    py: Python<'_>,
+    base_headers: &Bound<'_, PyAny>,
+    slot: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    let merged = PyDict::new(py);
+    if base_headers.is_instance_of::<PyDict>() {
+        let base = base_headers
+            .downcast::<PyDict>()
+            .expect("isinstance-checked dict");
+        for (key, value) in base.iter() {
+            merged.set_item(key, value)?;
+        }
+    } else {
+        let keys = base_headers.getattr("keys")?.call0()?;
+        for key in keys.try_iter()? {
+            let key = key?;
+            merged.set_item(&key, base_headers.get_item(&key)?)?;
+        }
+    }
+    let slot_str = py.import("builtins")?.getattr("str")?.call1((slot,))?;
+    merged.set_item("x-goog-authuser", slot_str)?;
+    let text = json_encode(py, &merged, "    ".to_string(), true, true, true)?;
+    Ok(PyBytes::new(py, text.as_bytes()).unbind())
+}
+
+/// The account.json record assembly — the dict the commit writes for
+/// exactly the auth bytes it publishes.
+///
+/// Mirrors the pure-Python reference (`_build_record`): the fixed
+/// insertion order (`schema_version`, `x-goog-authuser` through the
+/// interpreter's own `str()`, `channel_id` and `name` as the objects
+/// they are, `handle` through the truthiness gate — a falsy handle
+/// becomes `None` — `verified` as passed, the auth bytes' SHA-256 hex,
+/// the stream jar's hash as passed, and a fresh `revision` from the
+/// interpreter's own `os.urandom(16).hex()`). The atomic write itself
+/// stays Python-side in the commit.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)] // the record's seven fields, one parameter each
+#[pyo3(signature = (slot, name, handle, channel_id, verified, auth_payload, stream_sha256))]
+fn build_record<'py>(
+    py: Python<'py>,
+    slot: &Bound<'py, PyAny>,
+    name: &Bound<'py, PyAny>,
+    handle: &Bound<'py, PyAny>,
+    channel_id: &Bound<'py, PyAny>,
+    verified: &Bound<'py, PyAny>,
+    auth_payload: &Bound<'py, PyAny>,
+    stream_sha256: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("schema_version", 1i64)?;
+    let slot_str = py.import("builtins")?.getattr("str")?.call1((slot,))?;
+    out.set_item("x-goog-authuser", slot_str)?;
+    out.set_item("channel_id", channel_id)?;
+    out.set_item("name", name)?;
+    let handle_value = if handle.is_truthy()? {
+        handle.clone()
+    } else {
+        py.None().into_bound(py)
+    };
+    out.set_item("handle", handle_value)?;
+    out.set_item("verified", verified)?;
+    let sha = sha256_hex_impl(py, auth_payload)?;
+    out.set_item("auth_sha256", sha)?;
+    out.set_item("stream_sha256", stream_sha256)?;
+    let urandom = py.import("os")?.getattr("urandom")?.call1((16,))?;
+    let revision = urandom.getattr("hex")?.call0()?;
+    out.set_item("revision", revision)?;
+    Ok(out)
+}
+
+/// The SHA-256 hex primitive — `hashlib.sha256(payload).hexdigest()`
+/// as a standalone engine (see `sha256_hex_impl` for the shape rules).
+#[pyfunction]
+#[pyo3(signature = (payload))]
+fn sha256_hex(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<String> {
+    sha256_hex_impl(py, payload)
 }

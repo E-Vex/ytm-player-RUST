@@ -1809,3 +1809,79 @@ def _cookies_from_raw_header(cookie_header_value: str) -> list[Cookie]:
             )
         )
     return cookies
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same session-record engines; these
+# bindings replace the pure-Python definitions above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements.  The file reads, the session locking and the atomic
+# writes stay Python-side in this module either way.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        build_record as _native_build_record,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        candidate_payload as _native_candidate_payload,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        channel_id_from_account_menu as _native_channel_id_from_account_menu,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        identity_from_record as _native_identity_from_record,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        owner_of as _native_owner_of,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        parse_record as _native_parse_record,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        serialize_headers as _native_serialize_headers,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        sha256_hex as _native_sha256_hex,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        vouch_failure as _native_vouch_failure,
+    )
+except ImportError:
+    pass
+else:
+    _channel_id_from_account_menu = _native_channel_id_from_account_menu  # type: ignore[assignment]
+    _parse_record = _native_parse_record  # type: ignore[assignment]
+    _sha256 = _native_sha256_hex  # type: ignore[assignment]
+    _serialize_headers = _native_serialize_headers  # type: ignore[assignment]
+    _candidate_payload = _native_candidate_payload  # type: ignore[assignment]
+
+    def _identity_from_record(record: dict[str, Any] | None) -> _RecordedIdentity | None:
+        identity = _native_identity_from_record(record)
+        return None if identity is None else _RecordedIdentity(*identity)
+
+    def _owner_of(auth_bytes: bytes | None, record_raw: bytes | None) -> _SessionOwner | None:
+        owner = _native_owner_of(auth_bytes, record_raw)
+        return None if owner is None else _SessionOwner(*owner)
+
+    def _build_record(
+        account: _ProbedAccount,
+        auth_payload: bytes,
+        stream_sha256: str | None,
+        *,
+        verified: bool,
+    ) -> dict[str, Any]:
+        return _native_build_record(
+            account.slot,
+            account.name,
+            account.handle,
+            account.channel_id,
+            verified,
+            auth_payload,
+            stream_sha256,
+        )
+
+    def _vouch_failure(auth: _FileRead, record: _FileRead, jar: _FileRead) -> str | None:
+        return _native_vouch_failure(
+            auth.data, auth.error, record.data, record.error, jar.data, jar.error
+        )
