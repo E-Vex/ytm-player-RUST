@@ -1,3 +1,4 @@
+use pyo3::conversion::IntoPyObjectExt;
 use pyo3::exceptions::{
     PyImportError, PyIndexError, PyKeyError, PyOSError, PyRecursionError, PyTypeError,
     PyUnicodeDecodeError, PyValueError,
@@ -604,6 +605,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(sha256_hex, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(normalize_raw_headers, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(build_stream_cookiejar, module)?)?;
+
+    // Region-picker filter engine (ui/popups/country_picker.py
+    // equivalent): the case-insensitive code-or-name substring pass
+    // behind the chart-region picker's filter input — the query
+    // stripped and lowercased, an empty query passing the region list
+    // through unchanged (the same object the reference hands back),
+    // and every kept row re-packed as a fresh (code, name) pair of the
+    // same string objects.
+    module.add_function(pyo3::wrap_pyfunction!(filter_regions, module)?)?;
+
+    // Terminal orientation gate (utils/terminal.py equivalent): the
+    // aspect-ratio verdict behind the horizontal/vertical layout
+    // decision — the rows-zero guard, the true division and the 2.3
+    // threshold all through the interpreter's own operators, so every
+    // numeric shape and every error matches the reference exactly.
+    module.add_function(pyo3::wrap_pyfunction!(get_orientation, module)?)?;
     Ok(())
 }
 
@@ -13262,4 +13279,88 @@ fn build_stream_cookiejar<'py>(py: Python<'py>, jar: &Bound<'py, PyAny>) -> PyRe
         .downcast_into::<PyBytes>()
         .expect("str.encode returns bytes");
     Ok(bytes.unbind())
+}
+
+// ── Region-picker filter (ui/popups/country_picker.py) ───────────────────
+
+/// The chart-region picker's filter pass —
+/// `ui/popups/country_picker.py`'s `filter_regions`, behind the
+/// picker's `on_input_changed`.
+///
+/// Mirrors the reference: the query stripped and lowercased (Python's
+/// per-code-point mapping — see `python_lower`; CPython's own strip
+/// set — see `py_strip`), an empty query handing the *regions* object
+/// back unchanged (the very same tuple the caller passed, not a
+/// copy), and otherwise every row unpacked through the `for code,
+/// name in …` contract (see `py_unpack_pair` — a malformed row raises
+/// the reference's own ValueError) and kept when the query is a
+/// substring of either lowercased field. Lowercasing matches the
+/// reference's `.lower()` on plain strs; where the reference would
+/// raise — a non-string code or name hitting `.lower()` — the engine
+/// stays total and never matches the row (the `filter_panel_items`
+/// precedent). The kept rows answer as a fresh tuple of fresh
+/// `(code, name)` pairs holding the same string objects, exactly like
+/// the reference's comprehension.
+#[pyfunction]
+#[pyo3(signature = (regions, query))]
+fn filter_regions<'py>(regions: &Bound<'py, PyAny>, query: &str) -> PyResult<Bound<'py, PyAny>> {
+    let q = python_lower(python_strip(query));
+    if q.is_empty() {
+        return Ok(regions.clone());
+    }
+    let py = regions.py();
+    let mut kept: Vec<Bound<'py, PyTuple>> = Vec::new();
+    for row in regions.try_iter()? {
+        let row = row?;
+        let (code, name) = py_unpack_pair(&row)?;
+        // q in code.lower() or q in name.lower() — a non-string field
+        // never matches (the reference's AttributeError there).
+        let code_matches = code
+            .extract::<&str>()
+            .map(|c| python_lower(c).contains(&q))
+            .unwrap_or(false);
+        let name_matches = name
+            .extract::<&str>()
+            .map(|n| python_lower(n).contains(&q))
+            .unwrap_or(false);
+        if code_matches || name_matches {
+            kept.push(PyTuple::new(py, [code, name])?);
+        }
+    }
+    Ok(PyTuple::new(py, kept)?.into_any())
+}
+
+// ── Terminal orientation gate (utils/terminal.py) ────────────────────────
+
+/// The terminal orientation verdict — `utils/terminal.py`'s
+/// `get_orientation`, the aspect-ratio gate behind the app's
+/// horizontal/vertical layout decision.
+///
+/// Mirrors the reference's one expression exactly, every operator the
+/// interpreter's own: `rows == 0` through CPython's `==` (its
+/// `__eq__` protocol, a non-int rows simply not equal), `cols / rows`
+/// through CPython's true division (arbitrary-precision ints divided
+/// correctly-rounded — a float on every path — its TypeError for a
+/// non-numeric pair kept), and the `> 2.3` comparison through
+/// CPython's `>` against the very double the reference's literal
+/// compiles to. `"horizontal"` when rows is zero or the ratio exceeds
+/// the threshold, `"vertical"` otherwise.
+#[pyfunction]
+#[pyo3(signature = (cols, rows))]
+fn get_orientation<'py>(
+    py: Python<'py>,
+    cols: &Bound<'py, PyAny>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<&'static str> {
+    let zero = 0i64.into_py_any(py)?;
+    if rows.eq(&zero)? {
+        return Ok("horizontal");
+    }
+    let ratio = cols.div(rows)?;
+    let threshold = PyFloat::new(py, 2.3).into_any();
+    if ratio.gt(&threshold)? {
+        Ok("horizontal")
+    } else {
+        Ok("vertical")
+    }
 }

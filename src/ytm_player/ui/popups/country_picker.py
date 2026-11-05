@@ -26,11 +26,31 @@ def filter_regions(regions: tuple[tuple[str, str], ...], query: str) -> tuple[tu
     """Return regions matching *query* on either ISO code or display name.
 
     Empty query returns all. Case-insensitive substring match on either field.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.filter_regions``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     q = query.strip().lower()
     if not q:
         return regions
     return tuple((code, name) for code, name in regions if q in code.lower() or q in name.lower())
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same filter pass; this binding replaces
+# the pure-Python transcription above when the extension is importable.  The
+# rebinding must happen AFTER the definition above — assigning the native
+# function any earlier would be clobbered by the ``def`` statement.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        filter_regions as _native_filter_regions,
+    )
+except ImportError:
+    pass
+else:
+    filter_regions = _native_filter_regions  # type: ignore[assignment]
 
 
 class _RegionItem(ListItem):
