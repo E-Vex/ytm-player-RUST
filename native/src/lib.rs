@@ -315,6 +315,19 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // first four fields.
     module.add_function(pyo3::wrap_pyfunction!(cli_stats_payload, module)?)?;
 
+    // CLI history-query statement engines (cli.py equivalents): the
+    // two statement texts behind the standalone `ytm history` and
+    // `ytm history search` reads — every column, newest first,
+    // bounded by the caller's limit, each with the limit passed
+    // through as the object it is into the parameter tuple. The
+    // connect/row-factory/execute/fetch glue and the error exits
+    // stay Python-side in _query_history.
+    module.add_function(pyo3::wrap_pyfunction!(cli_history_select, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        cli_search_history_select,
+        module
+    )?)?;
+
     // CLI cache-status engines (cli.py equivalents): the six-key status
     // payload behind the standalone `ytm cache status --json` command,
     // the four aligned human lines it echoes without --json — both from
@@ -666,15 +679,28 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // patched clock included), the quality-input gate behind the
     // resolver's setter, the base yt-dlp options dict behind
     // _build_ydl_opts, the extract_info → StreamInfo field assembly
-    // behind _try_resolve, and the DownloadError hint. The YoutubeDL
-    // construction, the cookiejar vouching, the network extraction and
-    // the pending-future bookkeeping stay Python-side in the resolver.
+    // behind _try_resolve, the DownloadError hint, and the cache
+    // maintenance walks — the expired-entry prune behind _put_cache
+    // and prune_expired, and the over-cap eviction of the oldest
+    // entries by expires_at behind _put_cache's second phase (the cap
+    // read through the module's own _CACHE_MAX_SIZE name, a patched
+    // cap included). The YoutubeDL construction, the cookiejar
+    // vouching, the network extraction, the cache state and the
+    // pending-future bookkeeping stay Python-side in the resolver.
     module.add_function(pyo3::wrap_pyfunction!(is_stale, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(wait_seconds, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(validate_quality, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_base_opts, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_info_fields, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(download_error_hint, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        stream_cache_expired_ids,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        stream_cache_cap_evictions,
+        module
+    )?)?;
 
     // Download-service engines (services/download.py equivalents): the
     // base yt-dlp options dict behind DownloadService._build_opts (the
@@ -6694,6 +6720,47 @@ fn cli_stats_payload<'py>(
     out.set_item("top_tracks", items)
         .expect("dict insertion with a str key cannot fail");
     Ok(out)
+}
+
+/// The play-history select behind the CLI's standalone `ytm history`
+/// command — the pure half of the history read in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cli_history_select`): the
+/// statement text exactly as the fallback spells it — every column,
+/// newest play first, bounded by the caller's limit — and `limit`
+/// passed through as the object it is into the parameter tuple, packed
+/// as the `(sql, params)` pair the reference's `_query_history` hands
+/// `execute`.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn cli_history_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "SELECT * FROM play_history ORDER BY played_at DESC LIMIT ?".to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
+}
+
+/// The search-history select behind the CLI's standalone
+/// `ytm history search` command — the pure half of the search-history
+/// read in `cli.py`.
+///
+/// Mirrors the pure-Python reference (`_cli_search_history_select`):
+/// the statement text exactly as the fallback spells it — every
+/// column, most recently searched first, bounded by the caller's
+/// limit — and `limit` passed through as the object it is into the
+/// parameter tuple, packed as the `(sql, params)` pair the reference's
+/// `_query_history` hands `execute`.
+#[pyfunction]
+#[pyo3(signature = (limit))]
+fn cli_search_history_select<'py>(
+    py: Python<'py>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let sql = "SELECT * FROM search_history ORDER BY last_searched DESC LIMIT ?".to_string();
+    let params = PyTuple::new(py, [limit])?;
+    Ok((sql, params))
 }
 
 /// The status payload behind the CLI's standalone `ytm cache status`
@@ -13871,6 +13938,13 @@ fn stream_quality_formats(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     PyModule::import(py, "ytm_player.services.stream")?.getattr("QUALITY_FORMATS")
 }
 
+/// The stream module's `_CACHE_MAX_SIZE` cap, read through the module
+/// attribute — the very constant the fallback's own over-cap gate and
+/// excess arithmetic run against, a patched cap included.
+fn stream_cache_max_size(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.services.stream")?.getattr("_CACHE_MAX_SIZE")
+}
+
 /// `float(info.get(key) or 0)` — the truthiness gate feeding the
 /// interpreter's own `float()` (see `builtin_float`), so the string
 /// grammar, `__float__` dispatch and error shapes all come free.
@@ -14182,6 +14256,127 @@ fn download_error_hint(message: &str, session_cookiejar_active: bool) -> String 
 static DOWNLOAD_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)sign in|login_required|confirm you").expect("valid download hint regex")
 });
+
+/// The expired-entry walk — `services/stream.py`'s
+/// `_cache_expired_ids`, the prune phase behind the resolver cache's
+/// maintenance (`_put_cache` and `prune_expired`).
+///
+/// Mirrors the reference's comprehension exactly: the clock read
+/// through the module's own `time` name first (see
+/// `stream_module_clock`), then one pass over `cache.items()` — the
+/// method call, so a subclass override steers the walk — in the
+/// mapping's own order, each entry unpacked as the reference's `for
+/// vid, info in …` pair (see `py_unpack_pair`), each `expires_at` read
+/// through CPython's attribute protocol and compared with the `>=`
+/// through CPython's own rich comparison, the reference's operand
+/// order — so every numeric shape and every error matches the
+/// reference. The ids answer in the cache's iteration order; the dict
+/// state stays Python-side (the caller holds the lock and performs
+/// the deletions).
+#[pyfunction]
+#[pyo3(signature = (cache))]
+fn stream_cache_expired_ids<'py>(
+    py: Python<'py>,
+    cache: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let now = stream_module_clock(py)?;
+    let items = cache.call_method0("items")?;
+    let mut expired: Vec<Bound<'py, PyAny>> = Vec::new();
+    for entry in items.try_iter()? {
+        let entry = entry?;
+        let (vid, info) = py_unpack_pair(&entry)?;
+        let expires_at = info.getattr("expires_at")?;
+        if now.ge(&expires_at)? {
+            expired.push(vid);
+        }
+    }
+    Ok(PyList::new(py, expired).expect("list of ids cannot fail"))
+}
+
+/// The over-cap eviction walk — `services/stream.py`'s
+/// `_cache_cap_evictions`, the second phase of `_put_cache`'s
+/// maintenance, run once the expired entries are pruned.
+///
+/// Mirrors the reference exactly: the cap read through the module's
+/// own `_CACHE_MAX_SIZE` attribute (a patched cap steers both
+/// backends identically), the `len(cache) > cap` gate through
+/// CPython's own comparison — within the cap answers the empty list —
+/// then `sorted(cache, key=lambda vid: cache[vid].expires_at)`: the
+/// key read through the subscript and attribute protocols once per
+/// entry over the cache's own iteration order, the ranking through
+/// CPython's own `<` on the key results (exactly the comparisons
+/// `list.sort` runs), the stability the reference's `sorted()`
+/// guarantees. Then `excess = len(cache) - cap` through CPython's own
+/// `-` and the `sorted_ids[:excess]` slice through CPython's own
+/// slice protocol — so every numeric shape and every error matches
+/// the reference, operand orders included. The ids answer in eviction
+/// order; the dict state stays Python-side.
+#[pyfunction]
+#[pyo3(signature = (cache))]
+fn stream_cache_cap_evictions<'py>(
+    py: Python<'py>,
+    cache: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let cap = stream_cache_max_size(py)?;
+    // len(cache) — through CPython's own len(), as the int object the
+    // reference's comparisons and subtraction run against.
+    let size = cache
+        .len()?
+        .into_pyobject(py)
+        .expect("len() -> int is infallible")
+        .into_any();
+    // if len(cache) <= _CACHE_MAX_SIZE: return [] — the inverted
+    // over-cap gate.
+    if !size.gt(&cap)? {
+        return Ok(PyList::empty(py));
+    }
+    // sorted(cache, key=…) — the decorate pass: cache[vid].expires_at
+    // once per entry, in the cache's own iteration order.
+    let mut keyed: Vec<(Bound<'py, PyAny>, Bound<'py, PyAny>)> = Vec::new();
+    for vid in cache.try_iter()? {
+        let vid = vid?;
+        let expires_at = cache.get_item(&vid)?.getattr("expires_at")?;
+        keyed.push((vid, expires_at));
+    }
+    // list.sort's `<`-only ordering over the key results, stable —
+    // the first comparison error returns exactly like the reference's
+    // sorted() would raise it.
+    let mut sort_err: Option<PyErr> = None;
+    keyed.sort_by(|a, b| {
+        if sort_err.is_some() {
+            // The outcome no longer matters — the error returns anyway.
+            return std::cmp::Ordering::Equal;
+        }
+        match (a.1.lt(&b.1), b.1.lt(&a.1)) {
+            (Ok(true), _) => std::cmp::Ordering::Less,
+            (Ok(false), Ok(true)) => std::cmp::Ordering::Greater,
+            (Ok(_), Ok(_)) => std::cmp::Ordering::Equal,
+            (Err(err), _) | (_, Err(err)) => {
+                sort_err = Some(err);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(err) = sort_err {
+        return Err(err);
+    }
+    // sorted_ids — the fresh list sorted() answers.
+    let ids: Vec<Bound<'py, PyAny>> = keyed.into_iter().map(|(vid, _)| vid).collect();
+    let sorted_ids = PyList::new(py, ids).expect("list of ids cannot fail");
+    // excess = len(cache) - cap, then sorted_ids[:excess] — both
+    // through CPython's own protocols, a non-int excess raising the
+    // slice's own TypeError exactly like the reference.
+    let excess = size.sub(&cap)?;
+    let slice_type = PyModule::import(py, "builtins")?.getattr("slice")?;
+    let window = slice_type.call1((py.None(), excess, py.None()))?;
+    // The slice through the getitem protocol — sorted_ids[window], the
+    // reference's sorted_ids[:excess] spelled as the slice object it
+    // compiles to.
+    let evictions = sorted_ids.as_any().get_item(&window)?;
+    Ok(evictions
+        .downcast_into::<PyList>()
+        .expect("a slice of a list is a list"))
+}
 
 // ── Download service (services/download.py) ──────────────────────────────
 

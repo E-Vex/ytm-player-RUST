@@ -164,6 +164,30 @@ class TestCacheEviction:
         assert resolver._get_cached("fresh") is not None
         assert resolver._get_cached("old") is None
 
+    def test_put_cache_enforces_the_cap(self, monkeypatch):
+        from ytm_player.services import stream
+
+        # A patched cap steers both backends identically (the engine
+        # reads the module's own _CACHE_MAX_SIZE name).
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 3)
+        resolver = StreamResolver()
+        # ttls stay above the 300s staleness buffer so reads hit.
+        for vid, ttl in (("a", 400), ("b", 600), ("c", 500), ("d", 700)):
+            resolver._put_cache(_make_info(vid, ttl=ttl))
+        # The oldest by expires_at (a) fell out; insertion order kept.
+        assert list(resolver._cache) == ["b", "c", "d"]
+        assert resolver._get_cached("a") is None
+        assert resolver._get_cached("b") is not None
+        assert resolver._get_cached("d") is not None
+
+    def test_put_cache_prunes_an_immediately_expired_entry(self):
+        resolver = StreamResolver()
+        # A zero-TTL entry is expired the moment it lands (the write's
+        # own maintenance walk prunes it, no read needed).
+        resolver._put_cache(_make_info("gone", ttl=-1))
+        assert "gone" not in resolver._cache
+        assert resolver.prune_expired() == 0
+
 
 def _fake_info_dict(video_id: str = "dQw4w9WgXcQ") -> dict:
     """Return a fake yt-dlp info dict for mocking extract_info."""

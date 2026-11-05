@@ -1,6 +1,6 @@
 """Tests for the stream resolver-glue engines.
 
-The six pure cores of ``services/stream.py`` run with two
+The eight pure cores of ``services/stream.py`` run with two
 interchangeable backends: the pure-Python transcriptions in the module
 and, when the Rust extension is built, the native implementations
 bound at the module's tail. ``_is_stale`` is the buffered expiry gate
@@ -11,11 +11,16 @@ gate the resolver's ``quality`` setter raises through;
 ``_build_ydl_opts`` (before the configured extras);
 ``_stream_info_fields`` is the extract-info → ``StreamInfo`` field
 assembly behind ``_try_resolve``; ``_download_error_hint`` is the
-stale-cookiejar diagnostic the DownloadError handler appends. The two
-clock-reading engines resolve ``time.time()`` through the module's own
-``time`` name at call time — a frozen or patched clock steers both
-backends identically, which the tests below use for determinism and
-the parity class pins as the contract.
+stale-cookiejar diagnostic the DownloadError handler appends;
+``_cache_expired_ids`` is the expired-entry walk behind both
+``_put_cache``'s and ``prune_expired``'s prune phase;
+``_cache_cap_evictions`` is the over-cap eviction walk behind
+``_put_cache``'s second phase (the cap read through the module's own
+``_CACHE_MAX_SIZE`` name). The three clock-reading engines resolve
+``time.time()`` through the module's own ``time`` name at call time —
+a frozen or patched clock steers both backends identically, which the
+tests below use for determinism and the parity class pins as the
+contract.
 
 The unit tests below assert each engine's contract on whichever
 backend is loaded. When the extension is built, the parity tests
@@ -38,6 +43,8 @@ from ytm_player.services.stream import (
     StreamInfo,
     StreamResolver,
     _base_ydl_opts,
+    _cache_cap_evictions,
+    _cache_expired_ids,
     _download_error_hint,
     _is_stale,
     _stream_info_fields,
@@ -359,11 +366,138 @@ class TestDownloadErrorHint:
         assert _download_error_hint("", True) == ""
 
 
+def _entry(expires_at):
+    """A cache value exposing the one attribute the walks read."""
+    return SimpleNamespace(expires_at=expires_at)
+
+
+class TestCacheExpiredIds:
+    """The expired-entry walk behind ``_put_cache`` and ``prune_expired``."""
+
+    def test_empty_cache_answers_empty(self, frozen_clock):
+        assert _cache_expired_ids({}) == []
+
+    def test_fresh_cache_answers_empty(self, frozen_clock):
+        cache = {"a": _entry(1300.0), "b": _entry(5000.0)}
+        assert _cache_expired_ids(cache) == []
+
+    def test_expired_answered_in_the_cache_iteration_order(self, frozen_clock):
+        cache = {
+            "fresh": _entry(1300.0),
+            "old": _entry(700.0),
+            "edge": _entry(1000.0),  # the boundary is expired (>=)
+            "ancient": _entry(-50.0),
+            "new": _entry(1000.5),
+        }
+        assert _cache_expired_ids(cache) == ["old", "edge", "ancient"]
+
+    def test_ids_pass_through_as_the_objects(self, frozen_clock):
+        vid = "the-very-id"
+        assert _cache_expired_ids({vid: _entry(700.0)})[0] is vid
+
+    def test_int_expires_at_compares_like_a_float(self, frozen_clock):
+        assert _cache_expired_ids({"a": _entry(1000)}) == ["a"]
+        assert _cache_expired_ids({"a": _entry(1001)}) == []
+
+    def test_walks_a_real_resolver_cache(self, frozen_clock):
+        resolver = StreamResolver()
+        with resolver._cache_lock:
+            resolver._cache["fresh"] = StreamInfo(
+                url="https://x",
+                video_id="fresh",
+                format="opus",
+                bitrate=1,
+                duration=1,
+                expires_at=_FROZEN_NOW + 18000,
+            )
+            resolver._cache["old"] = StreamInfo(
+                url="https://x",
+                video_id="old",
+                format="opus",
+                bitrate=1,
+                duration=1,
+                expires_at=0.0,
+            )
+        assert _cache_expired_ids(resolver._cache) == ["old"]
+
+    def test_non_numeric_expires_at_raises_the_comparison_error(self, frozen_clock):
+        with pytest.raises(TypeError, match="not supported between instances"):
+            _cache_expired_ids({"a": _entry("soon")})
+
+
+class TestCacheCapEvictions:
+    """The over-cap eviction walk behind ``_put_cache``'s second phase."""
+
+    def test_within_cap_answers_empty(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 3)
+        cache = {"a": _entry(100.0), "b": _entry(300.0), "c": _entry(200.0)}
+        assert _cache_cap_evictions(cache) == []
+
+    def test_over_cap_evicts_the_oldest_by_expires_at(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 2)
+        cache = {"a": _entry(100.0), "b": _entry(300.0), "c": _entry(200.0)}
+        assert _cache_cap_evictions(cache) == ["a"]
+
+    def test_the_excess_is_exact_and_ordered(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 0)
+        cache = {"b": _entry(100.0), "a": _entry(500.0), "a2": _entry(300.0)}
+        assert _cache_cap_evictions(cache) == ["b", "a2", "a"]
+
+    def test_ties_keep_the_cache_iteration_order(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 2)
+        cache = {
+            "z": _entry(900.0),
+            "y": _entry(100.0),
+            "x": _entry(900.0),
+            "w": _entry(100.0),
+        }
+        # Stable sort: the 100s evict in insertion order (y before w),
+        # and only the over-cap excess goes.
+        assert _cache_cap_evictions(cache) == ["y", "w"]
+
+    def test_huge_values_rank_after_small_ones(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 2)
+        cache = {"a": _entry(10**20), "b": _entry(1.5), "c": _entry(-3)}
+        assert _cache_cap_evictions(cache) == ["c"]
+
+    def test_the_cap_is_read_through_the_module_name(self, monkeypatch):
+        from ytm_player.services import stream
+
+        cache = {"a": _entry(100.0), "b": _entry(300.0), "c": _entry(200.0)}
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 3)
+        assert _cache_cap_evictions(cache) == []
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 1)
+        assert _cache_cap_evictions(cache) == ["a", "c"]
+
+    def test_a_missing_expires_at_raises_the_attribute_error(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_CACHE_MAX_SIZE", 0)
+        with pytest.raises(AttributeError, match="expires_at"):
+            _cache_cap_evictions({"a": SimpleNamespace()})
+
+
 # Each parity case: the engine's arguments as JSON-round-trippable
 # lists, keyed by the engine's native name (the Python module-level
 # fallback spells the same name with a leading underscore). Both the
 # parent and the child run with stream.py's clock frozen at 1000, so
-# every clock-derived value is exact on both sides.
+# every clock-derived value is exact on both sides. The cache is
+# carried as a {video_id: expires_at} mapping and rebuilt as the
+# attribute-bearing objects the walks read; the cap engine's first
+# argument is the _CACHE_MAX_SIZE both sides install before the call.
+# (expires_at never spells NaN in these cases: the ranking of a NaN
+# key is sort-algorithm-dependent, so only totally ordered values are
+# parity-pinned.)
 _PARITY_CASES = {
     "is_stale": [
         [1300.0],
@@ -447,6 +581,23 @@ _PARITY_CASES = {
         ["", True],
         ["", False],
     ],
+    "stream_cache_expired_ids": [
+        [{}],
+        [{"a": 1300.0, "b": 1500.0}],
+        [{"old": 700.0, "edge": 1000.0, "new": 1300.0}],
+        [{"a": 999.5, "b": 1000, "c": 1000.5}],
+        [{"neg": -50.0, "zero": 0}],
+        [{"a": "soon"}],
+    ],
+    "stream_cache_cap_evictions": [
+        [128, {}],
+        [3, {"a": 100.0, "b": 300.0, "c": 200.0}],
+        [2, {"a": 100.0, "b": 300.0, "c": 200.0}],
+        [1, {"a": 100.0, "b": 100.0, "c": 100.0}],
+        [0, {"b": 100.0, "a": 500.0, "a2": 300.0}],
+        [2, {"z": 900.0, "y": 100.0, "x": 900.0, "w": 100.0}],
+        [2, {"a": 100000000000000000000, "b": 1.5, "c": -3}],
+    ],
 }
 
 _CHILD_PROG = """
@@ -467,13 +618,24 @@ PY_NAMES = {
     "stream_base_opts": "_base_ydl_opts",
     "stream_info_fields": "_stream_info_fields",
     "download_error_hint": "_download_error_hint",
+    "stream_cache_expired_ids": "_cache_expired_ids",
+    "stream_cache_cap_evictions": "_cache_cap_evictions",
 }
+
+
+def call_args(name, args):
+    if name == "stream_cache_expired_ids":
+        return [{vid: SimpleNamespace(expires_at=exp) for vid, exp in args[0].items()}]
+    if name == "stream_cache_cap_evictions":
+        stream._CACHE_MAX_SIZE = args[0]
+        return [{vid: SimpleNamespace(expires_at=exp) for vid, exp in args[1].items()}]
+    return args
 
 
 def outcome(name, args):
     fn = getattr(stream, PY_NAMES[name])
     try:
-        result = fn(*args)
+        result = fn(*call_args(name, args))
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
     if name == "stream_info_fields":
@@ -498,7 +660,25 @@ _PY_NAMES = {
     "stream_base_opts": "_base_ydl_opts",
     "stream_info_fields": "_stream_info_fields",
     "download_error_hint": "_download_error_hint",
+    "stream_cache_expired_ids": "_cache_expired_ids",
+    "stream_cache_cap_evictions": "_cache_cap_evictions",
 }
+
+
+def _cache_call_args(name, args):
+    """The cache rebuilt from the JSON case as the attribute-bearing
+    objects the walks read; the cap engine's case also installs its
+    cap first (the caller restores it once the engine has run, so the
+    module constant never leaks)."""
+    from ytm_player.services import stream
+
+    if name == "stream_cache_expired_ids":
+        return [{vid: _entry(exp) for vid, exp in args[0].items()}], None
+    if name == "stream_cache_cap_evictions":
+        saved = stream._CACHE_MAX_SIZE
+        stream._CACHE_MAX_SIZE = args[0]
+        return [{vid: _entry(exp) for vid, exp in args[1].items()}], saved
+    return args, None
 
 
 def _native_outcomes():
@@ -507,10 +687,16 @@ def _native_outcomes():
 
     def outcome(name, args):
         fn = getattr(sys.modules["ytm_player.services.stream"], _PY_NAMES[name])
+        call_args, saved_cap = _cache_call_args(name, args)
         try:
-            result = fn(*args)
+            result = fn(*call_args)
         except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
             return {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if saved_cap is not None:
+                from ytm_player.services import stream
+
+                stream._CACHE_MAX_SIZE = saved_cap
         if name == "stream_info_fields":
             return {"ok": None if result is None else list(result)}
         if name == "stream_base_opts":

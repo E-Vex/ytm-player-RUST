@@ -109,21 +109,55 @@ def _ipc_action(command: str, success: str, args: dict[str, Any] | None = None) 
         _error(resp.get("error", "unknown error"))
 
 
-def _query_history(query: str, limit: int, error_label: str) -> list[dict]:
+def _cli_history_select(limit: Any) -> tuple[str, tuple[Any, ...]]:
+    """The statement and bindings behind the ``history`` command's read.
+
+    The pure half of the standalone ``ytm history`` output: the
+    play-history select — every column, newest play first, bounded by
+    ``limit`` — with the limit passed through as the object it is,
+    packed as the ``(sql, params)`` pair ``_query_history``'s
+    ``execute`` call takes.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cli_history_select``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return ("SELECT * FROM play_history ORDER BY played_at DESC LIMIT ?", (limit,))
+
+
+def _cli_search_history_select(limit: Any) -> tuple[str, tuple[Any, ...]]:
+    """The statement and bindings behind the ``history search`` command's read.
+
+    The pure half of the standalone ``ytm history search`` output: the
+    search-history select — every column, most recently searched
+    first, bounded by ``limit`` — with the limit passed through as the
+    object it is, packed as the ``(sql, params)`` pair
+    ``_query_history``'s ``execute`` call takes.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.cli_search_history_select``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return ("SELECT * FROM search_history ORDER BY last_searched DESC LIMIT ?", (limit,))
+
+
+def _query_history(statement: tuple[str, tuple[Any, ...]], error_label: str) -> list[dict]:
     """Run a parameterised history query, returning rows as dicts.
 
     Returns an empty list when the database file doesn't exist yet; exits
     via ``_error`` (labelled *error_label*) on any SQLite failure. The
-    row materialisation is resolved by the ``_row_dicts`` engine
-    (native when the Rust extension is built, the pure-Python
-    transcription otherwise); this helper performs the query.
+    statement — the SQL text and its bound values — is resolved by the
+    caller's engine (native when the Rust extension is built, the
+    pure-Python transcription otherwise); the row materialisation is
+    resolved by the ``_row_dicts`` engine; this helper performs the
+    query.
     """
     if not HISTORY_DB.exists():
         return []
     try:
         with sqlite3.connect(str(HISTORY_DB)) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(query, (limit,)).fetchall()
+            rows = conn.execute(*statement).fetchall()
             return _row_dicts(rows)
     except sqlite3.Error as exc:
         _error(f"Failed to read {error_label} database: {exc}")
@@ -463,9 +497,7 @@ def history(ctx: click.Context, limit: int, compact_json: bool) -> None:
     if ctx.invoked_subcommand is not None:
         return
 
-    data = _query_history(
-        "SELECT * FROM play_history ORDER BY played_at DESC LIMIT ?", limit, "history"
-    )
+    data = _query_history(_cli_history_select(limit), "history")
     _json_output(data, compact=compact_json)
 
 
@@ -481,11 +513,7 @@ def history(ctx: click.Context, limit: int, compact_json: bool) -> None:
 @click.option("--json", "compact_json", is_flag=True, help="Compact JSON output.")
 def history_search(limit: int, compact_json: bool) -> None:
     """Show recent search history (JSON)."""
-    data = _query_history(
-        "SELECT * FROM search_history ORDER BY last_searched DESC LIMIT ?",
-        limit,
-        "search history",
-    )
+    data = _query_history(_cli_search_history_select(limit), "search history")
     _json_output(data, compact=compact_json)
 
 
@@ -896,6 +924,24 @@ except ImportError:
     pass
 else:
     _cli_stats_payload = _native_cli_stats_payload  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cli_history_select as _native_cli_history_select,
+    )
+except ImportError:
+    pass
+else:
+    _cli_history_select = _native_cli_history_select  # type: ignore[assignment]
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        cli_search_history_select as _native_cli_search_history_select,
+    )
+except ImportError:
+    pass
+else:
+    _cli_search_history_select = _native_cli_search_history_select  # type: ignore[assignment]
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]

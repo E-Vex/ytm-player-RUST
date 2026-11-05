@@ -9,16 +9,22 @@ setter raises through), the base options dict ``_base_ydl_opts`` (the
 ten-key yt-dlp configuration behind ``_build_ydl_opts``, before the
 configured extras), the extract-info field assembly
 ``_stream_info_fields`` (the ``info`` dict → the eight ``StreamInfo``
-field values behind ``_try_resolve``) and the DownloadError hint
+field values behind ``_try_resolve``), the DownloadError hint
 ``_download_error_hint`` (the stale-cookiejar diagnostic the error
-handler appends). All are implemented by the Rust extension
+handler appends), the expired-entry walk ``_cache_expired_ids`` (the
+prune phase behind both ``_put_cache``'s and ``prune_expired``'s
+maintenance) and the over-cap eviction walk ``_cache_cap_evictions``
+(the oldest-by-``expires_at`` excess ``_put_cache`` drops once the
+prune has run). All are implemented by the Rust extension
 (``_ytm_player_native.is_stale`` /
 ``_ytm_player_native.wait_seconds`` /
 ``_ytm_player_native.validate_quality`` /
 ``_ytm_player_native.stream_base_opts`` /
 ``_ytm_player_native.stream_info_fields`` /
-``_ytm_player_native.download_error_hint``) when it is built and by
-the pure-Python transcriptions below otherwise; the YoutubeDL
+``_ytm_player_native.download_error_hint`` /
+``_ytm_player_native.stream_cache_expired_ids`` /
+``_ytm_player_native.stream_cache_cap_evictions``) when it is built
+and by the pure-Python transcriptions below otherwise; the YoutubeDL
 construction, the cookiejar vouching, the network extraction, the
 cache state and the pending-future bookkeeping stay Python-side in
 the resolver. The clock-reading engines resolve ``time.time()``
@@ -291,6 +297,50 @@ def _download_error_hint(message: str, session_cookiejar_active: bool) -> str:
     if session_cookiejar_active and re.search(r"sign in|login_required|confirm you", message, re.I):
         return " (stream cookiejar may be stale/revoked — try `ytm setup` to refresh it)"
     return ""
+
+
+def _cache_expired_ids(cache: dict[str, StreamInfo]) -> list[str]:
+    """Video IDs of the cache entries whose expiry has passed.
+
+    The pure half of ``StreamResolver._put_cache``'s maintenance walk
+    and of ``prune_expired``: the ids of every entry whose
+    ``expires_at`` the module's own clock has reached — the ``del``
+    targets of the reference's prune loop — in the cache's own
+    iteration order. The clock is resolved through this module's own
+    ``time`` name at call time, so a patched or frozen clock steers
+    both backends identically; the cache state itself stays
+    Python-side in the resolver (the caller holds the lock and
+    performs the deletions).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_cache_expired_ids``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    now = time.time()
+    return [vid for vid, info in cache.items() if now >= info.expires_at]
+
+
+def _cache_cap_evictions(cache: dict[str, StreamInfo]) -> list[str]:
+    """Video IDs to evict for the cache being over its size cap.
+
+    The pure half of ``StreamResolver._put_cache``'s maintenance
+    walk's second phase, run once the expired entries are pruned:
+    the ids of the oldest entries by ``expires_at`` that bring the
+    cache back within ``_CACHE_MAX_SIZE`` — the cap read through this
+    module's own name, so a patched cap steers both backends
+    identically — ties kept in the cache's own iteration order by
+    the sort's stability. An empty list when the cache is within its
+    cap; the cache state itself stays Python-side in the resolver.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_cache_cap_evictions``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if len(cache) <= _CACHE_MAX_SIZE:
+        return []
+    sorted_ids = sorted(cache, key=lambda vid: cache[vid].expires_at)
+    excess = len(cache) - _CACHE_MAX_SIZE
+    return sorted_ids[:excess]
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,18 +651,17 @@ class StreamResolver:
                 return
             self._cache[info.video_id] = info
 
-            # Prune expired entries on every write to prevent unbounded growth.
-            now = time.time()
-            expired = [vid for vid, si in self._cache.items() if now >= si.expires_at]
-            for vid in expired:
+            # Prune expired entries on every write to prevent unbounded
+            # growth, then, if still over the cap, evict the oldest entries
+            # by expires_at — both maintenance phases resolved by the
+            # _cache_expired_ids / _cache_cap_evictions engines (native when
+            # the Rust extension is built, the pure-Python transcriptions
+            # otherwise); the cache state itself stays Python-side in the
+            # resolver.
+            for vid in _cache_expired_ids(self._cache):
                 del self._cache[vid]
-
-            # If still over the cap, evict the oldest entries by expires_at.
-            if len(self._cache) > _CACHE_MAX_SIZE:
-                sorted_ids = sorted(self._cache, key=lambda vid: self._cache[vid].expires_at)
-                excess = len(self._cache) - _CACHE_MAX_SIZE
-                for vid in sorted_ids[:excess]:
-                    del self._cache[vid]
+            for vid in _cache_cap_evictions(self._cache):
+                del self._cache[vid]
 
     def resolve_sync(self, video_id: str) -> StreamInfo | None:
         """Resolve a video ID to a StreamInfo, using cache when possible.
@@ -755,10 +804,15 @@ class StreamResolver:
         self._reset_ydl()
 
     def prune_expired(self) -> int:
-        """Remove expired entries from the cache. Returns number removed."""
+        """Remove expired entries from the cache. Returns number removed.
+
+        The expired-entry walk is resolved by the ``_cache_expired_ids``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the deletions and the
+        count stay Python-side in the resolver.
+        """
         with self._cache_lock:
-            now = time.time()
-            expired = [vid for vid, info in self._cache.items() if now >= info.expires_at]
+            expired = _cache_expired_ids(self._cache)
             for vid in expired:
                 del self._cache[vid]
             return len(expired)
@@ -782,6 +836,12 @@ try:
         stream_base_opts as _native_stream_base_opts,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_cache_cap_evictions as _native_stream_cache_cap_evictions,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_cache_expired_ids as _native_stream_cache_expired_ids,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         stream_info_fields as _native_stream_info_fields,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -799,3 +859,5 @@ else:
     _base_ydl_opts = _native_stream_base_opts  # type: ignore[assignment]
     _stream_info_fields = _native_stream_info_fields  # type: ignore[assignment]
     _download_error_hint = _native_download_error_hint  # type: ignore[assignment]
+    _cache_expired_ids = _native_stream_cache_expired_ids  # type: ignore[assignment]
+    _cache_cap_evictions = _native_stream_cache_cap_evictions  # type: ignore[assignment]
