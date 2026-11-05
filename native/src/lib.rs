@@ -2136,9 +2136,9 @@ fn feed_key<'py>(
         }
     };
     if items.next().is_some() {
-        return Err(PyValueError::new_err(
-            "too many values to unpack (expected 2)",
-        ));
+        return Err(PyValueError::new_err(unpack_too_many_message(
+            py, &matched, 2,
+        )));
     }
     let action = if action.is_none() { None } else { Some(action) };
     let kind = match result
@@ -2192,6 +2192,38 @@ fn dispatch_outcome<'py>(
     out.set_item("branch", branch)?;
     out.set_item("page", page)?;
     Ok(out)
+}
+
+/// CPython's UNPACK_SEQUENCE "too many values" message for *obj* being
+/// unpacked into *expected* names. 3.14 reports the actual count, but
+/// only through the exact-type fast path — an exact list, tuple or dict
+/// whose size exceeds the arity; every other iterable (a subclass, a
+/// generator, a custom sequence) and every earlier interpreter keeps
+/// the sizeless spelling. Mirrors the error arm of `unpack_iterable`
+/// in Python/ceval.c, so the native engines raise byte-identical
+/// messages on every interpreter the abi3 wheel runs on.
+fn unpack_too_many_message<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    expected: usize,
+) -> String {
+    let reported = if py.version_info() < (3, 14) {
+        None
+    } else if let Ok(list) = obj.downcast_exact::<PyList>() {
+        Some(list.len())
+    } else if let Ok(tuple) = obj.downcast_exact::<PyTuple>() {
+        Some(tuple.len())
+    } else if let Ok(dict) = obj.downcast_exact::<PyDict>() {
+        Some(dict.len())
+    } else {
+        None
+    };
+    match reported {
+        Some(got) if got > expected => {
+            format!("too many values to unpack (expected {expected}, got {got})")
+        }
+        _ => format!("too many values to unpack (expected {expected})"),
+    }
 }
 
 /// Unpack one dispatch-table row exactly like the fallback's
@@ -2257,9 +2289,7 @@ fn unpack_dispatch_row<'py>(
         }
     };
     if items.next().is_some() {
-        return Err(PyValueError::new_err(
-            "too many values to unpack (expected 3)",
-        ));
+        return Err(PyValueError::new_err(unpack_too_many_message(py, row, 3)));
     }
     Ok((member, branch, page))
 }
@@ -7267,9 +7297,11 @@ fn unpack_two<'py>(pair: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bou
         }
     };
     if items.next().is_some() {
-        return Err(PyValueError::new_err(
-            "too many values to unpack (expected 2)",
-        ));
+        return Err(PyValueError::new_err(unpack_too_many_message(
+            pair.py(),
+            pair,
+            2,
+        )));
     }
     Ok((key, value))
 }
@@ -8584,8 +8616,9 @@ fn mpris_status_text<'py>(
 /// slow path), otherwise the iterator protocol with the opcode's own
 /// error shaping — `ValueError: not enough values to unpack (expected
 /// 2, got N)` when the iterator ends early, `ValueError: too many
-/// values to unpack (expected 2)` when it keeps going, and a
-/// non-iterable reporting `TypeError: cannot unpack non-iterable <type>
+/// values to unpack (expected 2)` when it keeps going (on 3.14 the
+/// exact types carry the actual count — see `unpack_too_many_message`),
+/// and a non-iterable reporting `TypeError: cannot unpack non-iterable <type>
 /// object`, the opcode's reformat of `GetIter`'s own TypeError.
 fn unpack_pair<'py>(
     py: Python<'py>,
@@ -8638,9 +8671,7 @@ fn unpack_pair<'py>(
             // The extra-item probe: a third item is too many, the
             // iterator ending is the reference's success.
             match iter.next() {
-                Some(Ok(_)) => Err(PyValueError::new_err(
-                    "too many values to unpack (expected 2)",
-                )),
+                Some(Ok(_)) => Err(PyValueError::new_err(unpack_too_many_message(py, obj, 2))),
                 Some(Err(err)) => Err(err),
                 None => Ok((a, b)),
             }
@@ -10942,20 +10973,20 @@ fn py_key_position<'py, V>(
 fn py_unpack_pair<'py>(
     item: &Bound<'py, PyAny>,
 ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-    let unpack_err = |got: usize| {
-        if got > 2 {
-            // CPython 3.12's too-many shape: no got-count suffix.
-            PyValueError::new_err("too many values to unpack (expected 2)")
-        } else {
-            PyValueError::new_err(format!(
-                "not enough values to unpack (expected 2, got {got})"
-            ))
-        }
+    let unpack_not_enough = |got: usize| {
+        PyValueError::new_err(format!(
+            "not enough values to unpack (expected 2, got {got})"
+        ))
     };
     if let Ok(tuple) = item.downcast::<PyTuple>() {
         return match tuple.len() {
             2 => Ok((tuple.get_item(0)?, tuple.get_item(1)?)),
-            n => Err(unpack_err(n)),
+            n if n > 2 => Err(PyValueError::new_err(unpack_too_many_message(
+                item.py(),
+                item,
+                2,
+            ))),
+            n => Err(unpack_not_enough(n)),
         };
     }
     let mut got: Vec<Bound<'py, PyAny>> = Vec::new();
@@ -10967,7 +10998,12 @@ fn py_unpack_pair<'py>(
     }
     match got.len() {
         2 => Ok((got.remove(0), got.remove(0))),
-        n => Err(unpack_err(n)),
+        n if n > 2 => Err(PyValueError::new_err(unpack_too_many_message(
+            item.py(),
+            item,
+            2,
+        ))),
+        n => Err(unpack_not_enough(n)),
     }
 }
 
