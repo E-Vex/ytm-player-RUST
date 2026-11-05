@@ -1,4 +1,27 @@
-"""Audio playback control using python-mpv."""
+"""Audio playback control using python-mpv.
+
+The wrapper's glue code is dual-implemented: the libmpv discovery walk
+``_find_brew_libmpv`` (the Homebrew-prefix probe behind the import-time
+fallback find), the end-file verdict ``_end_file_verdict`` (the
+event-matching gate behind ``_end_file_data``), the seek clamp
+``_clamp_seek`` (the ``[0, duration]`` target clamp behind
+``_clamp_seek_target``), the position throttle ``_position_due`` (the
+0.4 s gate behind ``_on_time_pos_change``) and the command gate
+``_command_current`` (the supersession predicate behind ``_dispatch``'s
+still-current check and ``_finish_load``'s acceptance check). All are
+implemented by the Rust extension
+(``_ytm_player_native.player_find_libmpv`` /
+``_ytm_player_native.player_end_file_verdict`` /
+``_ytm_player_native.player_clamp_seek`` /
+``_ytm_player_native.player_position_due`` /
+``_ytm_player_native.player_command_current``) when it is built and by
+the pure-Python transcriptions below otherwise; the locks, the
+pending-event buffer, the payload assembly, the dispatch, the mpv
+calls and the LC_NUMERIC dance stay Python-side in the player. The
+clock-reading engine resolves ``time.monotonic()`` through this
+module's own ``time`` name at call time, so a patched or frozen clock
+steers both backends identically.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +38,21 @@ from pathlib import Path
 from typing import Any
 
 from ytm_player.utils.compat import StrEnum, auto
+
+# Try to load the native Rust engine for the libmpv discovery walk via
+# PyO3.  If the compiled extension is unavailable (e.g. during
+# development without a Rust toolchain), fall back to the pure-Python
+# implementation below.  This binding is resolved here — before the
+# module-level discovery call further down runs — because that call
+# happens mid-import, long before the tail rebinding at the bottom of
+# the module could install it; _find_brew_libmpv therefore checks it
+# at call time.
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_find_libmpv as _native_find_libmpv,
+    )
+except ImportError:
+    _native_find_libmpv = None
 
 if sys.platform == "win32":
     # python-mpv uses ctypes to find mpv DLLs on PATH.  Package managers like
@@ -67,7 +105,17 @@ _BREW_LIB_DIRS = (
 
 
 def _find_brew_libmpv() -> str | None:
-    """Return a libmpv path from a known Homebrew prefix, or None."""
+    """Return a libmpv path from a known Homebrew prefix, or None.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_find_libmpv``) when it is built; this
+    pure-Python transcription is the fallback otherwise. Both read the
+    pattern pair from ``sys.platform`` and the prefix list through this
+    module's own ``_BREW_LIB_DIRS`` name, so patched values steer both
+    backends identically.
+    """
+    if _native_find_libmpv is not None:
+        return _native_find_libmpv()
     patterns = (
         ("libmpv.dylib", "libmpv.*.dylib")
         if sys.platform == "darwin"
@@ -140,6 +188,111 @@ except OSError as _exc:
     mpv = _SimpleNamespace(MPV=_stub_mpv, ShutdownError=_MpvUnavailableError)  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pure cores of the mpv glue (native engines when the extension is built)
+# ---------------------------------------------------------------------------
+
+
+def _end_file_verdict(
+    instance: Any,
+    current_instance: Any,
+    loading: Any,
+    entry_id: Any,
+    current_entry_id: Any,
+    current_track: Any,
+    reason: Any,
+) -> str:
+    """The event-matching verdict behind ``Player._end_file_data``.
+
+    The pure half of the end-file handler: which of the five fates an
+    mpv end-file callback suffers — ``"drop"`` when it comes from an
+    instance that is no longer the live player (a recovered or discarded
+    mpv), ``"park"`` when a loadfile reply is still in flight (the event
+    is buffered until the reply lands), ``"ignore"`` when the entry id,
+    the current track or the reason no longer matches the owned play,
+    ``"track_end"`` for the natural end of the owned entry (reason 0)
+    and ``"error"`` for mpv's failure end of it (reason 4). The locks,
+    the pending-event buffer, the payload assembly and the dispatch stay
+    with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_end_file_verdict``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if instance is not current_instance:
+        return "drop"
+    if loading:
+        return "park"
+    if (
+        not isinstance(entry_id, int)
+        or entry_id != current_entry_id
+        or current_track is None
+        or reason not in (0, 4)
+    ):
+        return "ignore"
+    if reason == 4:
+        return "error"
+    return "track_end"
+
+
+def _clamp_seek(target: Any, duration: Any) -> Any:
+    """The seek-target clamp behind ``Player._clamp_seek_target``.
+
+    Clamps *target* to ``[0, duration]``: a positive duration caps the
+    target (through ``min``, unknown durations — ``0.0`` or negative —
+    leave it uncapped), and the floor is ``0.0`` (through ``max``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_clamp_seek``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The
+    ``self.duration`` read stays with the caller.
+    """
+    if duration > 0:
+        target = min(target, duration)
+    return max(0.0, target)
+
+
+def _position_due(last_dispatch: Any) -> Any:
+    """The position-dispatch throttle behind ``_on_time_pos_change``.
+
+    Reads the clock through this module's own ``time`` name — a patched
+    or frozen clock steers both backends identically — and answers
+    ``None`` when less than ``0.4`` seconds have elapsed since
+    *last_dispatch*, or otherwise the very ``now`` the gate read: the
+    value the caller stamps as the new last-dispatch timestamp.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_position_due``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The
+    ``value is not None`` gate and the dispatch stay with the caller.
+    """
+    now = time.monotonic()
+    if now - last_dispatch < 0.4:
+        return None
+    return now
+
+
+def _command_current(command: Any, generation: Any, current_track: Any) -> bool:
+    """The command-supersession gate behind ``_dispatch``'s
+    ``still_current`` check and ``_finish_load``'s acceptance check.
+
+    A ``None`` command (the dispatch default) is unconditionally
+    current; any other command is current exactly while it still equals
+    the command generation and a current track is set — so a superseded
+    play attempt's callbacks are dropped even once scheduled, and a stop
+    that cleared the track invalidates a still-matching command's queued
+    dispatches.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_command_current``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The locks
+    and the state they guard stay with the caller.
+    """
+    if command is None:
+        return True
+    return command == generation and current_track is not None
 
 
 class PlayerEvent(StrEnum):
@@ -295,20 +448,29 @@ class Player:
         self._end_file_data(instance, reason, entry_id, getattr(data, "error", None))
 
     def _end_file_data(self, instance: Any, reason: Any, entry_id: Any, error: Any) -> None:
+        """Match native events by entry ID, never by an expected event count.
+
+        The event-matching verdict is resolved by the ``_end_file_verdict``
+        engine (native when the Rust extension is built, the pure-Python
+        transcription otherwise); the lock, the pending-event buffer, the
+        payload assembly and the dispatch stay here.
+        """
         with self._skip_lock:
-            if instance is not self._mpv:
+            verdict = _end_file_verdict(
+                instance,
+                self._mpv,
+                self._loading,
+                entry_id,
+                self._current_entry_id,
+                self._current_track,
+                reason,
+            )
+            if verdict == "drop" or verdict == "ignore":
                 return
-            if self._loading:
+            if verdict == "park":
                 # loadfile's reply and its end-file can arrive in either order.
                 # Copy scalar fields; the native event's storage is temporary.
                 self._pending_end_events.append((instance, reason, entry_id, error))
-                return
-            if (
-                not isinstance(entry_id, int)
-                or entry_id != self._current_entry_id
-                or self._current_track is None
-                or reason not in (0, 4)
-            ):
                 return
             payload = {
                 "reason": reason,
@@ -318,7 +480,7 @@ class Player:
             self._current_track = None
             self._current_attempt = None
             self._current_entry_id = None
-        if reason == 4:
+        if verdict == "error":
             payload["error"] = error
             self._dispatch(PlayerEvent.ERROR, payload)
         else:
@@ -381,9 +543,7 @@ class Player:
 
         def still_current() -> bool:
             with self._skip_lock:
-                return command is None or (
-                    command == self._command_generation and self._current_track is not None
-                )
+                return _command_current(command, self._command_generation, self._current_track)
 
         def _schedule_async(coro_fn: Any, call_args: tuple) -> None:
             """Create a task for an async callback with error handling."""
@@ -436,9 +596,12 @@ class Player:
 
     def _on_time_pos_change(self, _name: str, value: float | None) -> None:
         if value is not None:
-            # Throttle position dispatches to ~2 per second (lyrics + UI).
-            now = time.monotonic()
-            if now - self._last_position_dispatch < 0.4:
+            # Throttle position dispatches to ~2 per second (lyrics + UI),
+            # the gate resolved by the ``_position_due`` engine (native
+            # when the Rust extension is built, the pure-Python
+            # transcription otherwise).
+            now = _position_due(self._last_position_dispatch)
+            if now is None:
                 return
             self._last_position_dispatch = now
             self._dispatch(PlayerEvent.POSITION_CHANGE, value)
@@ -571,7 +734,7 @@ class Player:
         for instance, reason, entry, error in pending:
             self._end_file_data(instance, reason, entry, error)
         with self._skip_lock:
-            accepted = command == self._command_generation and self._current_track is not None
+            accepted = _command_current(command, self._command_generation, self._current_track)
         if accepted:
             self._dispatch(PlayerEvent.TRACK_CHANGE, track, command=command)
 
@@ -633,11 +796,13 @@ class Player:
                 pass
 
     def _clamp_seek_target(self, target: float) -> float:
-        """Clamp a seek target to [0, duration] (duration 0.0 = unknown)."""
-        duration = self.duration
-        if duration > 0:
-            target = min(target, duration)
-        return max(0.0, target)
+        """Clamp a seek target to [0, duration] (duration 0.0 = unknown).
+
+        The clamp itself is resolved by the ``_clamp_seek`` engine
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise); the ``self.duration`` read stays here.
+        """
+        return _clamp_seek(target, self.duration)
 
     async def seek(self, seconds: float) -> None:
         """Seek relative to the current position."""
@@ -728,3 +893,35 @@ class Player:
             pass
         with Player._lock:
             Player._instance = None
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same player-glue engines; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements.  ``_find_brew_libmpv`` is NOT rebound here: the
+# module's import-time discovery call runs long before this block, so its
+# native binding is resolved at the top of the module and checked at call
+# time instead.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_clamp_seek as _native_player_clamp_seek,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_command_current as _native_player_command_current,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_end_file_verdict as _native_player_end_file_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_position_due as _native_player_position_due,
+    )
+except ImportError:
+    pass
+else:
+    _end_file_verdict = _native_player_end_file_verdict  # type: ignore[assignment]
+    _clamp_seek = _native_player_clamp_seek  # type: ignore[assignment]
+    _position_due = _native_player_position_due  # type: ignore[assignment]
+    _command_current = _native_player_command_current  # type: ignore[assignment]
