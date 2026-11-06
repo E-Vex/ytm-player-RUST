@@ -20,6 +20,9 @@ from ytm_player.utils.bidi import (
     _do_reorder,
     has_rtl,
     isolate_bidi,
+    render_bar_cell,
+    render_lyric_line,
+    render_track_cell,
     reorder_rtl_line,
     reset_bidi_cache,
     wrap_rtl_line,
@@ -201,18 +204,25 @@ class TestIsolateBidi:
 
 class TestIsolateBidiCallSites:
     """Verify that every render site that displays user-supplied text
-    calls isolate_bidi.  This guards against re-introducing the BiDi
-    bleed bug where Arabic titles appear duplicated at row edges or
-    bleed into adjacent widgets in the playback bar.
+    renders through a fused per-cell isolation engine.  This guards
+    against re-introducing the BiDi bleed bug where Arabic titles appear
+    duplicated at row edges or bleed into adjacent widgets in the
+    playback bar.
+
+    The render sites used to assemble isolate_bidi(truncate(
+    reorder_rtl_line(...))) chains by hand; the fused engines
+    (render_track_cell / render_bar_cell / render_lyric_line) fold the
+    whole chain — the FSI...PDI isolation included — into one call, so
+    the guard now pins the engine name each site must render through.
 
     If you move or rename these render sites, update this test —
     do NOT just delete entries without ensuring isolation is preserved.
     """
 
     REQUIRED_SITES = {
-        "src/ytm_player/ui/widgets/track_table.py": "isolate_bidi",
-        "src/ytm_player/ui/playback_bar.py": "isolate_bidi",
-        "src/ytm_player/ui/sidebars/lyrics_sidebar.py": "isolate_bidi",
+        "src/ytm_player/ui/widgets/track_table.py": "render_track_cell",
+        "src/ytm_player/ui/playback_bar.py": "render_bar_cell",
+        "src/ytm_player/ui/sidebars/lyrics_sidebar.py": "render_lyric_line",
     }
 
     def test_render_sites_call_isolate_bidi(self):
@@ -225,8 +235,9 @@ class TestIsolateBidiCallSites:
             text = full_path.read_text(encoding="utf-8")
             assert token in text, (
                 f"{rel_path} must call {token} to prevent RTL BiDi bleed. "
-                "Wrap user text fragments (title, artist, album, lyrics) "
-                "with isolate_bidi() AFTER truncate()."
+                "Render user text fragments (title, artist, album, lyrics) "
+                "through the fused per-cell render engines — the FSI...PDI "
+                "isolation is applied inside them, after truncate."
             )
 
 
@@ -303,6 +314,110 @@ class TestGatedReorderDisabled:
         assert wrap_rtl_line("يا ليل يا عين طويل", 9) == "يا ليل يا عين طويل"
 
 
+# ── Fused per-cell render engines ─────────────────────────────────────
+
+
+class TestFusedRenderCellsEnabled:
+    """The fused per-cell engines with the cached ``bidi_mode`` verdict
+    forced on — the exact chains the render sites used to assemble:
+    isolate_bidi(reorder_rtl_line(...)),
+    isolate_bidi(truncate(reorder_rtl_line(...), width)) and
+    isolate_bidi(wrap_rtl_line(..., width)), each through one call."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        reset_bidi_cache()
+        bidi._should_reorder = True
+        yield
+        reset_bidi_cache()
+
+    def test_track_cell_reorders_then_isolates(self):
+        assert render_track_cell("عيون القلب") == f"{FSI}القلب عيون{PDI}"
+
+    def test_track_cell_ltr_stays_unwrapped(self):
+        # The isolate's only_if_rtl gate: pure-Latin cells render clean.
+        assert render_track_cell("Hello World") == "Hello World"
+
+    def test_track_cell_empty_unchanged(self):
+        assert render_track_cell("") == ""
+
+    def test_track_cell_falsy_passthrough(self):
+        assert render_track_cell(None) is None  # type: ignore[arg-type]
+
+    def test_bar_cell_reorders_truncates_then_isolates(self):
+        # reorder first ("القلب عيون", 10 chars), then truncate to 6
+        # (5 chars + ellipsis), then isolate — the chain's own order.
+        assert render_bar_cell("عيون القلب", 6) == f"{FSI}القلب…{PDI}"
+
+    def test_bar_cell_truncates_ltr_without_isolate(self):
+        assert render_bar_cell("Hello World", 7) == "Hello …"
+
+    def test_bar_cell_zero_width_answers_empty(self):
+        assert render_bar_cell("Hello World", 0) == ""
+        assert render_bar_cell("عيون القلب", 0) == ""
+
+    def test_bar_cell_negative_width_answers_empty(self):
+        assert render_bar_cell("Hello World", -3) == ""
+
+    def test_bar_cell_width_one_answers_first_char(self):
+        # truncate's max_len == 1 arm: the first char of the REORDERED
+        # text, no ellipsis — then the isolate wraps it (an RTL char
+        # keeps its marks). The reorder puts "القلب" first, so "ا".
+        assert render_bar_cell("Hello World", 1) == "H"
+        assert render_bar_cell("عيون القلب", 1) == f"{FSI}ا{PDI}"
+
+    def test_bar_cell_exact_width_unchanged(self):
+        assert render_bar_cell("Hello", 5) == "Hello"
+
+    def test_bar_cell_pdi_survives_the_width_budget(self):
+        # The isolate wraps AFTER the truncate, so a full-width RTL
+        # fragment keeps its closing PDI — the property the old chain's
+        # "apply isolate AFTER truncate" comment pinned.
+        text = "مرحبا"
+        out = render_bar_cell(text, 5)
+        assert out == f"{FSI}{text}{PDI}"
+        assert out.endswith(PDI)
+
+    def test_lyric_line_wraps_then_isolates(self):
+        # One FSI...PDI pair bracketing the WHOLE wrapped string.
+        assert render_lyric_line("يا ليل يا عين طويل", 9) == (f"{FSI}يا ليل يا\nطويل عين{PDI}")
+
+    def test_lyric_line_short_reorders_without_wrapping(self):
+        assert render_lyric_line("عيون القلب", 80) == f"{FSI}القلب عيون{PDI}"
+
+    def test_lyric_line_ltr_passthrough(self):
+        # Pure-LTR lines: no wrap (the wrap's no-RTL gate), no isolate.
+        assert render_lyric_line("Hello World", 4) == "Hello World"
+
+    def test_lyric_line_empty_and_falsy_passthrough(self):
+        assert render_lyric_line("", 4) == ""
+        assert render_lyric_line(None, 4) is None  # type: ignore[arg-type]
+
+
+class TestFusedRenderCellsDisabled:
+    """The same fused engines with the cached verdict forced off — the
+    reorder step passes through, but the truncate and the isolate still
+    apply: the bar cells still fit their width budgets and RTL cells are
+    still isolated."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        reset_bidi_cache()
+        bidi._should_reorder = False
+        yield
+        reset_bidi_cache()
+
+    def test_track_cell_rtl_isolated_without_reorder(self):
+        assert render_track_cell("عيون القلب") == f"{FSI}عيون القلب{PDI}"
+
+    def test_bar_cell_rtl_truncated_and_isolated(self):
+        # No reorder, so the truncate cuts the logical-order text.
+        assert render_bar_cell("عيون القلب", 4) == f"{FSI}عيو…{PDI}"
+
+    def test_lyric_line_rtl_isolated_without_wrap(self):
+        assert render_lyric_line("يا ليل يا عين طويل", 9) == (f"{FSI}يا ليل يا عين طويل{PDI}")
+
+
 # ── native vs fallback parity ────────────────────────────────────────
 
 try:
@@ -350,12 +465,54 @@ class TestGatedEngineContract:
     def test_wrap_short_line_becomes_bare_reorder(self):
         assert _ytm_player_native.wrap_rtl_line("عيون القلب", 80, True) == "القلب عيون"
 
+    def test_track_cell_reorders_then_isolates(self):
+        assert _ytm_player_native.render_track_cell("عيون القلب", True) == (f"{FSI}القلب عيون{PDI}")
+
+    def test_track_cell_passthroughs(self):
+        # No-RTL and empty answer the bare text; a disabled flag only
+        # skips the REORDER — the isolate still wraps RTL text, exactly
+        # like the call-site chain composed the two calls.
+        assert _ytm_player_native.render_track_cell("Hello World", True) == "Hello World"
+        assert _ytm_player_native.render_track_cell("", True) == ""
+        assert _ytm_player_native.render_track_cell("عيون القلب", False) == (
+            f"{FSI}عيون القلب{PDI}"
+        )
+
+    def test_bar_cell_reorders_truncates_then_isolates(self):
+        assert _ytm_player_native.render_bar_cell("عيون القلب", 6, True) == (f"{FSI}القلب…{PDI}")
+
+    def test_bar_cell_truncates_even_when_reorder_disabled(self):
+        # The gates only skip the REORDER — the truncate and the isolate
+        # still run, exactly like the call-site chain composed them.
+        assert _ytm_player_native.render_bar_cell("عيون القلب", 4, False) == (f"{FSI}عيو…{PDI}")
+
+    def test_bar_cell_ltr_truncates_without_isolate(self):
+        assert _ytm_player_native.render_bar_cell("Hello World", 7, True) == "Hello …"
+
+    def test_bar_cell_zero_width_answers_empty(self):
+        assert _ytm_player_native.render_bar_cell("عيون القلب", 0, True) == ""
+
+    def test_lyric_line_wraps_then_isolates(self):
+        assert _ytm_player_native.render_lyric_line("يا ليل يا عين طويل", 9, True) == (
+            f"{FSI}يا ليل يا\nطويل عين{PDI}"
+        )
+
+    def test_lyric_line_passthroughs(self):
+        assert _ytm_player_native.render_lyric_line("يا ليل يا عين طويل", 9, False) == (
+            f"{FSI}يا ليل يا عين طويل{PDI}"
+        )
+        assert _ytm_player_native.render_lyric_line("Hello World", 4, True) == "Hello World"
+        assert _ytm_player_native.render_lyric_line("", 4, True) == ""
+
 
 # Op sequences the two implementations must agree on, case for case:
 # the reorder across pure-RTL / mixed / neutral / empty / whitespace
-# inputs with the gate both on and off, and the wrap across the width
+# inputs with the gate both on and off, the wrap across the width
 # short-circuit edges (0, negative, exact-len, len+1), the join-budget
-# splits, the over-wide-word own line and the per-line reorder join.
+# splits, the over-wide-word own line and the per-line reorder join,
+# and the fused per-cell render engines (cell = reorder+isolate,
+# bar = reorder+truncate+isolate, lyric = wrap+isolate) across the
+# same input shapes and the truncate width edges.
 _PARITY_CASES: list = [
     ["reorder", "عيون القلب", 0, True],
     ["reorder", "يا ليل يا عين", 0, True],
@@ -393,6 +550,39 @@ _PARITY_CASES: list = [
     ["wrap", "Hello World", 4, True],
     ["wrap", "  ", 1, True],
     ["wrap", "", 3, True],
+    ["cell", "عيون القلب", 0, True],
+    ["cell", "كلمات DJ Khaled أغنية", 0, True],
+    ["cell", "مرحبا", 0, True],
+    ["cell", "Hello World", 0, True],
+    ["cell", "", 0, True],
+    ["cell", "   ", 0, True],
+    ["cell", "عيون القلب", 0, False],
+    ["cell", "Hello World", 0, False],
+    ["cell", None, 0, True],
+    ["bar", "عيون القلب", 6, True],
+    ["bar", "عيون القلب", 6, False],
+    ["bar", "عيون القلب", 1, True],
+    ["bar", "عيون القلب", 0, True],
+    ["bar", "عيون القلب", -3, True],
+    ["bar", "مرحبا", 5, True],
+    ["bar", "مرحبا", 6, True],
+    ["bar", "كلمات DJ Khaled أغنية", 12, True],
+    ["bar", "كلمات DJ Khaled أغنية", 12, False],
+    ["bar", "Hello World", 7, True],
+    ["bar", "Hello World", 5, True],
+    ["bar", "Hello", 5, True],
+    ["bar", "", 4, True],
+    ["bar", None, 5, True],
+    ["lyric", "يا ليل يا عين طويل", 9, True],
+    ["lyric", "يا ليل يا عين طويل", 9, False],
+    ["lyric", "أغنية جميلة جدا جدا جدا", 5, True],
+    ["lyric", "مرحبا", 2, True],
+    ["lyric", "مرحبا", 80, True],
+    ["lyric", "مرحبا", 0, True],
+    ["lyric", "Hello World", 4, True],
+    ["lyric", "Hello عالم", 4, True],
+    ["lyric", "", 3, True],
+    ["lyric", None, 5, True],
 ]
 
 _CHILD_PROG = """
@@ -404,6 +594,12 @@ for op, text, width, enabled in json.load(sys.stdin):
     bidi._should_reorder = enabled
     if op == "reorder":
         out.append(bidi.reorder_rtl_line(text))
+    elif op == "cell":
+        out.append(bidi.render_track_cell(text))
+    elif op == "bar":
+        out.append(bidi.render_bar_cell(text, width))
+    elif op == "lyric":
+        out.append(bidi.render_lyric_line(text, width))
     else:
         out.append(bidi.wrap_rtl_line(text, width))
 print(json.dumps(out, ensure_ascii=False))
@@ -434,6 +630,12 @@ def _run_cases(cases: list, in_child: bool) -> list:
             bidi._should_reorder = enabled
             if op == "reorder":
                 results.append(bidi.reorder_rtl_line(text))
+            elif op == "cell":
+                results.append(bidi.render_track_cell(text))
+            elif op == "bar":
+                results.append(bidi.render_bar_cell(text, width))
+            elif op == "lyric":
+                results.append(bidi.render_lyric_line(text, width))
             else:
                 results.append(bidi.wrap_rtl_line(text, width))
     finally:

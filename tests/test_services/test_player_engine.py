@@ -41,6 +41,7 @@ import pytest
 
 from ytm_player.services.player import (
     _clamp_seek,
+    _clamp_volume,
     _command_current,
     _end_file_verdict,
     _find_brew_libmpv,
@@ -255,6 +256,39 @@ class TestClampSeek:
             _clamp_seek("far", 100.0)
 
 
+class TestClampVolume:
+    """The volume clamp."""
+
+    def test_a_negative_level_clamps_to_zero(self):
+        assert _clamp_volume(-10) == 0
+
+    def test_a_level_above_one_hundred_clamps_to_one_hundred(self):
+        assert _clamp_volume(150) == 100
+
+    def test_the_boundaries_pass_through(self):
+        assert _clamp_volume(0) == 0
+        assert _clamp_volume(100) == 100
+
+    def test_an_in_range_level_is_unchanged(self):
+        assert _clamp_volume(37) == 37
+
+    def test_ints_stay_ints(self):
+        out = _clamp_volume(99)
+        assert out == 99 and isinstance(out, int)
+
+    def test_a_bool_level_answers_the_bool(self):
+        # min(100, True) keeps the bool object itself; max(0, True)
+        # keeps it too — the operand identity CPython's walks preserve.
+        assert _clamp_volume(True) is True
+        # False < 100 keeps the bool for the min, but False > 0 is
+        # False so the max answers its own 0 literal.
+        assert _clamp_volume(False) == 0
+
+    def test_a_non_numeric_level_raises_the_comparison_error(self):
+        with pytest.raises(TypeError, match="'<' not supported"):
+            _clamp_volume("loud")
+
+
 class TestPositionDue:
     """The position-dispatch throttle."""
 
@@ -369,6 +403,22 @@ _PARITY_CASES = {
         [0.0, 0.0],
         [-0.0, 100.0],
     ],
+    "player_clamp_volume": [
+        [50],
+        [0],
+        [100],
+        [-10],
+        [150],
+        [99],
+        [1],
+        [True],
+        [False],
+        ["loud"],
+        [50.0],
+        [-0.5],
+        [100.5],
+        [float("nan")],
+    ],
     "player_position_due": [
         [9975.0],
         [10000.0],
@@ -457,6 +507,7 @@ PY_NAMES = {
     "player_find_libmpv": "_find_brew_libmpv",
     "player_end_file_verdict": "_end_file_verdict",
     "player_clamp_seek": "_clamp_seek",
+    "player_clamp_volume": "_clamp_volume",
     "player_position_due": "_position_due",
     "player_command_current": "_command_current",
 }
@@ -483,6 +534,7 @@ _PY_NAMES = {
     "player_find_libmpv": "_find_brew_libmpv",
     "player_end_file_verdict": "_end_file_verdict",
     "player_clamp_seek": "_clamp_seek",
+    "player_clamp_volume": "_clamp_volume",
     "player_position_due": "_position_due",
     "player_command_current": "_command_current",
 }

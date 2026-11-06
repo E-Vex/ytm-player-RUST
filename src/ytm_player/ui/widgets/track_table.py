@@ -601,17 +601,21 @@ class TrackTable(DataTable):
         album = track.get("album") or ""
         duration = extract_duration(track)
 
-        from ytm_player.utils.bidi import isolate_bidi, reorder_rtl_line
+        # The per-cell render engine fuses the reorder -> isolate chain
+        # each text cell went through into one call (Rust when the
+        # extension is built): FSI...PDI isolation so RTL cells cannot
+        # bleed into adjacent columns.
+        from ytm_player.utils.bidi import render_track_cell
 
         cells: list[str | int] = [self._mark_glyph(track.get("_original_index", index))]
         if self._show_index:
             # Always show original playlist position, not current row number.
             orig = track.get("_original_index", index)
             cells.append(str(orig + 1))
-        cells.append(isolate_bidi(reorder_rtl_line(title)))
-        cells.append(isolate_bidi(reorder_rtl_line(artist)))
+        cells.append(render_track_cell(title))
+        cells.append(render_track_cell(artist))
         if self._show_album:
-            cells.append(isolate_bidi(reorder_rtl_line(album)))
+            cells.append(render_track_cell(album))
         cells.append(format_duration(duration) if duration else "--:--")
 
         video_id = track.get("video_id", f"row_{index}")
@@ -662,7 +666,7 @@ class TrackTable(DataTable):
 
         from rich.text import Text
 
-        from ytm_player.utils.bidi import isolate_bidi, reorder_rtl_line
+        from ytm_player.utils.bidi import render_track_cell
         from ytm_player.utils.formatting import (
             extract_artist as _extract_artist,
         )
@@ -696,10 +700,10 @@ class TrackTable(DataTable):
             cells: dict[str, Any] = {}
             cells["mark"] = self._mark_glyph(track.get("_original_index", row_index))
             cells["index"] = str(track.get("_original_index", row_index) + 1)
-            cells["title"] = isolate_bidi(reorder_rtl_line(title))
-            cells["artist"] = isolate_bidi(reorder_rtl_line(artist))
+            cells["title"] = render_track_cell(title)
+            cells["artist"] = render_track_cell(artist)
             if self._show_album:
-                cells["album"] = isolate_bidi(reorder_rtl_line(album))
+                cells["album"] = render_track_cell(album)
             cells["duration"] = _format_duration(duration) if duration else "--:--"
             return cells
 

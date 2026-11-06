@@ -17,7 +17,7 @@ from textual.worker import Worker, WorkerState
 
 from ytm_player.config.keymap import Action
 from ytm_player.services.player import PlayerEvent
-from ytm_player.utils.bidi import has_rtl, isolate_bidi, wrap_rtl_line
+from ytm_player.utils.bidi import has_rtl, render_lyric_line
 from ytm_player.utils.transliteration import has_non_ascii, transliterate_line
 
 logger = logging.getLogger(__name__)
@@ -363,8 +363,11 @@ class LyricsSidebar(Widget):
         wrap_width = self._get_rtl_wrap_width()
         children: list[Static] = []
         for ts, text in self._synced_lines:
-            display_text = wrap_rtl_line(text, wrap_width) if text else ""
-            display_text = isolate_bidi(display_text)
+            # The per-line render engine fuses the wrap -> isolate chain
+            # into one call (Rust when the extension is built): one
+            # FSI...PDI pair bracketing the whole (possibly wrapped)
+            # line so its directional context cannot leak.
+            display_text = render_lyric_line(text, wrap_width)
             widget = _LyricLine(display_text, timestamp=ts)
             widget.add_class("lyrics-upcoming")
             if text and has_rtl(text):
@@ -385,7 +388,7 @@ class LyricsSidebar(Widget):
         wrap_width = self._get_rtl_wrap_width()
         children: list[Static] = []
         for line in self._unsynced_lines:
-            widget = _LyricLine(isolate_bidi(wrap_rtl_line(line, wrap_width)))
+            widget = _LyricLine(render_lyric_line(line, wrap_width))
             widget.add_class("lyrics-upcoming")
             if line and has_rtl(line):
                 widget.add_class("lyrics-rtl")

@@ -74,6 +74,7 @@ class QueueCoreLike(Protocol):
     def add_multiple(self, tracks: list[dict]) -> None: ...
     def remove(self, index: int) -> None: ...
     def remove_entry(self, entry_id: int) -> bool: ...
+    def add_radio_tracks(self, tracks: list[dict]) -> int: ...
     def clear(self) -> None: ...
     def move(self, from_idx: int, to_idx: int) -> None: ...
     def current(self) -> dict | None: ...
@@ -308,6 +309,24 @@ class _QueueCore:
         """Return the tracks whose video_id is not already queued."""
         existing_ids = {t.get("video_id") for t in self._tracks}
         return [t for t in tracks if t.get("video_id") not in existing_ids]
+
+    def add_radio_tracks(self, tracks: list[dict]) -> int:
+        """The fused radio append: dedup, then append what survived.
+
+        One core operation behind ``QueueManager.set_radio_tracks``'s
+        orchestration — the ``filter_not_in_queue`` dedup and the
+        ``add_multiple`` append under the single lock section the facade
+        already holds. Returns how many tracks were appended; ``0``
+        leaves the queue untouched (no entry ids minted, no shuffle
+        rebuild). Duplicates WITHIN *tracks* pass — the dedup only
+        consults the tracks already queued, exactly like the two-step
+        compose it replaces.
+        """
+        new_tracks = self.filter_not_in_queue(tracks)
+        if not new_tracks:
+            return 0
+        self._add_multiple_unlocked(new_tracks)
+        return len(new_tracks)
 
     def remove(self, index: int) -> None:
         """Remove the track at the given index (in visible/playback order)."""
@@ -981,13 +1000,16 @@ class QueueManager:
     def set_radio_tracks(self, tracks: list[dict]) -> None:
         """Append radio/autoplay suggestion tracks to the queue.
 
-        Skips tracks already in the queue (by video_id).
+        Skips tracks already in the queue (by video_id). The dedup
+        filter and the append fuse into one core operation
+        (``add_radio_tracks``, the native Rust engine when the extension
+        is built) under the queue lock — no Python list crosses the
+        boundary between the two steps.
         """
         with self._lock:
-            new_tracks = self._core.filter_not_in_queue(tracks)
-            if new_tracks:
-                logger.debug("Adding %d radio tracks to queue", len(new_tracks))
-                self._core.add_multiple(new_tracks)
+            added = self._core.add_radio_tracks(tracks)
+            if added:
+                logger.debug("Adding %d radio tracks to queue", added)
 
     def peek_next(self) -> dict | None:
         """Return the next track WITHOUT advancing the position.

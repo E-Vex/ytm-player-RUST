@@ -17,7 +17,7 @@ from ytm_player.services.queue import RepeatMode
 from ytm_player.ui.theme import get_theme
 from ytm_player.ui.widgets.album_art import AlbumArt
 from ytm_player.ui.widgets.progress_bar import PlaybackProgress
-from ytm_player.utils.formatting import extract_artist, truncate
+from ytm_player.utils.formatting import extract_artist
 
 if TYPE_CHECKING:
     from ytm_player.app._base import YTMHostBase
@@ -105,25 +105,29 @@ class _TrackInfo(Widget):
                 self.size.width, self.title, self.artist
             )
 
+            # The per-cell render engine fuses the whole
+            # reorder -> truncate -> isolate chain each fragment went
+            # through into one call (Rust when the extension is built):
             # FSI...PDI isolates each fragment so RTL titles don't pull
-            # adjacent widgets (volume, repeat, shuffle) into the RTL BiDi
-            # context.  Apply isolate AFTER truncate (PDI must not be cut).
-            from ytm_player.utils.bidi import isolate_bidi, reorder_rtl_line
+            # adjacent widgets (volume, repeat, shuffle) into the RTL
+            # BiDi context, applied AFTER truncate (PDI must not be
+            # cut).
+            from ytm_player.utils.bidi import render_bar_cell
 
             result.append(
-                isolate_bidi(truncate(reorder_rtl_line(self.title), title_w)),
+                render_bar_cell(self.title, title_w),
                 style=f"bold {theme.foreground}",
             )
             if self.artist:
                 result.append(" \u2014 ", style=theme.muted_text)
                 result.append(
-                    isolate_bidi(truncate(reorder_rtl_line(self.artist), artist_w)),
+                    render_bar_cell(self.artist, artist_w),
                     style=theme.secondary,
                 )
             if self.album:
                 result.append(" \u2014 ", style=theme.muted_text)
                 result.append(
-                    isolate_bidi(truncate(reorder_rtl_line(self.album), album_w)),
+                    render_bar_cell(self.album, album_w),
                     style=theme.muted_text,
                 )
         else:

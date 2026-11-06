@@ -141,6 +141,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // settings read stays Python-side, passed in as a bool).
     module.add_function(pyo3::wrap_pyfunction!(reorder_rtl_line, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(wrap_rtl_line, module)?)?;
+    // The fused per-cell render engines — the whole
+    // reorder/truncate/isolate (and wrap/isolate) chains the render
+    // sites used to assemble through three separate calls, folded into
+    // one native call per rendered cell or lyric line (the cached
+    // settings read stays Python-side, passed in as a bool).
+    module.add_function(pyo3::wrap_pyfunction!(render_track_cell, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(render_bar_cell, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(render_lyric_line, module)?)?;
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
@@ -840,6 +848,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(player_find_libmpv, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_end_file_verdict, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_clamp_seek, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(player_clamp_volume, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_position_due, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_command_current, module)?)?;
     Ok(())
@@ -1640,6 +1649,15 @@ fn has_rtl(text: &str) -> bool {
 /// *only_if_rtl* is set, and never double-wraps.
 #[pyfunction(signature = (text, *, only_if_rtl = true))]
 fn isolate_bidi(text: &str, only_if_rtl: bool) -> String {
+    isolate_bidi_impl(text, only_if_rtl)
+}
+
+/// The isolate wrap shared by the `isolate_bidi` export and the fused
+/// per-cell render engines — one definition so the export and every
+/// render chain isolates through exactly the same body: the empty and
+/// pure-LTR (when *only_if_rtl*) passthroughs, the FSI...PDI
+/// double-wrap guard, and the wrap itself.
+fn isolate_bidi_impl(text: &str, only_if_rtl: bool) -> String {
     if text.is_empty() {
         return text.to_string();
     }
@@ -1812,6 +1830,20 @@ fn wrap_line(text: &str, width: i64) -> String {
     wrap_line_impl(text, width)
 }
 
+/// The gated line reorder shared by the `reorder_rtl_line` export and
+/// the fused per-cell render engines: the disabled flag (the cached
+/// `bidi_mode` verdict, read Python-side), empty text and text without
+/// any RTL script character all answer *text* unchanged — the
+/// passthrough that keeps `bidi_mode="auto"` and `"passthrough"` free
+/// of any transformation; otherwise the UAX #9 L2 word-level reversal
+/// of `do_reorder`.
+fn gated_reorder(text: &str, reorder_enabled: bool) -> String {
+    if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    do_reorder(text)
+}
+
 /// The gated line reorder every rendered RTL fragment funnels through —
 /// the public `reorder_rtl_line` of `bidi.py` with the `bidi_mode` gate
 /// folded in. The track-table cells, the playback-bar fragments and the
@@ -1830,10 +1862,7 @@ fn wrap_line(text: &str, width: i64) -> String {
 #[pyfunction]
 #[pyo3(signature = (text, reorder_enabled))]
 fn reorder_rtl_line(text: &str, reorder_enabled: bool) -> String {
-    if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
-        return text.to_string();
-    }
-    do_reorder(text)
+    gated_reorder(text, reorder_enabled)
 }
 
 /// The gated multi-line pre-wrap behind the lyrics sidebar's line
@@ -1853,6 +1882,72 @@ fn wrap_rtl_line(text: &str, width: i64, reorder_enabled: bool) -> String {
         return text.to_string();
     }
     wrap_line_impl(text, width)
+}
+
+/// The fused per-cell engine behind the track-table render sites —
+/// `isolate_bidi(reorder_rtl_line(text))`, the chain `_add_track_row`
+/// and `_highlight_playing`'s restore-cells assembled per
+/// title/artist/album cell, folded into one native call.
+///
+/// Mirrors the chain exactly: the gated line reorder (the disabled /
+/// empty / no-RTL passthroughs, then the UAX #9 L2 word-level
+/// reversal), then the isolate wrap with its own empty / pure-LTR /
+/// already-wrapped passthroughs — the wrap the chain applies AFTER the
+/// reorder so the FSI/PDI pair brackets the words the terminal's BiDi
+/// resolver sees. Only the cached `bidi_mode` verdict stays
+/// Python-side, travelling in as a plain bool.
+#[pyfunction]
+#[pyo3(signature = (text, reorder_enabled))]
+fn render_track_cell(text: &str, reorder_enabled: bool) -> String {
+    isolate_bidi_impl(&gated_reorder(text, reorder_enabled), true)
+}
+
+/// The fused per-cell engine behind the playback bar's track-info row —
+/// `isolate_bidi(truncate(reorder_rtl_line(text), width))`, the chain
+/// `_TrackInfo.render` assembled per title/artist/album fragment,
+/// folded into one native call.
+///
+/// Mirrors the chain exactly and in the chain's own order: the gated
+/// line reorder, then `formatting.truncate` over the REORDERED text
+/// (the reference truncates the reordered fragment — the ellipsis
+/// lands at the display edge, and a `width < 1` answers the empty
+/// string), then the isolate wrap — applied after the truncate so the
+/// closing PDI is never cut off by the width budget. Only the cached
+/// `bidi_mode` verdict stays Python-side, travelling in as a plain
+/// bool; the width-splitting engine (`track_info_widths`) stays its
+/// own call so the reference's `len()`-based split keeps steering both
+/// backends.
+#[pyfunction]
+#[pyo3(signature = (text, width, reorder_enabled))]
+fn render_bar_cell(text: &str, width: isize, reorder_enabled: bool) -> String {
+    isolate_bidi_impl(
+        &truncate_str(&gated_reorder(text, reorder_enabled), width),
+        true,
+    )
+}
+
+/// The fused line engine behind the lyrics sidebar's two views —
+/// `isolate_bidi(wrap_rtl_line(text, width))`, the chain
+/// `_build_synced_view` and `_build_unsynced_view` assembled per lyric
+/// line, folded into one native call.
+///
+/// Mirrors the chain exactly: the gated multi-line pre-wrap (the same
+/// disabled / empty / no-RTL passthroughs, then the wrap-then-reorder
+/// pipeline of `wrap_line_impl` — the width short-circuit, the word
+/// walk, the per-line reorder join), then the isolate wrap around the
+/// WHOLE wrapped string — one FSI...PDI pair bracketing every wrapped
+/// line, exactly where the reference's outer call puts it. Only the
+/// cached `bidi_mode` verdict stays Python-side, travelling in as a
+/// plain bool.
+#[pyfunction]
+#[pyo3(signature = (text, width, reorder_enabled))]
+fn render_lyric_line(text: &str, width: i64, reorder_enabled: bool) -> String {
+    let wrapped = if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
+        text.to_string()
+    } else {
+        wrap_line_impl(text, width)
+    };
+    isolate_bidi_impl(&wrapped, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -3326,6 +3421,43 @@ impl QueueCore {
             }
         }
         Ok(out)
+    }
+
+    /// The fused radio append — `QueueManager.set_radio_tracks`'s
+    /// filter-then-add orchestration folded into one core operation:
+    /// the `filter_not_in_queue` dedup (the video_id set of the queued
+    /// tracks, the candidates read through their own `get`) and, when
+    /// anything survives it, the `add_multiple` append — under the one
+    /// lock section the facade already holds, with no Python list
+    /// crossing the boundary in between. Returns how many tracks were
+    /// appended; 0 leaves the queue untouched (no entry ids minted, no
+    /// shuffle rebuild, no removed-current bookkeeping), matching the
+    /// reference's `if new_tracks:` gate. Duplicates WITHIN *candidates*
+    /// pass exactly like the reference's two-step compose — the dedup
+    /// only consults the tracks already queued when the filter ran.
+    fn add_radio_tracks(&mut self, py: Python, candidates: Vec<Py<PyAny>>) -> PyResult<usize> {
+        let existing: Vec<Py<PyAny>> = self
+            .tracks
+            .iter()
+            .map(|t| {
+                t.bind(py)
+                    .call_method1("get", ("video_id",))
+                    .map(|v| v.unbind())
+            })
+            .collect::<PyResult<Vec<Py<PyAny>>>>()?;
+        let set = PySet::new(py, existing)?;
+        let mut fresh: Vec<Py<PyAny>> = Vec::new();
+        for t in candidates {
+            let vid = t.bind(py).call_method1("get", ("video_id",))?;
+            if !set.contains(vid)? {
+                fresh.push(t);
+            }
+        }
+        let added = fresh.len();
+        if added > 0 {
+            self.add_multiple_unlocked(py, fresh)?;
+        }
+        Ok(added)
     }
 
     /// Remove the track at the given index (in visible/playback order).
@@ -15591,6 +15723,43 @@ fn player_clamp_seek<'py>(
     // as the running maximum; the clamped target replaces it only
     // when it compares strictly greater.
     let zero = PyFloat::new(py, 0.0).into_any();
+    if clamped.gt(&zero)? {
+        Ok(clamped)
+    } else {
+        Ok(zero)
+    }
+}
+
+/// The volume clamp — `services/player.py`'s `set_volume` clamp, the
+/// `[0, 100]` level gate behind every volume write (the direct `set`
+/// and the relative `change_volume` that funnels into it).
+///
+/// Mirrors the reference's `max(0, min(100, level))` exactly: the
+/// inner `min` walked like CPython's own call — the int literal `100`
+/// starts as the running minimum and the level takes over only when
+/// it compares strictly less — then the outer `max` walked the same
+/// way — the int literal `0` starts as the running maximum and the
+/// clamped level replaces it only when it compares strictly greater —
+/// so boundary values answer the literal arms and a non-numeric level
+/// raises the comparison's own `TypeError`. The mpv assignment and the
+/// VOLUME_CHANGE dispatch stay Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (level))]
+fn player_clamp_volume<'py>(
+    py: Python<'py>,
+    level: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // min(100, level) — CPython's min walk: the level takes over only
+    // when it compares strictly less than the running minimum.
+    let hundred = 100i64.into_pyobject(py)?.into_any();
+    let clamped = if level.lt(&hundred)? {
+        level.clone()
+    } else {
+        hundred
+    };
+    // max(0, clamped) — CPython's max walk: the clamped level replaces
+    // the running maximum only when it compares strictly greater.
+    let zero = 0i64.into_pyobject(py)?.into_any();
     if clamped.gt(&zero)? {
         Ok(clamped)
     } else {

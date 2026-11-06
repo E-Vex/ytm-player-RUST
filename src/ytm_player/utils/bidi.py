@@ -252,6 +252,78 @@ def wrap_rtl_line(text: str, width: int) -> str:
     return "\n".join(_do_reorder(line) for line in lines)
 
 
+# ── Fused per-cell render engines ───────────────────────────────────────
+# One call per rendered cell or lyric line, replacing the
+# isolate_bidi(truncate(reorder_rtl_line(...))) chains the render sites
+# used to assemble through three separate calls. Each engine keeps the
+# chain's own step order; the fused native versions run the whole chain
+# inside one extension call.
+
+
+def render_track_cell(text: str) -> str:
+    """Format one track-table cell: gated reorder, then isolate.
+
+    The fused ``isolate_bidi(reorder_rtl_line(text))`` chain — the
+    title/artist/album cells ``_add_track_row`` and
+    ``_highlight_playing``'s restore-cells render. The reorder keeps
+    its ``bidi_mode`` gate (disabled / no-RTL text passes through
+    unreordered); the isolate then wraps RTL cells in FSI...PDI so
+    their directional context cannot bleed into adjacent columns.
+    Falsy input passes through untouched, exactly like the native
+    wrapper's gate.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.render_track_cell``) when it is built; this
+    pure-Python composition is the fallback otherwise.
+    """
+    if not text:
+        return text
+    return isolate_bidi(reorder_rtl_line(text))
+
+
+def render_bar_cell(text: str, width: int) -> str:
+    """Format one playback-bar fragment: gated reorder, truncate, isolate.
+
+    The fused ``isolate_bidi(truncate(reorder_rtl_line(text), width))``
+    chain — the title/artist/album fragments ``_TrackInfo.render``
+    displays. The steps run in the chain's own order: the gated
+    reorder, the truncation of the REORDERED fragment (``width < 1``
+    answers the empty string), then the isolate — applied after the
+    truncate so the closing PDI is never cut off by the width budget.
+    Falsy input passes through untouched, exactly like the native
+    wrapper's gate.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.render_bar_cell``) when it is built; this
+    pure-Python composition is the fallback otherwise.
+    """
+    if not text:
+        return text
+    from ytm_player.utils.formatting import truncate
+
+    return isolate_bidi(truncate(reorder_rtl_line(text), width))
+
+
+def render_lyric_line(text: str, width: int) -> str:
+    """Format one lyric line: gated multi-line wrap, then isolate.
+
+    The fused ``isolate_bidi(wrap_rtl_line(text, width))`` chain — the
+    lines ``_build_synced_view`` and ``_build_unsynced_view`` render.
+    The wrap keeps its ``bidi_mode`` and no-RTL gates (pure-LTR lines
+    pass through unwrapped); the isolate then wraps RTL lines — one
+    FSI...PDI pair bracketing the whole (possibly multi-line) result.
+    Falsy input passes through untouched, exactly like the native
+    wrapper's gate.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.render_lyric_line``) when it is built; this
+    pure-Python composition is the fallback otherwise.
+    """
+    if not text:
+        return text
+    return isolate_bidi(wrap_rtl_line(text, width))
+
+
 # ── Native (Rust/PyO3) implementation, if available ──────────────────────
 # The Rust extension implements the same functions; these bindings override
 # the pure-Python definitions above when the extension is importable.
@@ -263,6 +335,15 @@ try:
     )
     from ._ytm_player_native import (
         isolate_bidi as _native_isolate_bidi,
+    )
+    from ._ytm_player_native import (
+        render_bar_cell as _native_render_bar_cell,
+    )
+    from ._ytm_player_native import (
+        render_lyric_line as _native_render_lyric_line,
+    )
+    from ._ytm_player_native import (
+        render_track_cell as _native_render_track_cell,
     )
     from ._ytm_player_native import (
         reorder_line as _native_reorder_line,
@@ -303,3 +384,39 @@ else:
         if not text:
             return text
         return _native_wrap_rtl_line(text, width, _get_reorder_enabled())
+
+    def render_track_cell(text: str) -> str:  # noqa: F811
+        """Format one track-table cell: gated reorder, then isolate (native).
+
+        The falsy passthrough aside, the reorder gates, the UAX #9
+        word-level reversal and the FSI...PDI isolate wrap all run
+        inside one native call; only the cached settings read stays
+        here.
+        """
+        if not text:
+            return text
+        return _native_render_track_cell(text, _get_reorder_enabled())
+
+    def render_bar_cell(text: str, width: int) -> str:  # noqa: F811
+        """Format one playback-bar fragment (native).
+
+        The falsy passthrough aside, the reorder gates, the truncation
+        of the reordered fragment and the FSI...PDI isolate wrap all
+        run inside one native call; only the cached settings read
+        stays here.
+        """
+        if not text:
+            return text
+        return _native_render_bar_cell(text, width, _get_reorder_enabled())
+
+    def render_lyric_line(text: str, width: int) -> str:  # noqa: F811
+        """Format one lyric line: gated wrap, then isolate (native).
+
+        The falsy passthrough aside, the wrap gates, the word wrap, the
+        per-line reorder join and the FSI...PDI isolate wrap all run
+        inside one native call; only the cached settings read stays
+        here.
+        """
+        if not text:
+            return text
+        return _native_render_lyric_line(text, width, _get_reorder_enabled())

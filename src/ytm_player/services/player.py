@@ -5,14 +5,16 @@ The wrapper's glue code is dual-implemented: the libmpv discovery walk
 fallback find), the end-file verdict ``_end_file_verdict`` (the
 event-matching gate behind ``_end_file_data``), the seek clamp
 ``_clamp_seek`` (the ``[0, duration]`` target clamp behind
-``_clamp_seek_target``), the position throttle ``_position_due`` (the
-0.4 s gate behind ``_on_time_pos_change``) and the command gate
-``_command_current`` (the supersession predicate behind ``_dispatch``'s
-still-current check and ``_finish_load``'s acceptance check). All are
-implemented by the Rust extension
+``_clamp_seek_target``), the volume clamp ``_clamp_volume`` (the
+``[0, 100]`` level gate behind ``set_volume``), the position throttle
+``_position_due`` (the 0.4 s gate behind ``_on_time_pos_change``) and
+the command gate ``_command_current`` (the supersession predicate
+behind ``_dispatch``'s still-current check and ``_finish_load``'s
+acceptance check). All are implemented by the Rust extension
 (``_ytm_player_native.player_find_libmpv`` /
 ``_ytm_player_native.player_end_file_verdict`` /
 ``_ytm_player_native.player_clamp_seek`` /
+``_ytm_player_native.player_clamp_volume`` /
 ``_ytm_player_native.player_position_due`` /
 ``_ytm_player_native.player_command_current``) when it is built and by
 the pure-Python transcriptions below otherwise; the locks, the
@@ -252,6 +254,22 @@ def _clamp_seek(target: Any, duration: Any) -> Any:
     if duration > 0:
         target = min(target, duration)
     return max(0.0, target)
+
+
+def _clamp_volume(level: Any) -> Any:
+    """The volume clamp behind ``Player.set_volume``.
+
+    Clamps *level* into ``[0, 100]``: negative levels answer ``0``,
+    levels above 100 answer ``100``, and boundary values pass through
+    — both ends through CPython's own ``min``/``max`` walks, so a
+    non-numeric level raises the comparison's own ``TypeError``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_clamp_volume``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The mpv
+    assignment and the VOLUME_CHANGE dispatch stay with the caller.
+    """
+    return max(0, min(100, level))
 
 
 def _position_due(last_dispatch: Any) -> Any:
@@ -829,8 +847,14 @@ class Player:
         await self.seek_absolute(0.0)
 
     async def set_volume(self, level: int) -> None:
-        """Set volume to a specific level (clamped to 0-100)."""
-        level = max(0, min(100, level))
+        """Set volume to a specific level (clamped to 0-100).
+
+        The clamp itself is resolved by the ``_clamp_volume`` engine
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise); the mpv write and the dispatch stay
+        here.
+        """
+        level = _clamp_volume(level)
         try:
             self._mpv.volume = level
         except mpv.ShutdownError:
@@ -910,6 +934,9 @@ try:
         player_clamp_seek as _native_player_clamp_seek,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_clamp_volume as _native_player_clamp_volume,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         player_command_current as _native_player_command_current,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -923,5 +950,6 @@ except ImportError:
 else:
     _end_file_verdict = _native_player_end_file_verdict  # type: ignore[assignment]
     _clamp_seek = _native_player_clamp_seek  # type: ignore[assignment]
+    _clamp_volume = _native_player_clamp_volume  # type: ignore[assignment]
     _position_due = _native_player_position_due  # type: ignore[assignment]
     _command_current = _native_player_command_current  # type: ignore[assignment]

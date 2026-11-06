@@ -903,6 +903,17 @@ _PARITY_CASES: list[tuple[int, str]] = [
         "q.add_multiple([t(f'v{i}') for i in range(5)]); q.play_random(); "
         "q.set_radio_tracks([t('v2'), t('r1'), t('r2')]); q.play_random()",
     ),
+    # The fused radio append's quirk pins: duplicates WITHIN the candidate
+    # batch pass (the dedup only consults the already-queued tracks), an
+    # all-duplicate batch is a full no-op (no generation bump), and an
+    # empty batch changes nothing.
+    (
+        0,
+        "q.add_multiple([t(f'v{i}') for i in range(3)]); g = q.generation; "
+        "q.set_radio_tracks([t('d1'), t('d1')]); "
+        "q.set_radio_tracks([t('v0'), t('v2')]); assert q.generation == g; "
+        "q.set_radio_tracks([]); q.jump_to(0)",
+    ),
     # clear bumps the generation; refill rebuilds the shuffle order.
     (
         3,
