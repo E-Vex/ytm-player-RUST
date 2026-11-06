@@ -1,4 +1,35 @@
-"""Async wrapper around ytmusicapi providing all YouTube Music functionality."""
+"""Async wrapper around ytmusicapi providing all YouTube Music functionality.
+
+The service's pure computation is dual-implemented: the
+mutation-failure classifier ``_classify_mutation_failure`` and the
+browse wrappers' cores — the watch-playlist kwargs assembly
+``_watch_playlist_kwargs``, the result-tracks extraction
+``_result_tracks``, the playlist-tracks gate ``_playlist_tracks``,
+the radio seed pool ``_radio_seed_pool``, the discovery source
+rotation ``_discovery_source_order``, the chart-shelf assembly
+``_chart_shelves`` and its round-robin shelf pick
+``_chart_shelf_index``, the playable filters
+``_discovery_playable_tracks`` / ``_chart_playable_tracks``, the
+explore new-releases extraction ``_explore_new_releases`` and the
+playlist sort-order lookup ``_playlist_order_params`` — are
+implemented by the Rust extension
+(``_ytm_player_native.classify_mutation_failure`` /
+``_ytm_player_native.ytm_watch_playlist_kwargs`` /
+``_ytm_player_native.ytm_result_tracks`` /
+``_ytm_player_native.ytm_playlist_tracks`` /
+``_ytm_player_native.ytm_radio_seed_pool`` /
+``_ytm_player_native.ytm_discovery_source_order`` /
+``_ytm_player_native.ytm_chart_shelves`` /
+``_ytm_player_native.ytm_chart_shelf_index`` /
+``_ytm_player_native.ytm_discovery_playable_tracks`` /
+``_ytm_player_native.ytm_chart_playable_tracks`` /
+``_ytm_player_native.ytm_explore_new_releases`` /
+``_ytm_player_native.ytm_playlist_order_params``) when it is built
+and by the pure-Python transcriptions below otherwise; the client
+construction and renewal, the ``asyncio.to_thread`` dispatch, the
+patch-window gate and the RNG-driven shuffle/sample stay Python-side
+in the service.
+"""
 
 from __future__ import annotations
 
@@ -187,6 +218,242 @@ def mutation_failure_suffix(kind: MutationResult) -> str:
     own action prefix and a sensible separator.
     """
     return _MUTATION_TOAST_SUFFIX.get(kind, "")
+
+
+def _watch_playlist_kwargs(
+    video_id: Any,
+    playlist_id: Any,
+    limit: Any,
+    radio: Any,
+) -> dict[str, Any]:
+    """The kwargs dict ``get_watch_playlist`` forwards to the client.
+
+    The pure core of the wrapper's call assembly: the conditional
+    members — ``limit`` always, ``videoId`` / ``playlistId`` only when
+    the caller passed them (an ``is None`` identity gate, so a falsy
+    but non-None id still travels) and ``radio`` only when truthy (the
+    literal ``True`` travels, never the flag object) — in the
+    reference's insertion order, every value passed through as the
+    object it is. The both-None early return stays in the wrapper, as
+    does the ``**`` unpacking at the call.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_watch_playlist_kwargs``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    kwargs: dict[str, Any] = {"limit": limit}
+    if video_id is not None:
+        kwargs["videoId"] = video_id
+    if playlist_id is not None:
+        kwargs["playlistId"] = playlist_id
+    if radio:
+        kwargs["radio"] = True
+    return kwargs
+
+
+def _result_tracks(result: Any) -> list[Any]:
+    """The ``tracks`` member of a watch / liked-songs payload.
+
+    The pure core of the tracks extraction ``get_liked_songs``,
+    ``get_watch_playlist``, ``get_radio``'s per-seed fetch,
+    ``get_playlist_radio`` and the discovery trending/liked mixes
+    share: the member read through the mapping's own ``get`` with a
+    fresh empty list as the default, over the subclass-aware
+    ``isinstance(result, dict)`` gate — a non-dict answers a fresh
+    empty list (never the input itself), a dict passes its ``tracks``
+    object through as it is.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_result_tracks``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return result.get("tracks", []) if isinstance(result, dict) else []
+
+
+def _playlist_tracks(playlist: Any) -> list[Any]:
+    """The ``tracks`` member of a playlist payload, list-gated.
+
+    The pure core of ``get_chart_shelf_tracks``'s extraction — the
+    stricter sibling of ``_result_tracks``: over the
+    ``isinstance(playlist, dict)`` gate the member is read through the
+    mapping's own ``get`` with a fresh empty list default, then the
+    reference's ``or []`` (a falsy member — ``None`` where the payload
+    carries the key's null shape — answers a fresh empty list), then
+    the ``isinstance(raw, list)`` gate: only a list passes through,
+    as the object it is; every other member shape — a dict, a string,
+    a generator — answers a fresh empty list.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_playlist_tracks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if isinstance(playlist, dict):
+        raw = playlist.get("tracks", []) or []
+        return raw if isinstance(raw, list) else []
+    return []
+
+
+def _radio_seed_pool(results: Any) -> list[Any]:
+    """The deduplicated pool of radio tracks across all seeds' fetches.
+
+    The pure core of ``get_radio``'s mix assembly: the per-seed result
+    lists (``asyncio.gather``'s output, walked through the iteration
+    protocol) each walked through the iteration protocol in turn, and
+    each track read its id through the mapping's own ``get`` —
+    ``videoId`` first, ``video_id`` with the fresh ``""`` default only
+    when the first read answers falsy (the reference's ``or`` — a
+    missing or falsy first key falls to the second, and only then is
+    the second call made) — and the track kept when that id is truthy
+    and not yet seen: first occurrence wins, the set's own
+    hash-then-identity-or-``==`` membership and add deciding, an
+    unhashable id raising the containment protocol's own
+    ``TypeError``. Kept tracks pass through as the objects they are,
+    in first-sight order; the shuffle, the limit trim and the
+    normalisation stay in the wrapper, next to the RNG state.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_radio_seed_pool``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    pool: list[Any] = []
+    seen_ids: set[Any] = set()
+    for tracks in results:
+        for track in tracks:
+            vid = track.get("videoId") or track.get("video_id", "")
+            if vid and vid not in seen_ids:
+                seen_ids.add(vid)
+                pool.append(track)
+    return pool
+
+
+def _discovery_source_order(last_source: Any) -> list[Any]:
+    """The six discovery sources' rotation order.
+
+    The pure core of ``get_discovery_mix``'s source cycling: the
+    ``(last % 6) + 1`` start (0 → 1 first, 5 → 6 first, 6 wraps to 1)
+    and the six-entry rotation that follows it — every operator
+    through CPython's own, so a non-int last source steers both
+    backends identically.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_discovery_source_order``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    total = 6
+    start = (last_source % total) + 1
+    return [(start + i - 1) % total + 1 for i in range(total)]
+
+
+def _chart_shelves(charts: Any) -> list[Any]:
+    """The chart shelves of a ``get_charts`` payload, key order kept.
+
+    The pure core of the discovery charts mix's shelf assembly: the
+    ``daily``, ``weekly`` and ``videos`` members read through the
+    mapping's own ``get`` — in that order, a missing member skipped —
+    each gated by the subclass-aware ``isinstance(arr, list)``, and
+    each survivor's items filtered by the ``isinstance(s, dict)`` gate
+    into the flat shelf list. The dict shelves pass through as the
+    objects they are; the payload is never mutated.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_chart_shelves``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    shelves: list[Any] = []
+    for key in ("daily", "weekly", "videos"):
+        arr = charts.get(key)
+        if isinstance(arr, list):
+            shelves.extend(s for s in arr if isinstance(s, dict))
+    return shelves
+
+
+def _chart_shelf_index(last_index: Any, shelf_count: Any) -> Any:
+    """The next chart shelf's position in the rotation.
+
+    The pure core of the discovery charts mix's shelf pick: the
+    ``(last + 1) % count`` round-robin step — every operator through
+    CPython's own, so a zero count raises the modulo's own
+    ``ZeroDivisionError`` exactly like the reference would (the mix
+    guards with ``if not shelves`` before it ever reaches the pick).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_chart_shelf_index``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return (last_index + 1) % shelf_count
+
+
+def _discovery_playable_tracks(items: Any) -> list[Any]:
+    """The playable track dicts of a discovery payload.
+
+    The pure core of the playable filter the trending, home, liked,
+    artist and history mixes run over their payloads: only dict items
+    (the subclass-aware ``isinstance`` gate) whose ``videoId`` member —
+    read through the mapping's own ``get`` — is truthy pass through,
+    as the objects they are, in the payload's order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_discovery_playable_tracks``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return [t for t in items if isinstance(t, dict) and t.get("videoId")]
+
+
+def _chart_playable_tracks(tracks: Any) -> list[Any]:
+    """The playable track dicts of a chart shelf's track list.
+
+    The charts mix's own playable filter — the two-key spelling the
+    chart shelves' mixed payload shapes need: only dict items (the
+    subclass-aware ``isinstance`` gate) pass whose id read —
+    ``videoId`` first through the mapping's own ``get``, ``video_id``
+    with the fresh ``""`` default only when the first read answers
+    falsy (the reference's ``or``) — is truthy. Kept tracks pass
+    through as the objects they are, in the list's order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_chart_playable_tracks``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return [t for t in tracks if isinstance(t, dict) and (t.get("videoId") or t.get("video_id"))]
+
+
+def _explore_new_releases(result: Any) -> list[Any]:
+    """The new-releases member of an explore payload.
+
+    The pure core of ``get_new_releases``: over the subclass-aware
+    ``isinstance(result, dict)`` gate the ``new_releases`` member is
+    read through the mapping's own ``get`` with a fresh empty list
+    default and passed through — as the list object it is — only when
+    the subclass-aware ``isinstance(releases, list)`` gate holds;
+    every other shape answers a fresh empty list.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_explore_new_releases``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if isinstance(result, dict):
+        releases = result.get("new_releases", [])
+        if isinstance(releases, list):
+            return releases
+    return []
+
+
+def _playlist_order_params(order: Any) -> Any:
+    """The sort-params token for a ``get_playlist`` order name.
+
+    The pure core of ``get_playlist``'s order resolution: the
+    ``order or ""`` truthiness gate (``None`` and every other falsy
+    spelling read as the default order) and the ``_ORDER_PARAMS``
+    table lookup — read from the service class at call time, so a
+    patched table steers both backends identically — answering the
+    a_to_z / z_to_a / recently_added browse ``params`` tokens, or
+    ``None`` for the playlist's server-side default.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_playlist_order_params``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return YTMusicService._ORDER_PARAMS.get(order or "")
 
 
 class YTMusicService:
@@ -466,7 +733,7 @@ class YTMusicService:
         """
         try:
             playlist = await self._call(self.client.get_liked_songs, timeout=timeout, limit=limit)
-            return playlist.get("tracks", []) if isinstance(playlist, dict) else []
+            return _result_tracks(playlist)
         except Exception:
             logger.exception("get_liked_songs failed")
             return None
@@ -520,11 +787,7 @@ class YTMusicService:
         """
         try:
             result = await self._call(self.client.get_explore)
-            if isinstance(result, dict):
-                releases = result.get("new_releases", [])
-                if isinstance(releases, list):
-                    return releases
-            return []
+            return _explore_new_releases(result)
         except Exception:
             logger.exception("get_new_releases failed")
             return None
@@ -589,7 +852,7 @@ class YTMusicService:
             timeout: Override the default API timeout (seconds).
         """
         try:
-            params = self._ORDER_PARAMS.get(order or "")
+            params = _playlist_order_params(order)
             if params:
                 client = self.client
                 try:
@@ -735,15 +998,9 @@ class YTMusicService:
         if video_id is None and playlist_id is None:
             return []
         try:
-            kwargs: dict[str, Any] = {"limit": limit}
-            if video_id is not None:
-                kwargs["videoId"] = video_id
-            if playlist_id is not None:
-                kwargs["playlistId"] = playlist_id
-            if radio:
-                kwargs["radio"] = True
+            kwargs = _watch_playlist_kwargs(video_id, playlist_id, limit, radio)
             result = await self._call(self.client.get_watch_playlist, **kwargs)
-            return result.get("tracks", []) if isinstance(result, dict) else []
+            return _result_tracks(result)
         except Exception:
             logger.exception(
                 "get_watch_playlist failed for video=%r playlist=%r",
@@ -765,10 +1022,7 @@ class YTMusicService:
         if playlist_id.startswith("OLAK5"):
             return await self.get_watch_playlist(playlist_id=playlist_id, limit=limit)
         playlist = await self.get_playlist(playlist_id, limit=limit)
-        if isinstance(playlist, dict):
-            raw = playlist.get("tracks", []) or []
-            return raw if isinstance(raw, list) else []
-        return []
+        return _playlist_tracks(playlist)
 
     async def get_radio(self, video_ids: str | list[str], limit: int = 25) -> list[dict]:
         """Fetch radio tracks from one or more seeds and return a deduplicated mix.
@@ -793,21 +1047,14 @@ class YTMusicService:
                 result = await self._call(
                     self.client.get_watch_playlist, videoId=video_id, radio=True, limit=limit
                 )
-                return result.get("tracks", []) if isinstance(result, dict) else []
+                return _result_tracks(result)
             except Exception:
                 logger.debug("get_radio: seed %r failed, skipping", video_id)
                 return []
 
         results = await asyncio.gather(*[_fetch_one(vid) for vid in video_ids])
 
-        pool: list[dict] = []
-        seen_ids: set[str] = set()
-        for tracks in results:
-            for track in tracks:
-                vid = track.get("videoId") or track.get("video_id", "")
-                if vid and vid not in seen_ids:
-                    seen_ids.add(vid)
-                    pool.append(track)
+        pool = _radio_seed_pool(results)
 
         # Single-seed callers (e.g., "Start Radio on this track") expect the seed
         # track to lead. Only shuffle when there are multiple seeds (refill, discovery).
@@ -824,23 +1071,17 @@ class YTMusicService:
         """
         import random
 
-        total = 6
-        start = (self._last_discovery_source % total) + 1
-        sources = [(start + i - 1) % total + 1 for i in range(total)]
+        sources = _discovery_source_order(self._last_discovery_source)
 
         async def _charts_mix() -> tuple[list[dict], str]:
             from ytm_player.config.settings import get_settings
 
             region = get_settings().ui.region
             charts = await self._call(self.client.get_charts, country=region)
-            shelves: list[dict] = []
-            for key in ("daily", "weekly", "videos"):
-                arr = charts.get(key)
-                if isinstance(arr, list):
-                    shelves.extend(s for s in arr if isinstance(s, dict))
+            shelves = _chart_shelves(charts)
             if not shelves:
                 return [], ""
-            idx = (self._last_chart_shelf + 1) % len(shelves)
+            idx = _chart_shelf_index(self._last_chart_shelf, len(shelves))
             self._last_chart_shelf = idx
             shelf = shelves[idx]
             playlist_id = shelf.get("playlistId", "")
@@ -850,9 +1091,7 @@ class YTMusicService:
             if not playlist_id:
                 return [], ""
             tracks = await self.get_chart_shelf_tracks(playlist_id)
-            playable = [
-                t for t in tracks if isinstance(t, dict) and (t.get("videoId") or t.get("video_id"))
-            ]
+            playable = _chart_playable_tracks(tracks)
             if not playable:
                 return [], ""
             sampled = random.sample(playable, min(3, len(playable)))
@@ -866,8 +1105,8 @@ class YTMusicService:
             wl = await self._call(
                 self.client.get_watch_playlist, playlistId=playlist_id, shuffle=True
             )
-            items = wl.get("tracks", []) if isinstance(wl, dict) else []
-            playable = [t for t in items if isinstance(t, dict) and t.get("videoId")]
+            items = _result_tracks(wl)
+            playable = _discovery_playable_tracks(items)
             if not playable:
                 return [], ""
             sampled = random.sample(playable, min(3, len(playable)))
@@ -878,7 +1117,7 @@ class YTMusicService:
             all_playable: list[dict] = []
             for shelf in shelves:
                 items = shelf.get("contents", []) if isinstance(shelf, dict) else []
-                all_playable.extend(i for i in items if isinstance(i, dict) and i.get("videoId"))
+                all_playable.extend(_discovery_playable_tracks(items))
             if not all_playable:
                 return [], ""
             sampled = random.sample(all_playable, min(3, len(all_playable)))
@@ -886,8 +1125,8 @@ class YTMusicService:
 
         async def _liked_songs_mix() -> tuple[list[dict], str]:
             liked = await self._call(self.client.get_liked_songs, limit=50)
-            items = liked.get("tracks", []) if isinstance(liked, dict) else []
-            playable = [t for t in items if isinstance(t, dict) and t.get("videoId")]
+            items = _result_tracks(liked)
+            playable = _discovery_playable_tracks(items)
             if not playable:
                 return [], ""
             sampled = random.sample(playable, min(3, len(playable)))
@@ -904,7 +1143,7 @@ class YTMusicService:
             artist_data = await self._call(self.client.get_artist, channel_id)
             songs = artist_data.get("songs", {})
             results = songs.get("results", []) if isinstance(songs, dict) else []
-            playable = [t for t in results if isinstance(t, dict) and t.get("videoId")]
+            playable = _discovery_playable_tracks(results)
             if not playable:
                 return [], ""
             sampled = random.sample(playable, min(3, len(playable)))
@@ -915,7 +1154,7 @@ class YTMusicService:
             history = await self._call(self.client.get_history)
             if not history:
                 return [], ""
-            playable = [t for t in history if isinstance(t, dict) and t.get("videoId")]
+            playable = _discovery_playable_tracks(history)
             if not playable:
                 return [], ""
             recent = playable[:20]
@@ -954,7 +1193,7 @@ class YTMusicService:
         except Exception:
             logger.exception("Playlist radio failed for %s", playlist_id)
             return []
-        tracks = result.get("tracks", []) if isinstance(result, dict) else []
+        tracks = _result_tracks(result)
         if not tracks:
             logger.warning("Playlist radio returned no tracks for %s", playlist_id)
         return tracks
@@ -1289,3 +1528,59 @@ class YTMusicService:
             logger.exception("add_history_item failed for %r", video_id)
             return False
         return getattr(resp, "status_code", None) == 204
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_chart_playable_tracks as _native_chart_playable_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_chart_shelf_index as _native_chart_shelf_index,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_chart_shelves as _native_chart_shelves,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_discovery_playable_tracks as _native_discovery_playable_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_discovery_source_order as _native_discovery_source_order,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_explore_new_releases as _native_explore_new_releases,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_playlist_order_params as _native_playlist_order_params,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_playlist_tracks as _native_playlist_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_radio_seed_pool as _native_radio_seed_pool,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_result_tracks as _native_result_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_watch_playlist_kwargs as _native_watch_playlist_kwargs,
+    )
+except ImportError:
+    pass
+else:
+    _watch_playlist_kwargs = _native_watch_playlist_kwargs  # type: ignore[assignment]
+    _result_tracks = _native_result_tracks  # type: ignore[assignment]
+    _playlist_tracks = _native_playlist_tracks  # type: ignore[assignment]
+    _radio_seed_pool = _native_radio_seed_pool  # type: ignore[assignment]
+    _discovery_source_order = _native_discovery_source_order  # type: ignore[assignment]
+    _chart_shelves = _native_chart_shelves  # type: ignore[assignment]
+    _chart_shelf_index = _native_chart_shelf_index  # type: ignore[assignment]
+    _discovery_playable_tracks = _native_discovery_playable_tracks  # type: ignore[assignment]
+    _chart_playable_tracks = _native_chart_playable_tracks  # type: ignore[assignment]
+    _explore_new_releases = _native_explore_new_releases  # type: ignore[assignment]
+    _playlist_order_params = _native_playlist_order_params  # type: ignore[assignment]

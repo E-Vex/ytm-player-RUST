@@ -554,6 +554,35 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // values included) deciding auth_expired from server_error.
     module.add_function(pyo3::wrap_pyfunction!(classify_mutation_failure, module)?)?;
 
+    // YTMusic browse-wrapper engines (services/ytmusic.py equivalents):
+    // the read wrappers' pure cores — the watch-playlist kwargs
+    // assembly behind get_watch_playlist, the tracks extraction the
+    // liked-songs / watch-playlist / radio-fetch / playlist-radio and
+    // trending/liked-mix sites share, the list-gated playlist-tracks
+    // extraction behind get_chart_shelf_tracks, the deduplicated radio
+    // seed pool behind get_radio, the six-source rotation behind
+    // get_discovery_mix, the chart-shelf assembly and its round-robin
+    // shelf pick behind the charts mix, the two playable filters
+    // behind the discovery mixes, the explore new-releases extraction
+    // behind get_new_releases, and the sort-order params lookup
+    // behind get_playlist — with the client calls, the patch-window
+    // gate, the renewal machinery and the RNG-driven shuffle/sample
+    // staying Python-side in the service.
+    module.add_function(pyo3::wrap_pyfunction!(ytm_watch_playlist_kwargs, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_result_tracks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_playlist_tracks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_radio_seed_pool, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_discovery_source_order, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_chart_shelves, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_chart_shelf_index, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ytm_discovery_playable_tracks,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_chart_playable_tracks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_explore_new_releases, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_playlist_order_params, module)?)?;
+
     // Playback-bar track-info width engine (ui/playback_bar.py
     // equivalent): the halves-and-thirds width split behind the
     // one-line title/artist/album render — the max(10, width - 30)
@@ -11711,6 +11740,360 @@ fn classify_mutation_failure(py: Python, exc: &Bound<'_, PyAny>) -> PyResult<&'s
     }
     // The reference's unreachable-in-practice safety default.
     Ok("server_error")
+}
+
+// ── YTMusic browse-wrapper engines (services/ytmusic.py) ───────────────
+
+/// The kwargs dict behind `YTMusicService.get_watch_playlist` — the
+/// pure core of the wrapper's call assembly from `services/ytmusic.py`.
+///
+/// Mirrors the pure-Python reference (`_watch_playlist_kwargs`): the
+/// conditional members in the reference's insertion order — `limit`
+/// always; `videoId` / `playlistId` only when the caller passed them,
+/// the gate an `is None` identity check (a falsy but non-None id still
+/// travels); `radio` only when truthy, and the literal `True` travels,
+/// never the flag object. Every value passes through as the object it
+/// is; the both-None early return and the `**` unpacking stay
+/// Python-side in the wrapper.
+#[pyfunction]
+#[pyo3(signature = (video_id, playlist_id, limit, radio))]
+fn ytm_watch_playlist_kwargs<'py>(
+    py: Python<'py>,
+    video_id: &Bound<'py, PyAny>,
+    playlist_id: &Bound<'py, PyAny>,
+    limit: &Bound<'py, PyAny>,
+    radio: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("limit", limit)?;
+    if !video_id.is_none() {
+        kwargs.set_item("videoId", video_id)?;
+    }
+    if !playlist_id.is_none() {
+        kwargs.set_item("playlistId", playlist_id)?;
+    }
+    if radio.is_truthy()? {
+        kwargs.set_item("radio", true)?;
+    }
+    Ok(kwargs)
+}
+
+/// The `tracks` member of a watch / liked-songs payload — the pure
+/// core of the tracks extraction `get_liked_songs`,
+/// `get_watch_playlist`, `get_radio`'s per-seed fetch,
+/// `get_playlist_radio` and the discovery trending/liked mixes share
+/// (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_result_tracks`): over the
+/// subclass-aware `isinstance(result, dict)` gate the member is read
+/// through the mapping's own `get` with a fresh empty list as the
+/// default (the default list built every call, exactly like the
+/// reference's literal); a non-dict answers a fresh empty list,
+/// never the input itself, and a dict passes its `tracks` object
+/// through as the object it is.
+#[pyfunction]
+#[pyo3(signature = (result))]
+fn ytm_result_tracks<'py>(result: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = result.py();
+    if result.is_instance_of::<PyDict>() {
+        let default = PyList::empty(py).into_any();
+        return result.getattr("get")?.call(("tracks", default), None);
+    }
+    Ok(PyList::empty(py).into_any())
+}
+
+/// The `tracks` member of a playlist payload, list-gated — the pure
+/// core of `get_chart_shelf_tracks`'s extraction
+/// (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_playlist_tracks`): over the
+/// subclass-aware `isinstance(playlist, dict)` gate the member is read
+/// through the mapping's own `get` with a fresh empty list default,
+/// then the reference's `or []` (a falsy member — `None` where the
+/// payload carries the key's null shape — answers a fresh empty
+/// list), then the subclass-aware `isinstance(raw, list)` gate: only
+/// a list passes through, as the object it is; every other member
+/// shape — a dict, a string, a generator — answers a fresh empty
+/// list.
+#[pyfunction]
+#[pyo3(signature = (playlist))]
+fn ytm_playlist_tracks<'py>(playlist: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let py = playlist.py();
+    if playlist.is_instance_of::<PyDict>() {
+        let default = PyList::empty(py).into_any();
+        let raw = playlist.getattr("get")?.call(("tracks", default), None)?;
+        let raw = if raw.is_truthy()? {
+            raw
+        } else {
+            PyList::empty(py).into_any()
+        };
+        if raw.is_instance_of::<PyList>() {
+            return Ok(raw);
+        }
+    }
+    Ok(PyList::empty(py).into_any())
+}
+
+/// The deduplicated pool of radio tracks across all seeds' fetches —
+/// the pure core of `YTMusicService.get_radio`'s mix assembly
+/// (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_radio_seed_pool`): the
+/// per-seed result lists walked through Python's iteration protocol
+/// (a non-iterable raises CPython's own `TypeError`; an `__iter__`
+/// that itself raises keeps its own error), each list walked in
+/// turn, and each track read its id through the mapping's own `get`
+/// — `videoId` first, `video_id` with the fresh `""` default only
+/// when the first read answers falsy (the reference's `or`, so the
+/// second attribute lookup and call happen only then; a track
+/// without a `get` attribute raises the attribute protocol's own
+/// `AttributeError` at exactly the lookup the reference would have
+/// made) — and the track kept when that id is truthy and not yet
+/// seen: the set's own containment and add — the id hashed first
+/// (an unhashable id raises the hash protocol's own `TypeError`),
+/// the identity-or-`==` probe deciding membership, the FIRST of
+/// equal ids the one that keeps its track. Kept tracks pass through
+/// as the objects they are, in first-sight order; the shuffle, the
+/// limit trim and the normalisation stay Python-side in the wrapper,
+/// next to the RNG state.
+#[pyfunction]
+#[pyo3(signature = (results))]
+fn ytm_radio_seed_pool<'py>(
+    py: Python<'py>,
+    results: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let pool = PyList::empty(py);
+    let seen = PySet::empty(py)?;
+    for tracks in results.try_iter()? {
+        for track in tracks?.try_iter()? {
+            let track = track?;
+            let first = track.getattr("get")?.call1(("videoId",))?;
+            let vid = if first.is_truthy()? {
+                first
+            } else {
+                track.getattr("get")?.call(("video_id", ""), None)?
+            };
+            // if vid and vid not in seen_ids — the truthiness gate
+            // first, the containment (and its hash) only behind it.
+            if vid.is_truthy()? && !seen.contains(&vid)? {
+                seen.add(&vid)?;
+                pool.append(track)?;
+            }
+        }
+    }
+    Ok(pool)
+}
+
+/// The six discovery sources' rotation order — the pure core of
+/// `YTMusicService.get_discovery_mix`'s source cycling
+/// (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_discovery_source_order`):
+/// the `(last % 6) + 1` start (0 → 1 first, 5 → 6 first, 6 wraps to
+/// 1) and the six-entry rotation that follows it —
+/// `(start + i - 1) % 6 + 1` for `i` over `range(6)`, left-associative
+/// exactly like the reference spells it — every operator through
+/// CPython's own, so a non-int last source (a float, a bool) steers
+/// both backends identically.
+#[pyfunction]
+#[pyo3(signature = (last_source))]
+fn ytm_discovery_source_order<'py>(
+    py: Python<'py>,
+    last_source: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let six = 6i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let start = last_source.rem(&six)?.add(&one)?;
+    let out = PyList::empty(py);
+    for i in 0i64..6 {
+        let i = i
+            .into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any();
+        out.append(start.add(&i)?.sub(&one)?.rem(&six)?.add(&one)?)?;
+    }
+    Ok(out)
+}
+
+/// The chart shelves of a `get_charts` payload — the pure core of the
+/// discovery charts mix's shelf assembly (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_chart_shelves`): the `daily`,
+/// `weekly` and `videos` members read through the mapping's own `get`
+/// — one lookup per key, in that order, a missing member skipped —
+/// each gated by the subclass-aware `isinstance(arr, list)`, and each
+/// survivor's items filtered by the subclass-aware
+/// `isinstance(s, dict)` into the flat shelf list. The dict shelves
+/// pass through as the objects they are; the payload is never
+/// mutated.
+#[pyfunction]
+#[pyo3(signature = (charts))]
+fn ytm_chart_shelves<'py>(
+    py: Python<'py>,
+    charts: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let shelves = PyList::empty(py);
+    for key in ["daily", "weekly", "videos"] {
+        let arr = charts.getattr("get")?.call1((key,))?;
+        if arr.is_instance_of::<PyList>() {
+            for s in arr.try_iter()? {
+                let s = s?;
+                if s.is_instance_of::<PyDict>() {
+                    shelves.append(s)?;
+                }
+            }
+        }
+    }
+    Ok(shelves)
+}
+
+/// The next chart shelf's position in the rotation — the pure core of
+/// the discovery charts mix's shelf pick (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_chart_shelf_index`): the
+/// `(last + 1) % count` round-robin step, both operators through
+/// CPython's own — so a zero count raises the modulo's own
+/// `ZeroDivisionError` exactly like the reference would (the mix
+/// guards with `if not shelves` before it ever reaches the pick).
+#[pyfunction]
+#[pyo3(signature = (last_index, shelf_count))]
+fn ytm_chart_shelf_index<'py>(
+    py: Python<'py>,
+    last_index: &Bound<'py, PyAny>,
+    shelf_count: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    last_index.add(&one)?.rem(shelf_count)
+}
+
+/// The playable track dicts of a discovery payload — the pure core of
+/// the playable filter the trending, home, liked, artist and history
+/// mixes run over their payloads (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_discovery_playable_tracks`):
+/// *items* walked through Python's iteration protocol, and only dict
+/// items (the subclass-aware `isinstance` gate, short-circuited
+/// before any `get` call exactly like the reference's `and`) whose
+/// `videoId` member — read through the mapping's own `get` — is
+/// truthy pass through, as the objects they are, in the payload's
+/// order. The input is never mutated.
+#[pyfunction]
+#[pyo3(signature = (items))]
+fn ytm_discovery_playable_tracks<'py>(
+    py: Python<'py>,
+    items: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for t in items.try_iter()? {
+        let t = t?;
+        if t.is_instance_of::<PyDict>() && t.getattr("get")?.call1(("videoId",))?.is_truthy()? {
+            out.append(t)?;
+        }
+    }
+    Ok(out)
+}
+
+/// The playable track dicts of a chart shelf's track list — the
+/// charts mix's own playable filter, the two-key spelling the chart
+/// shelves' mixed payload shapes need (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_chart_playable_tracks`):
+/// *tracks* walked through Python's iteration protocol, and only
+/// dict items (the subclass-aware `isinstance` gate) pass whose id
+/// read — `videoId` first through the mapping's own `get`,
+/// `video_id` with the fresh `""` default only when the first read
+/// answers falsy (the reference's `or`) — is truthy. Kept tracks
+/// pass through as the objects they are, in the list's order.
+#[pyfunction]
+#[pyo3(signature = (tracks))]
+fn ytm_chart_playable_tracks<'py>(
+    py: Python<'py>,
+    tracks: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let out = PyList::empty(py);
+    for t in tracks.try_iter()? {
+        let t = t?;
+        if t.is_instance_of::<PyDict>() {
+            let first = t.getattr("get")?.call1(("videoId",))?;
+            let vid = if first.is_truthy()? {
+                first
+            } else {
+                t.getattr("get")?.call(("video_id", ""), None)?
+            };
+            if vid.is_truthy()? {
+                out.append(t)?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The new-releases member of an explore payload — the pure core of
+/// `YTMusicService.get_new_releases` (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_explore_new_releases`): over
+/// the subclass-aware `isinstance(result, dict)` gate the
+/// `new_releases` member is read through the mapping's own `get`
+/// with a fresh empty list default and passed through — as the list
+/// object it is — only when the subclass-aware
+/// `isinstance(releases, list)` gate holds; every other shape
+/// answers a fresh empty list.
+#[pyfunction]
+#[pyo3(signature = (result))]
+fn ytm_explore_new_releases<'py>(
+    py: Python<'py>,
+    result: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if result.is_instance_of::<PyDict>() {
+        let default = PyList::empty(py).into_any();
+        let releases = result
+            .getattr("get")?
+            .call(("new_releases", default), None)?;
+        if releases.is_instance_of::<PyList>() {
+            return Ok(releases);
+        }
+    }
+    Ok(PyList::empty(py).into_any())
+}
+
+/// The sort-params token for a `get_playlist` order name — the pure
+/// core of `YTMusicService.get_playlist`'s order resolution
+/// (`services/ytmusic.py`).
+///
+/// Mirrors the pure-Python reference (`_playlist_order_params`): the
+/// `order or ""` truthiness gate (`None` and every other falsy
+/// spelling read as the default order) and the `_ORDER_PARAMS`
+/// table lookup — the table read from the service class at call time
+/// (see `YTMusicService._ORDER_PARAMS`), so a patched table steers
+/// both backends identically — answering the a_to_z / z_to_a /
+/// recently_added browse `params` tokens, or `None` for the
+/// playlist's server-side default. The ordered-fetch patch window
+/// and the renewal machinery stay Python-side in the wrapper.
+#[pyfunction]
+#[pyo3(signature = (order))]
+fn ytm_playlist_order_params<'py>(
+    py: Python<'py>,
+    order: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let table = py
+        .import("ytm_player.services.ytmusic")?
+        .getattr("YTMusicService")?
+        .getattr("_ORDER_PARAMS")?;
+    let key = if order.is_truthy()? {
+        order.clone()
+    } else {
+        PyString::new(py, "").into_any()
+    };
+    table.getattr("get")?.call1((key,))
 }
 
 // ── Playback-bar track-info width engine ───────────────────────────────
