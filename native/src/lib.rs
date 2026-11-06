@@ -636,6 +636,18 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(ytm_renewal_cooldown_stamp, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(ytm_api_failure_step, module)?)?;
 
+    // YTMusic patch-window bookkeeping engines (services/ytmusic.py
+    // equivalents): the in-flight counter's admission and release
+    // steps behind _call's gate — the += 1 that admits a normal
+    // client call past the patch-window protocol's wait, and the -= 1
+    // with its drained verdict that releases it, the verdict naming
+    // whether the counter reached zero so the caller sets the
+    // _no_inflight event a parked patch window waits on — with the
+    // _no_patch wait, the event clear/set and the counter assignments
+    // staying Python-side in the service.
+    module.add_function(pyo3::wrap_pyfunction!(ytm_patch_window_enter, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_patch_window_exit, module)?)?;
+
     // YTMusic browse-wrapper engines (services/ytmusic.py equivalents):
     // the read wrappers' pure cores — the watch-playlist kwargs
     // assembly behind get_watch_playlist, the tracks extraction the
@@ -12739,6 +12751,65 @@ fn ytm_api_failure_step<'py>(
         .getattr("_MAX_API_FAILURES_BEFORE_REINIT")?;
     let due = bumped.ge(&threshold)?;
     Ok((bumped, due))
+}
+
+/// The patch-window enter step — `services/ytmusic.py`'s `_call` gate
+/// arm, the admission half of the in-flight bookkeeping that keeps
+/// every normal client call out of a `get_playlist(order=...)` patch
+/// window's way.
+///
+/// Mirrors the reference's single expression exactly: the counter's
+/// `+= 1` through CPython's own `+` (its `__add__` protocol — a
+/// non-numeric count raises the operator's own `TypeError`). The
+/// bumped count is the very object the addition produced, for the
+/// caller's own `_inflight` assignment; the assignment itself and
+/// the `_no_inflight` clear that follows it stay Python-side in the
+/// caller, exactly at the reference's own points.
+#[pyfunction]
+#[pyo3(signature = (inflight))]
+fn ytm_patch_window_enter<'py>(
+    py: Python<'py>,
+    inflight: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    inflight.add(&one)
+}
+
+/// The patch-window exit step — `services/ytmusic.py`'s `_call`
+/// finally arm, the release half of the in-flight bookkeeping: a call
+/// leaving the gate counts itself out, and the drained verdict names
+/// whether the counter reached zero — the moment the caller sets
+/// `_no_inflight` so a patch window parked on it can open.
+///
+/// Mirrors the reference's two expressions exactly: the counter's
+/// `-= 1` through CPython's own `-` (its `__sub__` protocol — a
+/// non-numeric count raises the operator's own `TypeError`), then
+/// the `== 0` verdict through CPython's own comparison. The answer
+/// is the (left, drained) pair — *left* the very object the
+/// subtraction produced, for the caller's own `_inflight`
+/// assignment — with the assignment, the `_no_inflight` set and the
+/// zombie-worker limitation note staying Python-side in the caller,
+/// at the reference's own points.
+#[pyfunction]
+#[pyo3(signature = (inflight))]
+fn ytm_patch_window_exit<'py>(
+    py: Python<'py>,
+    inflight: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let left = inflight.sub(&one)?;
+    let zero = 0i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let drained = left.eq(&zero)?;
+    Ok((left, drained))
 }
 
 // ── YTMusic browse-wrapper engines (services/ytmusic.py) ───────────────

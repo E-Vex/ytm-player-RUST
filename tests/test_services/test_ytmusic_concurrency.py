@@ -4,17 +4,36 @@ The get_playlist(order=...) path monkey-patches client._send_request to
 inject sort params.  Two concurrent calls would stack patches and fail to
 fully restore the original — meaning a third call could see a stale
 patched _send_request.
+
+The patch-window bookkeeping engines — the in-flight counter's admission
+(``_patch_window_enter``) and release (``_patch_window_exit``) steps behind
+``_call``'s gate and finally arms — are unit-tested on whichever backend is
+loaded, wired through ``_call`` itself, and (when the Rust extension is
+built) compared against the pure-Python references run in a child
+interpreter with the extension import blocked, error shapes included, so
+the two implementations cannot drift.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
+import sys
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tests.conftest import make_ytmusic_service
+from ytm_player.services.ytmusic import _patch_window_enter, _patch_window_exit
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
 
 
 @pytest.fixture
@@ -160,3 +179,206 @@ class TestPatchWindowIsolation:
         assert normal_bodies == [{"browseId": "NORMAL"}], (
             "patch window opened while a normal call was in flight"
         )
+
+
+# ── The patch-window bookkeeping engines ──────────────────────────────
+
+
+class TestPatchWindowBookkeeping:
+    """The in-flight admission/release engines behind ``_call``'s gate,
+    on whichever backend is loaded."""
+
+    def test_enter_bumps_the_count(self):
+        assert _patch_window_enter(0) == 1
+        assert _patch_window_enter(1) == 2
+        assert _patch_window_enter(5) == 6
+
+    def test_exit_steps_down_without_draining_above_zero(self):
+        assert _patch_window_exit(3) == (2, False)
+        assert _patch_window_exit(2) == (1, False)
+
+    def test_exit_at_one_drains(self):
+        assert _patch_window_exit(1) == (0, True)
+
+    def test_exit_below_zero_keeps_counting(self):
+        # The reference has no floor: a stray exit below zero keeps
+        # subtracting (and never names the drain) — pinned so the
+        # engines cannot silently add a clamp.
+        assert _patch_window_exit(0) == (-1, False)
+        assert _patch_window_exit(-1) == (-2, False)
+
+    def test_the_bump_is_cpythons_own_addition(self):
+        assert _patch_window_enter(2.5) == 3.5
+        assert _patch_window_enter(True) == 2
+        assert _patch_window_enter(False) == 1
+        assert _patch_window_enter(-1) == 0
+        assert _patch_window_enter(10**20) == 10**20 + 1
+
+    def test_the_step_is_cpythons_own_subtraction(self):
+        assert _patch_window_exit(2.5) == (1.5, False)
+        assert _patch_window_exit(1.5) == (0.5, False)
+        assert _patch_window_exit(True) == (0, True)
+        assert _patch_window_exit(False) == (-1, False)
+        assert _patch_window_exit(10**20) == (10**20 - 1, False)
+
+    def test_non_numeric_counts_raise_the_operators_own_type_error(self):
+        with pytest.raises(TypeError, match="unsupported operand type"):
+            _patch_window_enter(None)
+        with pytest.raises(TypeError, match="unsupported operand type"):
+            _patch_window_exit(None)
+        with pytest.raises(TypeError, match="unsupported operand type"):
+            _patch_window_exit("2")
+        with pytest.raises(TypeError, match="can only concatenate"):
+            _patch_window_enter("2")
+        with pytest.raises(TypeError, match="can only concatenate"):
+            _patch_window_enter([1])
+
+
+class TestCallInflightBookkeeping:
+    """The engines wired through ``_call`` itself: a call counts itself
+    in at the gate and out in the finally, and the event that parks a
+    patch window sets only when the last concurrent call drains."""
+
+    async def test_a_call_counts_itself_in_and_out(self, ytmusic_service):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_normal():
+            assert ytmusic_service._inflight == 1
+            assert not ytmusic_service._no_inflight.is_set()
+            started.set()
+            release.wait(timeout=5)
+            return 42
+
+        task = asyncio.create_task(ytmusic_service._call(slow_normal))
+        await asyncio.to_thread(started.wait, 5)
+        assert ytmusic_service._inflight == 1
+        assert not ytmusic_service._no_inflight.is_set()
+        release.set()
+        assert await task == 42
+        assert ytmusic_service._inflight == 0
+        assert ytmusic_service._no_inflight.is_set()
+
+    async def test_a_failing_call_still_counts_itself_out(self, ytmusic_service):
+        def boom():
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await ytmusic_service._call(boom)
+        assert ytmusic_service._inflight == 0
+        assert ytmusic_service._no_inflight.is_set()
+
+    async def test_the_event_sets_only_when_the_last_call_drains(self, ytmusic_service):
+        entered = [threading.Event(), threading.Event()]
+        release = threading.Event()
+
+        def make_call(tag):
+            def run():
+                entered[tag].set()
+                release.wait(timeout=5)
+                return tag
+
+            return run
+
+        first = asyncio.create_task(ytmusic_service._call(make_call(0)))
+        second = asyncio.create_task(ytmusic_service._call(make_call(1)))
+        await asyncio.to_thread(entered[0].wait, 5)
+        await asyncio.to_thread(entered[1].wait, 5)
+        assert ytmusic_service._inflight == 2
+        assert not ytmusic_service._no_inflight.is_set()
+        release.set()
+        results = await asyncio.gather(first, second)
+        assert sorted(results) == [0, 1]
+        # Whichever call left first stepped down to 1 without setting
+        # the event; only the last one's exit drained to zero.
+        assert ytmusic_service._inflight == 0
+        assert ytmusic_service._no_inflight.is_set()
+
+
+# ── native vs fallback parity ─────────────────────────────────────────
+
+# Each case travels over a JSON bridge to a child interpreter with the
+# extension import blocked; the engines are pure arithmetic over their
+# single argument, so the cases span the numeric shapes (int, float,
+# bool, BigInt, negative), the drained boundary, and the non-numeric
+# shapes whose TypeError messages the operators themselves spell.
+_PARITY_CASES = {
+    "enter": [0, 1, 2, 5, -1, 2.5, True, False, 10**20, "2", None, [1]],
+    "exit": [3, 1, 0, 2, -1, 2.5, 1.5, True, False, 10**20, "2", None, [1]],
+}
+
+
+def _outcome(name, arg):
+    """One case's outcome on whichever backend this interpreter loaded."""
+    try:
+        if name == "enter":
+            result = _patch_window_enter(arg)
+        elif name == "exit":
+            result = _patch_window_exit(arg)
+        else:
+            raise AssertionError(name)
+    except BaseException as exc:  # noqa: BLE001 - repr'd for comparison
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if isinstance(result, tuple):
+        return {"ok": list(result)}
+    return {"ok": result}
+
+
+_CHILD_PROG = """
+import json, sys
+
+sys.modules["ytm_player.utils._ytm_player_native"] = None
+
+from ytm_player.services import ytmusic
+
+
+def outcome(name, arg):
+    try:
+        if name == "enter":
+            result = ytmusic._patch_window_enter(arg)
+        elif name == "exit":
+            result = ytmusic._patch_window_exit(arg)
+        else:
+            raise AssertionError(name)
+    except BaseException as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    if isinstance(result, tuple):
+        return {"ok": list(result)}
+    return {"ok": result}
+
+
+payload = json.load(sys.stdin)
+out = {name: [outcome(name, arg) for arg in cases] for name, cases in payload.items()}
+json.dump(out, sys.stdout)
+"""
+
+
+class TestNativeParity:
+    """When the Rust extension is built, the patch-window bookkeeping
+    engines must answer every case exactly like the pure-Python
+    references run in a child interpreter with the extension import
+    blocked — same counts, same drained verdicts, same errors with the
+    same messages — so the two implementations cannot drift.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_bookkeeping_matches_fallback(self):
+        result = subprocess.run(
+            [sys.executable, "-c", _CHILD_PROG],
+            input=json.dumps(_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = {
+            name: [_outcome(name, arg) for arg in cases] for name, cases in _PARITY_CASES.items()
+        }
+        assert set(native) == set(fallback) == set(_PARITY_CASES)
+        for name, cases in _PARITY_CASES.items():
+            for case, n, f in zip(cases, native[name], fallback[name]):
+                assert n == f, (
+                    f"native and fallback {name} differ for {case!r}:\n"
+                    f"native:   {n!r}\n"
+                    f"fallback: {f!r}"
+                )

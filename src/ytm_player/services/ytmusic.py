@@ -290,6 +290,41 @@ def _api_failure_step(consecutive_failures: int) -> tuple[int, bool]:
     return (bumped, bumped >= _MAX_API_FAILURES_BEFORE_REINIT)
 
 
+def _patch_window_enter(inflight: int) -> int:
+    """The in-flight admission step behind ``_call``'s gate arm.
+
+    The input half of the patch-window bookkeeping: every normal
+    client call counts itself in — ``inflight + 1`` — so a later
+    ``get_playlist(order=...)`` patch window can wait for the calls
+    already past the gate to drain before it touches
+    ``client._send_request``. The caller assigns the bumped count to
+    its ``_inflight`` and clears ``_no_inflight`` right after, at the
+    reference's own points.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_patch_window_enter``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return inflight + 1
+
+
+def _patch_window_exit(inflight: int) -> tuple[int, bool]:
+    """The in-flight release step behind ``_call``'s finally arm.
+
+    The exit half of the patch-window bookkeeping: a call leaving the
+    gate counts itself out — ``inflight - 1`` — and the drained
+    verdict names whether the counter reached zero, the moment the
+    caller sets ``_no_inflight`` so a patch window parked on it can
+    open.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_patch_window_exit``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    left = inflight - 1
+    return (left, left == 0)
+
+
 def mutation_failure_suffix(kind: MutationResult) -> str:
     """Return the user-facing suffix text for a non-success MutationResult.
 
@@ -619,7 +654,13 @@ class YTMusicService:
         params into an unrelated browse request.
         """
         await self._no_patch.wait()
-        self._inflight += 1
+        # The in-flight admission and release bookkeeping is resolved
+        # by the _patch_window_enter/_patch_window_exit engines (native
+        # when the Rust extension is built, the pure-Python
+        # transcriptions otherwise); the counter assignments and the
+        # _no_inflight clear/set stay here, at the reference's own
+        # points.
+        self._inflight = _patch_window_enter(self._inflight)
         self._no_inflight.clear()
         failed_client = getattr(func, "__self__", None)
         try:
@@ -641,8 +682,8 @@ class YTMusicService:
             # its response is already discarded (the awaiter is gone), so no
             # consumed data can be corrupted. Tracking worker lifetime instead
             # would stall ordered fetches behind hung sockets; not worth it.
-            self._inflight -= 1
-            if self._inflight == 0:
+            self._inflight, drained = _patch_window_exit(self._inflight)
+            if drained:
                 self._no_inflight.set()
 
     async def _renewed_client_for(
@@ -1652,6 +1693,12 @@ try:
         ytm_explore_new_releases as _native_explore_new_releases,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_patch_window_enter as _native_patch_window_enter,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_patch_window_exit as _native_patch_window_exit,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_playlist_order_params as _native_playlist_order_params,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -1679,6 +1726,8 @@ else:
     _renewal_cooldown_gate = _native_renewal_cooldown_gate  # type: ignore[assignment]
     _renewal_cooldown_stamp = _native_renewal_cooldown_stamp  # type: ignore[assignment]
     _api_failure_step = _native_api_failure_step  # type: ignore[assignment]
+    _patch_window_enter = _native_patch_window_enter  # type: ignore[assignment]
+    _patch_window_exit = _native_patch_window_exit  # type: ignore[assignment]
     _watch_playlist_kwargs = _native_watch_playlist_kwargs  # type: ignore[assignment]
     _result_tracks = _native_result_tracks  # type: ignore[assignment]
     _playlist_tracks = _native_playlist_tracks  # type: ignore[assignment]
