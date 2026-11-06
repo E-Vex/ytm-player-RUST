@@ -20,7 +20,26 @@ transcription lives in ``services/cache.py``; when the Rust extension
 is built the same engine runs natively
 (``_ytm_player_native.eviction_plan``).
 
-The unit tests below assert the engine's contract on whichever backend
+The maintenance engines around it — the schema DDL body
+``_cache_schema`` behind ``init``, the hit-counter batched-commit gate
+``_hit_commit_plan`` behind ``get``'s ``last_accessed`` UPDATE (the
+module's own ``_COMMIT_EVERY`` read at call time, so a patched
+constant steers both backends identically), the usage summary
+``_status_summary`` behind ``get_status`` (the four-key payload, the
+MB → bytes budget through CPython's own multiplication and the
+cache-dir ``str()``), the index write's statement body
+``_index_insert_statement`` behind ``_index``, the plan-triples →
+IN-clause DELETE ``_index_delete_statement`` behind ``evict``'s index
+cleanup (its triples unpacked through the reference's own
+``(video_id, _, _)`` contract) and the wipe's bare DELETE
+``_index_delete_all_statement`` behind ``clear`` — carry the same
+dual implementation, native
+(``_ytm_player_native.cache_schema`` / ``cache_hit_commit_plan`` /
+``cache_status_summary`` / ``cache_index_insert_statement`` /
+``cache_index_delete_statement`` / ``cache_index_delete_all_statement``)
+when the extension is built.
+
+The unit tests below assert the engines' contract on whichever backend
 is loaded. When the extension is built, the parity tests additionally
 compare the native engine against the pure-Python reference (run in a
 child interpreter with the extension import blocked) case for case —
@@ -34,10 +53,21 @@ import json
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
-from ytm_player.services.cache import _eviction_plan
+import ytm_player.services.cache as cache_module
+from ytm_player.services.cache import (
+    _SCHEMA,
+    _cache_schema,
+    _eviction_plan,
+    _hit_commit_plan,
+    _index_delete_all_statement,
+    _index_delete_statement,
+    _index_insert_statement,
+    _status_summary,
+)
 
 try:
     from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
@@ -375,7 +405,256 @@ class TestEvictionArithmetic:
         assert plan[0][2] is size  # the duck object passes through
 
 
-# ── Native vs fallback parity ──────────────────────────────────────────
+# ── The maintenance engines' contracts ─────────────────────────────
+
+
+class TestCacheSchema:
+    """The DDL body ``init`` hands to executescript."""
+
+    def test_answers_the_modules_schema_text(self):
+        assert _cache_schema() == _SCHEMA
+
+    def test_spells_the_single_table_index(self):
+        text = _cache_schema()
+        assert text.startswith("\nCREATE TABLE IF NOT EXISTS cache_index (")
+        assert text.rstrip().endswith(");")
+        assert "video_id TEXT PRIMARY KEY" in text
+        assert "last_accessed TEXT DEFAULT (datetime('now'))" in text
+
+    def test_the_text_is_stable(self):
+        assert _cache_schema() == _cache_schema()
+
+
+class TestHitCommitPlan:
+    """The batched-commit gate — the reference's commit-then-reset."""
+
+    def test_counts_below_the_threshold_accumulate(self):
+        assert [_hit_commit_plan(n) for n in range(0, 9)] == [
+            (1, False),
+            (2, False),
+            (3, False),
+            (4, False),
+            (5, False),
+            (6, False),
+            (7, False),
+            (8, False),
+            (9, False),
+        ]
+
+    def test_the_count_that_reaches_the_constant_commits_and_resets(self):
+        assert _hit_commit_plan(9) == (0, True)
+        assert _hit_commit_plan(10) == (0, True)
+        assert _hit_commit_plan(100) == (0, True)
+
+    def test_floats_and_bools_steer_through_the_operators(self):
+        assert _hit_commit_plan(8.5) == (9.5, False)
+        assert _hit_commit_plan(9.5) == (0, True)
+        assert _hit_commit_plan(True) == (2, False)
+        assert _hit_commit_plan(False) == (1, False)
+
+    def test_a_patched_constant_steers_whichever_backend_is_loaded(self):
+        original = cache_module._COMMIT_EVERY
+        try:
+            cache_module._COMMIT_EVERY = 2
+            assert _hit_commit_plan(1) == (0, True)
+            assert _hit_commit_plan(0) == (1, False)
+        finally:
+            cache_module._COMMIT_EVERY = original
+
+    def test_a_non_numeric_count_raises_the_additions_own_error(self):
+        with pytest.raises(TypeError):
+            _hit_commit_plan("x")
+
+
+class TestStatusSummary:
+    """The four-key usage summary behind ``get_status``."""
+
+    def test_the_payload_in_insertion_order(self):
+        summary = _status_summary(500, 3, 2, Path("/cache"))
+        assert summary == {
+            "total_size": 500,
+            "file_count": 3,
+            "max_size": 2 * 1024 * 1024,
+            "cache_dir": "/cache",
+        }
+        assert list(summary) == ["total_size", "file_count", "max_size", "cache_dir"]
+
+    def test_the_aggregates_pass_through_as_the_objects_they_are(self):
+        total = object()
+        count = object()
+        summary = _status_summary(total, count, 1, "/c")
+        assert summary["total_size"] is total
+        assert summary["file_count"] is count
+
+    def test_a_str_cache_dir_passes_through_as_the_same_object(self):
+        directory = "/already/a/string"
+        assert _status_summary(0, 0, 1, directory)["cache_dir"] is directory
+
+    def test_float_and_bool_budgets_steer_through_the_multiplication(self):
+        assert _status_summary(0, 0, 1.5, "/c")["max_size"] == 1.5 * 1024 * 1024
+        assert _status_summary(0, 0, True, "/c")["max_size"] == 1048576
+
+    def test_a_fresh_dict_every_call(self):
+        assert _status_summary(1, 2, 3, "x") is not _status_summary(1, 2, 3, "x")
+
+    def test_an_unmultiplicable_budget_raises_the_operators_own_error(self):
+        with pytest.raises(TypeError):
+            _status_summary(0, 0, None, "/c")
+
+    def test_a_raising_str_keeps_its_own_error(self):
+        class BoomStr:
+            def __str__(self) -> str:
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _status_summary(0, 0, 1, BoomStr())
+
+
+class TestIndexInsertStatement:
+    """The (sql, params) pair ``_index`` binds."""
+
+    def test_the_statement_text_exactly_as_spelled(self):
+        sql, _ = _index_insert_statement("v", "/p", 5, "opus")
+        assert sql == (
+            "\n"
+            "        INSERT OR REPLACE INTO cache_index\n"
+            "            (video_id, file_path, file_size, format)\n"
+            "        VALUES (?, ?, ?, ?)\n"
+            "        "
+        )
+
+    def test_the_bound_values(self):
+        path = Path("/cache/v.opus")
+        video_id, file_size, fmt = object(), object(), object()
+        sql, params = _index_insert_statement(video_id, path, file_size, fmt)
+        assert len(params) == 4
+        assert params[0] is video_id
+        assert params[1] == "/cache/v.opus"
+        assert params[2] is file_size
+        assert params[3] is fmt
+
+    def test_a_str_path_passes_through_as_the_same_object(self):
+        path = "/already/str"
+        _, params = _index_insert_statement("v", path, 5, "opus")
+        assert params[1] is path
+
+    def test_a_fresh_tuple_every_call(self):
+        first = _index_insert_statement("v", "/p", 5, "opus")[1]
+        second = _index_insert_statement("v", "/p", 5, "opus")[1]
+        assert first is not second
+
+    def test_a_raising_str_keeps_its_own_error(self):
+        class BoomStr:
+            def __str__(self) -> str:
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _index_insert_statement("v", BoomStr(), 5, "opus")
+
+    def test_prepare_and_bind_round_trip(self):
+        # The exact (sql, params) pair binds against the real schema'd
+        # index — the same table init's executescript builds.
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(_cache_schema())
+        sql, params = _index_insert_statement("vid", Path("/c/vid.opus"), 12, "opus")
+        conn.execute(sql, params)
+        row = conn.execute(
+            "SELECT video_id, file_path, file_size, format FROM cache_index"
+        ).fetchone()
+        assert tuple(row) == ("vid", "/c/vid.opus", 12, "opus")
+        conn.close()
+
+
+class TestIndexDeleteStatement:
+    """The plan-triples → IN-clause DELETE ``evict`` binds."""
+
+    def test_the_ids_in_plan_order_and_the_placeholders(self):
+        sql, ids = _index_delete_statement([("v1", "/p1", 5), ("v2", "/p2", 7)])
+        assert sql == "DELETE FROM cache_index WHERE video_id IN (?,?)"
+        assert ids == ["v1", "v2"]
+
+    def test_the_ids_pass_through_as_the_objects_they_are(self):
+        first, second = object(), object()
+        _, ids = _index_delete_statement([(first, "/p1", 5), (second, "/p2", 7)])
+        assert ids[0] is first
+        assert ids[1] is second
+
+    def test_the_placeholder_count_tracks_the_id_count(self):
+        assert _index_delete_statement([("v", "/p", 5)])[0].endswith("IN (?)")
+        sql, ids = _index_delete_statement([("v1", "/p1", 5), ("v2", "/p2", 5), ("v3", "/p3", 5)])
+        assert sql.endswith("IN (?,?,?)")
+        assert ids == ["v1", "v2", "v3"]
+
+    def test_an_empty_plan_spells_the_unreachable_empty_clause(self):
+        # The manager's `if evicted:` gate never sends an empty plan,
+        # but the engine still mirrors the reference's join.
+        assert _index_delete_statement([]) == ("DELETE FROM cache_index WHERE video_id IN ()", [])
+
+    def test_any_three_iterable_works(self):
+        sql, ids = _index_delete_statement([["v1", "/p1", 5], ("v2", "/p2", 7)])
+        assert ids == ["v1", "v2"]
+
+    def test_a_three_char_string_unpacks_its_characters(self):
+        _, ids = _index_delete_statement(["abc"])
+        assert ids == ["a"]
+
+    def test_a_generator_plan_is_consumed(self):
+        sql, ids = _index_delete_statement(iter([("v1", "/p1", 5)]))
+        assert ids == ["v1"]
+
+    def test_a_short_entry_raises_the_unpacks_own_valueerror(self):
+        with pytest.raises(ValueError, match=r"not enough values to unpack \(expected 3, got 2\)"):
+            _index_delete_statement([("v1", "/p1")])
+
+    def test_a_long_entry_raises_the_unpacks_own_valueerror(self):
+        with pytest.raises(ValueError, match="too many values to unpack"):
+            _index_delete_statement([("v1", "/p1", 5, "extra")])
+
+    def test_a_non_iterable_entry_raises_the_unpacks_own_typeerror(self):
+        with pytest.raises(TypeError, match="cannot unpack non-iterable int object"):
+            _index_delete_statement([5])
+
+    def test_a_raising_iter_keeps_its_own_error(self):
+        class BadIter:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _index_delete_statement([BadIter()])
+
+    def test_prepare_and_bind_round_trip(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(_cache_schema())
+        for vid in ("v1", "v2", "v3"):
+            conn.execute(
+                "INSERT INTO cache_index (video_id, file_path, file_size) VALUES (?, ?, ?)",
+                (vid, f"/p/{vid}", 5),
+            )
+        sql, ids = _index_delete_statement([("v1", "/p/v1", 5), ("v3", "/p/v3", 5)])
+        conn.execute(sql, ids)
+        remaining = [row[0] for row in conn.execute("SELECT video_id FROM cache_index")]
+        assert remaining == ["v2"]
+        conn.close()
+
+
+class TestIndexDeleteAllStatement:
+    """The bare DELETE ``clear`` binds."""
+
+    def test_the_text_verbatim(self):
+        assert _index_delete_all_statement() == "DELETE FROM cache_index"
+
+    def test_prepare_round_trip(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(_cache_schema())
+        conn.execute(
+            "INSERT INTO cache_index (video_id, file_path, file_size) VALUES ('v', '/p', 5)"
+        )
+        conn.execute(_index_delete_all_statement())
+        assert conn.execute("SELECT COUNT(*) FROM cache_index").fetchone()[0] == 0
+        conn.close()
+
+
+# ── Native parity ──────────────────────────────────────────────────────
 # The matrices below are shared with the child interpreter as JSON, so
 # every value must be JSON-round-trippable: the row shapes spelled out
 # as specs both sides build identically (the "sql" kind reconstructs
@@ -440,16 +719,25 @@ def _outcome(total: object, max_bytes: object, spec: dict) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
-# The child interpreter runs this program with the case matrix on the
-# stdin and prints the reference engine's outcomes as JSON.
+# The child interpreter runs this program with the case matrices on
+# the stdin and prints the reference engines' outcomes as JSON.
 _CHILD_PROG = """
 import json
+import pathlib
 import sqlite3
 import sys
 
 sys.modules['ytm_player.utils._ytm_player_native'] = None
 
-from ytm_player.services.cache import _eviction_plan
+from ytm_player.services.cache import (
+    _cache_schema,
+    _eviction_plan,
+    _hit_commit_plan,
+    _index_delete_all_statement,
+    _index_delete_statement,
+    _index_insert_statement,
+    _status_summary,
+)
 
 
 def build_rows(spec):
@@ -484,6 +772,26 @@ def build_rows(spec):
     raise AssertionError(kind)
 
 
+def build_arg(spec):
+    if isinstance(spec, dict) and spec.get("t") == "path":
+        return pathlib.Path(spec["v"])
+    if isinstance(spec, dict) and spec.get("t") == "gen":
+        return iter(spec["items"])
+    if isinstance(spec, dict) and spec.get("t") == "boomstr":
+        class BoomStr:
+            def __str__(self):
+                raise RuntimeError("boom")
+
+        return BoomStr()
+    if isinstance(spec, dict) and spec.get("t") == "baditer":
+        class BadIter:
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        return [BadIter()]
+    return spec
+
+
 def outcome(total, max_bytes, spec):
     rows = build_rows(spec)
     try:
@@ -492,18 +800,44 @@ def outcome(total, max_bytes, spec):
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+MAINT = {
+    "cache_schema": _cache_schema,
+    "hit_commit_plan": _hit_commit_plan,
+    "status_summary": _status_summary,
+    "index_insert_statement": _index_insert_statement,
+    "index_delete_statement": _index_delete_statement,
+    "index_delete_all_statement": _index_delete_all_statement,
+}
+
+
+def maint_outcome(case):
+    args = [build_arg(spec) for spec in case["args"]]
+    try:
+        result = MAINT[case["engine"]](*args)
+        if isinstance(result, tuple):
+            return {"ok": [list(part) if isinstance(part, (list, tuple)) else part
+                            for part in result]}
+        return {"ok": result}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 payload = json.load(sys.stdin)
-plans = [
-    outcome(total, max_bytes, spec) for total, max_bytes, spec in payload["plans"]
-]
-json.dump({"plans": plans}, sys.stdout)
+out = {
+    "plans": [
+        outcome(total, max_bytes, spec) for total, max_bytes, spec in payload["plans"]
+    ]
+}
+if "maint" in payload:
+    out["maint"] = [maint_outcome(case) for case in payload["maint"]]
+json.dump(out, sys.stdout)
 """
 
 
 def _fallback_outcomes() -> dict:
-    """Run the pure-Python reference engine over the parity cases in a
-    child interpreter with the native extension import blocked."""
-    payload = json.dumps({"plans": _EVICTION_PARITY_CASES})
+    """Run the pure-Python reference engines over the parity cases in
+    a child interpreter with the native extension import blocked."""
+    payload = json.dumps({"plans": _EVICTION_PARITY_CASES, "maint": _MAINT_PARITY_CASES})
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
         input=payload,
@@ -516,6 +850,105 @@ def _fallback_outcomes() -> dict:
 
 def _native_outcomes() -> list:
     return [_outcome(total, max_bytes, spec) for total, max_bytes, spec in _EVICTION_PARITY_CASES]
+
+
+# ── The maintenance engines' parity matrix ──────────────────────────
+
+_MAINT_PARITY_CASES = [
+    # ── _cache_schema ──
+    {"engine": "cache_schema", "args": []},
+    # ── _hit_commit_plan ──
+    {"engine": "hit_commit_plan", "args": [0]},
+    {"engine": "hit_commit_plan", "args": [1]},
+    {"engine": "hit_commit_plan", "args": [8]},
+    {"engine": "hit_commit_plan", "args": [9]},
+    {"engine": "hit_commit_plan", "args": [10]},
+    {"engine": "hit_commit_plan", "args": [100]},
+    {"engine": "hit_commit_plan", "args": [-1]},
+    {"engine": "hit_commit_plan", "args": [8.5]},
+    {"engine": "hit_commit_plan", "args": [9.5]},
+    {"engine": "hit_commit_plan", "args": [True]},
+    {"engine": "hit_commit_plan", "args": [False]},
+    {"engine": "hit_commit_plan", "args": ["x"]},
+    # ── _status_summary ──
+    {"engine": "status_summary", "args": [500, 3, 2, "/cache"]},
+    {"engine": "status_summary", "args": [0, 0, 0, "/c"]},
+    {"engine": "status_summary", "args": [1.5, 2, 1.5, "/c"]},
+    {"engine": "status_summary", "args": [True, False, True, "/c"]},
+    {"engine": "status_summary", "args": [500, 3, 2, {"t": "path", "v": "/p"}]},
+    {"engine": "status_summary", "args": [0, 0, None, "/c"]},
+    {"engine": "status_summary", "args": [0, 0, 1, {"t": "boomstr"}]},
+    # ── _index_insert_statement ──
+    {"engine": "index_insert_statement", "args": ["v", "/p", 5, "opus"]},
+    {"engine": "index_insert_statement", "args": ["v", {"t": "path", "v": "/c/x"}, None, ""]},
+    {"engine": "index_insert_statement", "args": [0, 1, 2, 3]},
+    {"engine": "index_insert_statement", "args": ["v", {"t": "boomstr"}, 5, "opus"]},
+    # ── _index_delete_statement ──
+    {"engine": "index_delete_statement", "args": [[]]},
+    {"engine": "index_delete_statement", "args": [[["v1", "/p1", 5]]]},
+    {"engine": "index_delete_statement", "args": [[["v1", "/p1", 5], ["v2", "/p2", 7]]]},
+    {
+        "engine": "index_delete_statement",
+        "args": [[[1, "/p1", 5], ["v2", 2, 7], [None, None, None]]],
+    },
+    {"engine": "index_delete_statement", "args": [[["ab", "/p1"]]]},
+    {"engine": "index_delete_statement", "args": [[["abcd", "/p1", 5, "x"]]]},
+    {"engine": "index_delete_statement", "args": [[5]]},
+    {"engine": "index_delete_statement", "args": ["abc"]},
+    {"engine": "index_delete_statement", "args": [{"t": "gen", "items": [["v1", "/p1", 5]]}]},
+    {"engine": "index_delete_statement", "args": [{"t": "baditer"}]},
+    # ── _index_delete_all_statement ──
+    {"engine": "index_delete_all_statement", "args": []},
+]
+
+
+def _maint_outcome(case: dict) -> dict:
+    args: list = []
+    for spec in case["args"]:
+        if isinstance(spec, dict) and spec.get("t") == "path":
+            args.append(Path(spec["v"]))
+        elif isinstance(spec, dict) and spec.get("t") == "boomstr":
+
+            class BoomStr:
+                def __str__(self) -> str:
+                    raise RuntimeError("boom")
+
+            args.append(BoomStr())
+        elif isinstance(spec, dict) and spec.get("t") == "baditer":
+
+            class BadIter:
+                def __iter__(self):
+                    raise RuntimeError("boom")
+
+            args.append([BadIter()])
+        elif isinstance(spec, dict) and spec.get("t") == "gen":
+            args.append(iter(spec["items"]))
+        else:
+            args.append(spec)
+    engine = {
+        "cache_schema": _cache_schema,
+        "hit_commit_plan": _hit_commit_plan,
+        "status_summary": _status_summary,
+        "index_insert_statement": _index_insert_statement,
+        "index_delete_statement": _index_delete_statement,
+        "index_delete_all_statement": _index_delete_all_statement,
+    }[case["engine"]]
+    try:
+        result = engine(*args)
+        if isinstance(result, tuple):
+            # Normalise the (sql, ids / params) pairs the way the
+            # child's JSON wire format already does — tuples become
+            # lists.
+            return {
+                "ok": [list(part) if isinstance(part, (list, tuple)) else part for part in result]
+            }
+        return {"ok": result}
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _native_maint_outcomes() -> list:
+    return [_maint_outcome(case) for case in _MAINT_PARITY_CASES]
 
 
 class TestNativeParity:
@@ -532,6 +965,17 @@ class TestNativeParity:
         for case, n, f in zip(_EVICTION_PARITY_CASES, native, fallback):
             assert n == f, (
                 f"native and fallback eviction outcomes differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_maintenance_engines_match_fallback(self):
+        native = _native_maint_outcomes()
+        fallback = _fallback_outcomes()["maint"]
+        for case, n, f in zip(_MAINT_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback maintenance outcomes differ for {case!r}:\n"
                 f"native:   {n!r}\n"
                 f"fallback: {f!r}"
             )

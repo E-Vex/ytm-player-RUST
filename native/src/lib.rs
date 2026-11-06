@@ -604,6 +604,35 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // staying Python-side in the manager.
     module.add_function(pyo3::wrap_pyfunction!(eviction_plan, module)?)?;
 
+    // Audio-cache maintenance engines (services/cache.py equivalents):
+    // the statement bodies and the bookkeeping around the eviction
+    // walk — the schema DDL script behind init's executescript, the
+    // hit-counter batched-commit gate behind get's last_accessed
+    // UPDATE (the module's own _COMMIT_EVERY read at call time, a
+    // patched constant included), the four-key usage summary behind
+    // get_status with the MB → bytes budget and the cache-dir
+    // str(), the INSERT OR REPLACE statement and its four-value
+    // bindings behind _index, the plan-triples → IN-clause DELETE
+    // behind evict's index cleanup, and the wipe's bare DELETE
+    // behind clear — with the connection handling, the row reads,
+    // the file unlinking and the commits staying Python-side in the
+    // manager.
+    module.add_function(pyo3::wrap_pyfunction!(cache_schema, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(cache_hit_commit_plan, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(cache_status_summary, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        cache_index_insert_statement,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        cache_index_delete_statement,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        cache_index_delete_all_statement,
+        module
+    )?)?;
+
     // History row-assembly peripherals (services/history.py
     // equivalents): the remaining pure cores around the four ported
     // history engines — the autocomplete string list behind
@@ -12240,6 +12269,176 @@ fn eviction_plan<'py>(
         total = py_inplace_sub(&total, &file_size)?;
     }
     Ok(out)
+}
+
+// ── Audio-cache maintenance engines (services/cache.py) ───────────────
+
+/// The schema DDL script behind `CacheManager.init` — the pure half
+/// of the cache index's creation step (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference (`_cache_schema`): the module's
+/// `_SCHEMA` text — the single `cache_index` table with its
+/// `video_id` primary key, its `file_path` / `file_size` / `format`
+/// columns and its `cached_at` / `last_accessed` datetime defaults —
+/// handed to `executescript` verbatim, the leading newline and
+/// indentation the fallback spells included. The connection handling
+/// stays Python-side in the manager.
+#[pyfunction]
+fn cache_schema() -> String {
+    "\nCREATE TABLE IF NOT EXISTS cache_index (\n    video_id TEXT PRIMARY KEY,\n    file_path TEXT NOT NULL,\n    file_size INTEGER NOT NULL,\n    format TEXT,\n    cached_at TEXT DEFAULT (datetime('now')),\n    last_accessed TEXT DEFAULT (datetime('now'))\n);\n".to_string()
+}
+
+/// The hit-counter batched-commit gate behind `CacheManager.get` —
+/// the pure core of the hit path's tail (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference (`_hit_commit_plan`): the count
+/// incremented through CPython's own `+` and the sum compared against
+/// the module's own `_COMMIT_EVERY` — read at call time from
+/// `ytm_player.services.cache`, so a patched constant steers both
+/// backends identically (the same pattern as
+/// `stream_cache_max_size`) — a sum that reaches the constant
+/// answering `(0, True)`: the batched commit is due and the stored
+/// count resets, exactly the reference's commit-then-reset; a sum
+/// still short answering `(sum, False)`. The `last_accessed` UPDATE
+/// around the engine and the commit itself stay Python-side in the
+/// manager.
+#[pyfunction]
+#[pyo3(signature = (hit_count))]
+fn cache_hit_commit_plan<'py>(
+    py: Python<'py>,
+    hit_count: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let commit_every =
+        PyModule::import(py, "ytm_player.services.cache")?.getattr("_COMMIT_EVERY")?;
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let count = hit_count.add(&one)?;
+    if count.ge(&commit_every)? {
+        let zero = 0i64
+            .into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any();
+        return Ok((zero, true));
+    }
+    Ok((count, false))
+}
+
+/// The usage summary behind `CacheManager.get_status` — the pure core
+/// of the status read (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference (`_status_summary`): the
+/// four-key payload in the reference's insertion order — the two
+/// aggregates passed through as the objects the row reads answered,
+/// the MB → bytes budget computed through CPython's own
+/// `max_size_mb * 1024 * 1024` (both multiplications, their errors
+/// included), and the cache directory rendered through CPython's own
+/// `str()` (a str input passes through as the same object) — into a
+/// fresh dict. The row reads and the aggregate assert stay
+/// Python-side in the manager.
+#[pyfunction]
+#[pyo3(signature = (total_size, file_count, max_size_mb, cache_dir))]
+fn cache_status_summary<'py>(
+    py: Python<'py>,
+    total_size: &Bound<'py, PyAny>,
+    file_count: &Bound<'py, PyAny>,
+    max_size_mb: &Bound<'py, PyAny>,
+    cache_dir: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let k1024 = 1024i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let out = PyDict::new(py);
+    out.set_item("total_size", total_size)?;
+    out.set_item("file_count", file_count)?;
+    out.set_item("max_size", max_size_mb.mul(&k1024)?.mul(&k1024)?)?;
+    out.set_item("cache_dir", cache_dir.str()?)?;
+    Ok(out)
+}
+
+/// The statement and bindings behind `CacheManager._index` — the
+/// pure half of the index write (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference (`_index_insert_statement`):
+/// the `INSERT OR REPLACE` statement text — exactly as the fallback
+/// spells it, leading newline and indentation included — and the
+/// four-value parameter tuple: `video_id` / `file_size` / `format`
+/// passed through as the objects they are, the path rendered through
+/// CPython's own `str()` (a raising `__str__` keeps its own error,
+/// exactly like the reference's `str()` call). The execute and the
+/// commit stay Python-side in the manager.
+#[pyfunction]
+#[pyo3(signature = (video_id, path, file_size, format))]
+fn cache_index_insert_statement<'py>(
+    py: Python<'py>,
+    video_id: &Bound<'py, PyAny>,
+    path: &Bound<'py, PyAny>,
+    file_size: &Bound<'py, PyAny>,
+    format: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyTuple>)> {
+    let params = PyTuple::new(
+        py,
+        [
+            video_id.clone(),
+            path.str()?.into_any(),
+            file_size.clone(),
+            format.clone(),
+        ],
+    )?;
+    Ok((
+        "\n        INSERT OR REPLACE INTO cache_index\n            (video_id, file_path, file_size, format)\n        VALUES (?, ?, ?, ?)\n        ".to_string(),
+        params,
+    ))
+}
+
+/// The statement and bindings behind `CacheManager.evict`'s index
+/// cleanup — the pure half of the post-unlink write
+/// (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference (`_index_delete_statement`):
+/// the video ids extracted from the plan's `(video_id, file_path,
+/// file_size)` triples — each entry unpacked through the
+/// reference's own `(video_id, _, _)` contract (any 3-iterable
+/// works, a wrong-shaped entry raising CPython's own not-enough /
+/// too-many `ValueError` and a non-iterable the unpack's own
+/// `TypeError` rewrite; see `unpack_dispatch_row`) — the ids passing
+/// through as the objects they are, in plan order — and the
+/// placeholder-joined `IN` clause packed as the `(sql, ids)` pair
+/// the reference's execute call takes: n ids spell n question
+/// marks comma-joined, so an empty plan spells an `IN ()` the
+/// manager's `if evicted:` gate never sends. The unlink loop and
+/// the commit stay Python-side in the manager.
+#[pyfunction]
+#[pyo3(signature = (evicted))]
+fn cache_index_delete_statement<'py>(
+    py: Python<'py>,
+    evicted: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyList>)> {
+    let mut ids: Vec<Bound<'py, PyAny>> = Vec::new();
+    for triple in evicted.try_iter()? {
+        let (video_id, _file_path, _file_size) = unpack_dispatch_row(&triple?)?;
+        ids.push(video_id);
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("DELETE FROM cache_index WHERE video_id IN ({placeholders})");
+    let out = PyList::new(py, ids).expect("list of ids cannot fail");
+    Ok((sql, out))
+}
+
+/// The statement behind `CacheManager.clear`'s index wipe — the pure
+/// half of the wipe's index write (`services/cache.py`).
+///
+/// Mirrors the pure-Python reference
+/// (`_index_delete_all_statement`): the text handed to the
+/// reference's execute call, verbatim. The file unlink walk and the
+/// commit stay Python-side in the manager.
+#[pyfunction]
+fn cache_index_delete_all_statement() -> &'static str {
+    "DELETE FROM cache_index"
 }
 
 // ── History row-assembly peripherals ───────────────────────────────────
