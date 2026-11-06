@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -115,34 +116,107 @@ def normalize_cafile(value: str | os.PathLike[str] | None) -> str | None:
     return _normalize_path(value)
 
 
-def apply_configured_yt_dlp_options(opts: dict, yt_dlp_settings: YtDlpSettings) -> dict:
-    """Mutate and return yt-dlp options with app-configured extras."""
-    cookies_file = normalize_cookiefile(yt_dlp_settings.cookies_file)
+def _configured_ydl_opts(
+    opts: dict,
+    cookies_file: str | None,
+    ca_bundle: str | None,
+    is_file: Callable[[], bool],
+    warn: Callable[..., None],
+    remote_components: list[str] | None,
+    js_runtimes: dict[str, dict] | None,
+) -> dict:
+    """The configured-extras layering behind ``apply_configured_yt_dlp_options``.
+
+    The pure core of the opts build's second half: the cookiefile
+    write, the CA bundle's missing-file warning and ``no-certifi``
+    ``compat_opts`` conversion, and the ``remote_components`` /
+    ``js_runtimes`` writes, over the four already-normalised setting
+    values — each gate a truthiness gate, each write through the
+    subscript protocol, the ``compat_opts`` read through the mapping's
+    own ``get`` copied by ``list()`` so the stored list is never
+    mutated, and the ``set()`` conversion always applied when a CA
+    bundle is configured. The *is_file* probe and the *warn* call
+    arrive as thunks so the engine can invoke them exactly where the
+    reference performed them — the probe only under a truthy CA
+    bundle, the warning between the probe and the ``compat_opts``
+    read — and a raising thunk propagates at the reference's own
+    point.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.yt_dlp_configured_opts``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
     if cookies_file:
         opts["cookiefile"] = cookies_file
 
     # When a custom CA bundle is configured (e.g. for Zscaler), tell yt-dlp to
     # skip its bundled certifi CA store and use the system/SSL_CERT_FILE certs
     # instead.  SSL_CERT_FILE is set at app startup in cli.py.
-    ca_bundle = normalize_cafile(yt_dlp_settings.ca_bundle)
     if ca_bundle:
-        if not Path(ca_bundle).is_file():
-            logger.warning("Configured [yt_dlp] ca_bundle does not exist: %s", ca_bundle)
+        if not is_file():
+            warn("Configured [yt_dlp] ca_bundle does not exist: %s", ca_bundle)
         compat = list(opts.get("compat_opts", []))
         if "no-certifi" not in compat:
             compat.append("no-certifi")
         opts["compat_opts"] = set(compat)
 
-    remote_components = normalize_remote_components(yt_dlp_settings.remote_components)
     if remote_components:
-        logger.warning(
+        warn(
             "yt-dlp remote_components is enabled; this allows remote JavaScript component downloads: %s",
             ", ".join(remote_components),
         )
         opts["remote_components"] = remote_components
 
-    js_runtimes = normalize_js_runtimes(yt_dlp_settings.js_runtimes)
     if js_runtimes:
         opts["js_runtimes"] = js_runtimes
 
     return opts
+
+
+def apply_configured_yt_dlp_options(opts: dict, yt_dlp_settings: YtDlpSettings) -> dict:
+    """Mutate and return yt-dlp options with app-configured extras.
+
+    The extras layering is resolved by the ``_configured_ydl_opts``
+    engine (native when the Rust extension is built, the pure-Python
+    transcription otherwise); the settings reads and their
+    normalisations stay here, evaluated up front in the reference's
+    own read order. The file probe arrives as a thunk (only invoked
+    under a configured CA bundle) and ``logger.warning`` as the warn
+    thunk, so the warnings fire at exactly the reference's points in
+    the sequence.
+    """
+    cookies_file = normalize_cookiefile(yt_dlp_settings.cookies_file)
+    ca_bundle = normalize_cafile(yt_dlp_settings.ca_bundle)
+    # The probe thunk runs only under a truthy CA bundle (the engine's
+    # own gate); the else-arm exists solely for the type checker's
+    # narrowing.
+    probe: Callable[[], bool] = (
+        (lambda: Path(ca_bundle).is_file()) if ca_bundle else (lambda: False)
+    )
+    return _configured_ydl_opts(
+        opts,
+        cookies_file,
+        ca_bundle,
+        probe,
+        logger.warning,
+        normalize_remote_components(yt_dlp_settings.remote_components),
+        normalize_js_runtimes(yt_dlp_settings.js_runtimes),
+    )
+
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same extras-layering engine; this
+# binding replaces the pure-Python transcription above when the extension
+# is importable. The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement (the lesson that produced formatting.py's dead native
+# bindings).
+
+try:
+    from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
+        yt_dlp_configured_opts as _native_configured_opts,
+    )
+except ImportError:
+    pass
+else:
+    _configured_ydl_opts = _native_configured_opts  # type: ignore[assignment]

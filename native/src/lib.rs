@@ -165,6 +165,16 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // `~otheruser` via the pwd database, which has no std equivalent.
     module.add_function(pyo3::wrap_pyfunction!(normalize_remote_components, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(normalize_js_runtimes, module)?)?;
+    // The configured-extras layering (the same module's
+    // apply_configured_yt_dlp_options core): the opts mutation pass
+    // behind StreamResolver._build_ydl_opts' second half — the
+    // cookiefile write, the CA bundle's missing-file warning and
+    // no-certifi compat_opts conversion, and the remote_components /
+    // js_runtimes writes — with the file probe and the logger.warning
+    // call supplied as thunks, invoked exactly where the reference
+    // performed them, and the settings reads and their normalisations
+    // staying Python-side in the caller.
+    module.add_function(pyo3::wrap_pyfunction!(yt_dlp_configured_opts, module)?)?;
 
     // IPC single-instance guard (ytm_player.ipc equivalent).
     module.add_function(pyo3::wrap_pyfunction!(looks_like_ytm, module)?)?;
@@ -2172,6 +2182,112 @@ fn normalize_js_runtimes<'py>(
         return Ok(None);
     }
     Ok(Some(result))
+}
+
+/// The configured-extras layering — `yt_dlp_options.py`'s
+/// `apply_configured_yt_dlp_options` core, the second half of
+/// `StreamResolver._build_ydl_opts`'s opts build (the first half is
+/// `stream_base_opts`).
+///
+/// Mirrors the reference's mutation sequence branch for branch, over
+/// the four already-normalised setting values the caller read in the
+/// reference's own order (`normalize_cookiefile` /
+/// `normalize_cafile` / `normalize_remote_components` /
+/// `normalize_js_runtimes` — the path expanders stay Python-side;
+/// the latter two are themselves native engines):
+///
+/// - a truthy *cookies_file* (CPython's own truthiness protocol)
+///   writes `opts["cookiefile"]` through the subscript protocol, the
+///   value the very object it is;
+/// - a truthy *ca_bundle* first probes the file through the
+///   zero-argument *is_file* thunk — invoked exactly where the
+///   reference's `Path(ca_bundle).is_file()` ran, so a falsy bundle
+///   never probes and a raising probe propagates before any mutation
+///   — and warns through the *warn* thunk when it came back falsy,
+///   the reference's exact `("Configured [yt_dlp] ca_bundle does not
+///   exist: %s", ca_bundle)` argument pair; then the `compat_opts`
+///   read through the mapping's own `.get` (a fresh empty list as the
+///   default) copied through the interpreter's own `list()` — so the
+///   stored list object is never mutated — the `"no-certifi"` gate
+///   through CPython's own containment, the survivor appended through
+///   the list's own `.append`, and the result written back through
+///   `set(compat)` — the interpreter's own set constructor, so an
+///   unhashable member raises the constructor's own `TypeError` at
+///   exactly the reference's point (after the missing-file warning,
+///   which the thunk timing preserves);
+/// - a truthy *remote_components* warns through the *warn* thunk with
+///   the reference's exact argument pair — the second argument the
+///   `", "`-join through the str's own `.join` method — then writes
+///   `opts["remote_components"]` as the very object it is;
+/// - a truthy *js_runtimes* writes `opts["js_runtimes"]` as the very
+///   object it is.
+///
+/// The *warn* thunk is `logger.warning` itself in production, so the
+/// warnings fire at exactly the reference's points in the sequence —
+/// interleaved with the mutations, not replayed after them. The
+/// settings-object attribute reads and their normalisations stay
+/// Python-side in `apply_configured_yt_dlp_options`, evaluated up
+/// front in the reference's own read order; their interleaving with
+/// the mutation sequence is not observable (the reads are
+/// side-effect-free dataclass field accesses). The answer is *opts*
+/// itself, the object it is.
+#[allow(clippy::too_many_arguments)] // the reference's four extras, plus the two thunk seams
+#[pyfunction]
+#[pyo3(signature = (opts, cookies_file, ca_bundle, is_file, warn, remote_components, js_runtimes))]
+fn yt_dlp_configured_opts<'py>(
+    py: Python<'py>,
+    opts: &Bound<'py, PyAny>,
+    cookies_file: &Bound<'py, PyAny>,
+    ca_bundle: &Bound<'py, PyAny>,
+    is_file: &Bound<'py, PyAny>,
+    warn: &Bound<'py, PyAny>,
+    remote_components: &Bound<'py, PyAny>,
+    js_runtimes: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if cookies_file.is_truthy()? {
+        opts.set_item("cookiefile", cookies_file)?;
+    }
+
+    if ca_bundle.is_truthy()? {
+        // if not Path(ca_bundle).is_file(): logger.warning(...)
+        let file_ok = is_file.call0()?;
+        if !file_ok.is_truthy()? {
+            warn.call1((
+                "Configured [yt_dlp] ca_bundle does not exist: %s",
+                ca_bundle,
+            ))?;
+        }
+        // compat = list(opts.get("compat_opts", []))
+        let empty = PyList::empty(py).into_any();
+        let raw_compat = opts.call_method1("get", ("compat_opts", empty))?;
+        let list_type = py.import("builtins")?.getattr("list")?;
+        let compat = list_type.call1((raw_compat,))?;
+        // if "no-certifi" not in compat: compat.append("no-certifi")
+        if !compat.contains("no-certifi")? {
+            compat.call_method1("append", ("no-certifi",))?;
+        }
+        // opts["compat_opts"] = set(compat)
+        let set_type = py.import("builtins")?.getattr("set")?;
+        let compat_set = set_type.call1((compat,))?;
+        opts.set_item("compat_opts", compat_set)?;
+    }
+
+    if remote_components.is_truthy()? {
+        // logger.warning("...: %s", ", ".join(remote_components))
+        let joiner = PyString::new(py, ", ");
+        let joined = joiner.call_method1("join", (remote_components,))?;
+        warn.call1((
+            "yt-dlp remote_components is enabled; this allows remote JavaScript component downloads: %s",
+            joined,
+        ))?;
+        opts.set_item("remote_components", remote_components)?;
+    }
+
+    if js_runtimes.is_truthy()? {
+        opts.set_item("js_runtimes", js_runtimes)?;
+    }
+
+    Ok(opts.clone())
 }
 
 // ---------------------------------------------------------------------------
