@@ -11,8 +11,15 @@ behind ``_save``) — lives in a ``ShufflePrefsCore``: the Rust
 implementation from the native extension
 (``_ytm_player_native.ShufflePrefsCore``) when it is built, and the
 pure-Python ``_ShufflePrefsCore`` transcription below otherwise. The
+disk I/O — the file read + ``json.loads`` parse behind ``_load`` and
+the atomic write behind ``_save`` — lives in the module-level
+``_read_prefs_file`` / ``_write_prefs_file`` engines: the Rust
+implementations (``_ytm_player_native.shuffle_prefs_read_file`` /
+``shuffle_prefs_write_file``) when the extension is built, the
+pure-Python transcriptions below otherwise, each driving the path
+object's own protocol so every error shape stays CPython's. The
 ``ShufflePreferences`` facade keeps the thread lock, the
-falsy-context guards, the JSON parse and the atomic file write.
+falsy-context guards, the exists gate and the logging.
 """
 
 from __future__ import annotations
@@ -59,6 +66,43 @@ def _new_core() -> ShufflePrefsCoreLike:
     if _NativeShufflePrefsCore is not None:
         return _NativeShufflePrefsCore(_MAX_ENTRIES)
     return _ShufflePrefsCore(_MAX_ENTRIES)
+
+
+def _read_prefs_file(path: Path) -> Any:
+    """The parsed prefs payload behind ``ShufflePreferences._load``.
+
+    The pure core of the load's read step: the file read and the
+    ``json.loads`` parse over the decoded text,
+    ``json.loads(path.read_text(encoding="utf-8"))`` verbatim,
+    answering the parsed object. The exists gate and the logging stay
+    in the facade; every read error and parse error propagates for the
+    facade to log.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.shuffle_prefs_read_file``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_prefs_file(path: Path, text: str) -> None:
+    """The atomic write behind ``ShufflePreferences._save``.
+
+    The pure core of the save's write step: the parent-directory
+    creation, the ``.tmp`` sibling (the path's own suffix plus
+    ``.tmp``, through pathlib's ``with_suffix``), the UTF-8 write and
+    the atomic replace. The snapshot + serialisation (the core's
+    ``dump_json``) and the logging stay in the facade; every error
+    propagates for the facade to log.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.shuffle_prefs_write_file``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
 
 
 class _ShufflePrefsCore:
@@ -109,14 +153,37 @@ class _ShufflePrefsCore:
         return len(self._prefs)
 
 
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same engines; these bindings replace the
+# pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        shuffle_prefs_read_file as _native_read_prefs_file,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        shuffle_prefs_write_file as _native_write_prefs_file,
+    )
+except ImportError:
+    pass
+else:
+    _read_prefs_file = _native_read_prefs_file  # type: ignore[assignment]
+    _write_prefs_file = _native_write_prefs_file  # type: ignore[assignment]
+
+
 class ShufflePreferences:
     """Thread-safe persistent dict of {context_id: shuffle_enabled}.
 
     Thin locking facade over a ``ShufflePrefsCore`` (the native Rust
     engine when the extension is built, the pure-Python transcription
-    otherwise): the lock, the falsy-context guards, the JSON parse of
-    the file and its atomic write live here; the ordered map, its
-    ingestion and its serialisation live in the core.
+    otherwise) and the file engines ``_read_prefs_file`` /
+    ``_write_prefs_file`` (native when built, transcribed otherwise):
+    the lock, the falsy-context guards, the exists gate and the
+    logging live here; the ordered map, its ingestion and its
+    serialisation live in the core, and the file read/parse and the
+    atomic write in the engines.
     """
 
     def __init__(self, path: Path) -> None:
@@ -149,7 +216,7 @@ class ShufflePreferences:
         if not self._path.exists():
             return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
+            data = _read_prefs_file(self._path)
             self._core.load(data)
         except Exception:
             logger.exception("Failed to load shuffle prefs from %s", self._path)
@@ -161,9 +228,6 @@ class ShufflePreferences:
         with self._lock:
             text = self._core.dump_json()
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(text, encoding="utf-8")
-            tmp.replace(self._path)
+            _write_prefs_file(self._path, text)
         except Exception:
             logger.exception("Failed to save shuffle prefs to %s", self._path)

@@ -538,8 +538,18 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // str-key filter, the bool(v) truthiness coercion and the for k, v
     // unpacking contract), and the lock-held snapshot +
     // json.dumps(..., indent=2) serialisation behind _save — with the
-    // thread lock and the file I/O staying Python-side in the facade.
+    // thread lock and the logging staying Python-side in the facade.
     module.add_class::<ShufflePrefsCore>()?;
+    // The prefs file's disk I/O cores (also services/shuffle_prefs.py):
+    // the read behind _load — the path's own read_text driven from
+    // native, the JSON parse through the ported CPython-grammar scanner
+    // with the interpreter's own json.loads rendering the exact
+    // rejection — and the atomic write behind _save — the parent mkdir,
+    // the pathlib with_suffix tmp sibling, the UTF-8 write and the
+    // os.replace cutover, each driven through the path object's own
+    // protocol so every error shape stays CPython's.
+    module.add_function(pyo3::wrap_pyfunction!(shuffle_prefs_read_file, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(shuffle_prefs_write_file, module)?)?;
 
     // Album-art cache LRU engine (ui/widgets/album_art.py equivalent):
     // the ordered URL→Text map behind the module-level art cache — the
@@ -11603,6 +11613,104 @@ impl ShufflePrefsCore {
     fn length(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// The read step behind `ShufflePreferences._load` — the pure core of
+/// the prefs file's disk I/O.
+///
+/// Mirrors the pure-Python transcription (`_read_prefs_file`):
+/// `path.read_text(encoding="utf-8")` — the read driven through the
+/// *path* object's own method, so a `Path`, a `Path` subclass or a stub
+/// steers both backends identically and every filesystem error shape
+/// (the `OSError` subclasses with their filename, the
+/// `UnicodeDecodeError` of an undecodable file) is CPython's own — and
+/// then `json.loads` over the read result through the ported
+/// CPython-grammar scanner. A scanner rejection — and every non-str
+/// result a stub's `read_text` might answer — falls through to the
+/// interpreter's own `json.loads` call over the same object, the same
+/// fallback the auth record parser uses for its exotic-decode path, so
+/// the error the caller sees (the `JSONDecodeError` class, message,
+/// `pos`/`lineno`/`colno`, or the `TypeError` of an unparseable shape)
+/// is exactly the reference's own; the scanner's accept/reject boundary
+/// mirrors `json.loads`'s, so the re-ask raises where the reference
+/// raises and the parity matrix pins the two together. The exists gate
+/// and the logging stay in the facade; the returned value passes
+/// through as the object the parse built.
+#[pyfunction]
+fn shuffle_prefs_read_file<'py>(
+    py: Python<'py>,
+    path: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // self._path.read_text(encoding="utf-8") — through the object's
+    // own method, the keyword spelled the reference's way.
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("encoding", "utf-8")?;
+    let text = path.getattr("read_text")?.call((), Some(&kwargs))?;
+    // json.loads(text) — the ported scanner over a str, the
+    // interpreter's own json.loads for every other shape.
+    match text.downcast::<PyString>() {
+        Ok(text) => match json_loads(py, text) {
+            Ok(value) => Ok(value),
+            Err(JsonReject::Py(err)) => Err(err),
+            Err(JsonReject::Reject) => py.import("json")?.getattr("loads")?.call1((text,)),
+        },
+        Err(_) => py.import("json")?.getattr("loads")?.call1((text,)),
+    }
+}
+
+/// The write step behind `ShufflePreferences._save` — the pure core of
+/// the prefs file's disk I/O.
+///
+/// Mirrors the pure-Python transcription (`_write_prefs_file`), every
+/// operation driven through the *path* object's own protocol so a
+/// `Path`, a `Path` subclass or a stub steers both backends
+/// identically and every error shape is CPython's own:
+///
+/// - `path.parent.mkdir(parents=True, exist_ok=True)` — the parent
+///   property read, then the directory creation through the parent's
+///   own method with both keywords spelled the reference's way.
+/// - `path.with_suffix(path.suffix + ".tmp")` — the suffix read
+///   through the property, the `+ ".tmp"` through CPython's own
+///   operator (`operator.add`, so a str subclass's overridden
+///   `__add__` steers both backends identically), and the sibling
+///   built through the path's own `with_suffix` (its `ValueError`
+///   shapes for the degenerate names included).
+/// - `tmp.write_text(text, encoding="utf-8")` — the serialised state
+///   written through the sibling's own method, the text passed through
+///   as the object it is.
+/// - `tmp.replace(path)` — the atomic cutover through the sibling's
+///   own `os.replace` delegation, the final path passed through as
+///   the object it is.
+///
+/// The snapshot + serialisation (the core's `dump_json`) and the
+/// logging stay in the facade; the statement order is the reference's
+/// own, so a failure leaves exactly the partial state the reference's
+/// would.
+#[pyfunction]
+fn shuffle_prefs_write_file<'py>(
+    py: Python<'py>,
+    path: &Bound<'py, PyAny>,
+    text: &Bound<'py, PyAny>,
+) -> PyResult<()> {
+    // self._path.parent.mkdir(parents=True, exist_ok=True)
+    let parent = path.getattr("parent")?;
+    let mkdir_kwargs = PyDict::new(py);
+    mkdir_kwargs.set_item("parents", true)?;
+    mkdir_kwargs.set_item("exist_ok", true)?;
+    parent.getattr("mkdir")?.call((), Some(&mkdir_kwargs))?;
+    // tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+    let suffix = path.getattr("suffix")?;
+    let add = py.import("operator")?.getattr("add")?;
+    let new_suffix = add.call1((suffix, ".tmp"))?;
+    let tmp = path.getattr("with_suffix")?.call1((new_suffix,))?;
+    // tmp.write_text(text, encoding="utf-8")
+    let write_kwargs = PyDict::new(py);
+    write_kwargs.set_item("encoding", "utf-8")?;
+    tmp.getattr("write_text")?
+        .call((text,), Some(&write_kwargs))?;
+    // tmp.replace(self._path)
+    tmp.getattr("replace")?.call1((path,))?;
+    Ok(())
 }
 
 /// The LRU bookkeeping engine behind the album-art widget's module-level

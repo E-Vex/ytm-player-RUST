@@ -5,15 +5,19 @@ The engine behind ``ShufflePreferences``: the ordered
 move_to_end and evict-while-over walk, the hand-edited-file ingestion
 (the dict gate, the str-key filter, the bool(v) truthiness coercion)
 and the snapshot + ``json.dumps(..., indent=2)`` serialisation behind
-``_save``. The pure-Python reference lives in
-``services/shuffle_prefs.py`` (``_ShufflePrefsCore``); when the Rust
-extension is built the same engine runs natively
-(``_ytm_player_native.ShufflePrefsCore``).
+``_save`` — plus the disk-I/O engines ``_read_prefs_file`` /
+``_write_prefs_file`` behind ``_load`` / ``_save`` (the file read +
+``json.loads`` parse, and the parent-mkdir / tmp-sibling / write /
+replace atomic write). The pure-Python references live in
+``services/shuffle_prefs.py`` (``_ShufflePrefsCore`` and the module
+transcriptions); when the Rust extension is built the same engines run
+natively (``_ytm_player_native.ShufflePrefsCore``,
+``shuffle_prefs_read_file`` and ``shuffle_prefs_write_file``).
 
-The unit tests below assert the engine's contract on whichever backend
+The unit tests below assert the engines' contract on whichever backend
 is loaded. When the extension is built, the parity tests additionally
-compare the native engine against the pure-Python reference (run in a
-child interpreter with the extension import blocked) operation for
+compare the native engines against the pure-Python references (run in
+a child interpreter with the extension import blocked) operation for
 operation, so the two implementations cannot drift apart.
 """
 
@@ -552,3 +556,379 @@ class TestNativeParity:
             assert native_steps == fallback_steps, (
                 f"native and fallback shuffle-prefs results differ for case {case}"
             )
+
+
+# ── file engines: read + parse, atomic write ─────────────────────────
+
+
+class TestReadPrefsFile:
+    """The `_read_prefs_file` engine — the file read + `json.loads`
+    parse behind `ShufflePreferences._load`, on whichever backend is
+    loaded (the native `shuffle_prefs_read_file` when the extension is
+    built, the pure-Python transcription otherwise)."""
+
+    def test_parses_dict_payload(self, tmp_path):
+        target = tmp_path / "shuffle_prefs.json"
+        target.write_text('{\n  "PLabc": true\n}', encoding="utf-8")
+        assert _sp._read_prefs_file(target) == {"PLabc": True}
+
+    def test_parses_non_dict_json_shapes(self, tmp_path):
+        # The engine answers whatever json.loads answers; the dict gate
+        # lives in the core's ingestion, not in the read.
+        for text, expected in [
+            ("[1, 2]", [1, 2]),
+            ('"plain"', "plain"),
+            ("null", None),
+            ("3.5", 3.5),
+            ("42", 42),
+            ("NaN", float("nan")),
+            ("Infinity", float("inf")),
+            ("-Infinity", float("-inf")),
+            ('  {"k": "v"}  ', {"k": "v"}),
+            ("1e999", float("inf")),
+        ]:
+            target = tmp_path / "prefs.json"
+            target.write_text(text, encoding="utf-8")
+            got = _sp._read_prefs_file(target)
+            if isinstance(got, float) and got != got:
+                assert expected != expected  # NaN identity
+            else:
+                assert got == expected, text
+
+    def test_parses_unicode_payload(self, tmp_path):
+        target = tmp_path / "prefs.json"
+        target.write_text('{"日本語": true, "emoji🎧": false}', encoding="utf-8")
+        assert _sp._read_prefs_file(target) == {"日本語": True, "emoji🎧": False}
+
+    def test_bad_json_raises_stdlib_shaped_decode_error(self, tmp_path):
+        import json as _json
+
+        for text in ["{bad}", "", "[1,", "{'x': 1}", '{"a": }', "tru"]:
+            target = tmp_path / "prefs.json"
+            target.write_text(text, encoding="utf-8")
+            with pytest.raises(_json.JSONDecodeError) as engine_err:
+                _sp._read_prefs_file(target)
+            with pytest.raises(_json.JSONDecodeError) as stdlib_err:
+                _json.loads(text)
+            assert str(engine_err.value) == str(stdlib_err.value), text
+            assert engine_err.value.pos == stdlib_err.value.pos, text
+
+    def test_invalid_utf8_raises_unicode_decode_error(self, tmp_path):
+        target = tmp_path / "prefs.json"
+        target.write_bytes(b'{"a": "\xff"}')
+        with pytest.raises(UnicodeDecodeError):
+            _sp._read_prefs_file(target)
+
+    def test_missing_file_raises_with_filename(self, tmp_path):
+
+        target = tmp_path / "missing.json"
+        with pytest.raises(OSError) as err:
+            _sp._read_prefs_file(target)
+        assert err.value.filename == str(target)
+
+    def test_directory_path_raises_os_error(self, tmp_path):
+        with pytest.raises(OSError):
+            _sp._read_prefs_file(tmp_path)
+
+    def test_stub_read_text_answering_bytes_parses_like_json_loads(self):
+        # The transcription is json.loads(path.read_text(...)) — a stub
+        # whose read_text answers bytes keeps json.loads' bytes lane on
+        # both backends.
+        class StubPath:
+            def read_text(self, encoding=None, **kwargs):
+                assert encoding == "utf-8"
+                return b'{"a": 1}'
+
+        assert _sp._read_prefs_file(StubPath()) == {"a": 1}
+
+    def test_stub_read_text_error_propagates(self):
+        class StubPath:
+            def read_text(self, encoding=None, **kwargs):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _sp._read_prefs_file(StubPath())
+
+
+class TestWritePrefsFile:
+    """The `_write_prefs_file` engine — the atomic write behind
+    `ShufflePreferences._save`, on whichever backend is loaded (the
+    native `shuffle_prefs_write_file` when the extension is built, the
+    pure-Python transcription otherwise)."""
+
+    def test_writes_content_and_leaves_no_tmp(self, tmp_path):
+        target = tmp_path / "shuffle_prefs.json"
+        _sp._write_prefs_file(target, '{\n  "a": true\n}')
+        assert target.read_text(encoding="utf-8") == '{\n  "a": true\n}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["shuffle_prefs.json"]
+
+    def test_creates_parent_directories(self, tmp_path):
+        target = tmp_path / "nested" / "deeper" / "prefs.json"
+        _sp._write_prefs_file(target, "1")
+        assert target.read_text(encoding="utf-8") == "1"
+
+    def test_overwrites_existing(self, tmp_path):
+        target = tmp_path / "prefs.json"
+        _sp._write_prefs_file(target, "first")
+        _sp._write_prefs_file(target, "second")
+        assert target.read_text(encoding="utf-8") == "second"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["prefs.json"]
+
+    def test_tmp_sibling_is_suffix_plus_tmp(self, tmp_path):
+        # The sibling is <name>.json.tmp (the path's own suffix kept),
+        # pinned by blocking that exact name with a directory: the
+        # write must fail against it, proving which sibling it used.
+        target = tmp_path / "prefs.json"
+        (tmp_path / "prefs.json.tmp").mkdir()
+        with pytest.raises(OSError):
+            _sp._write_prefs_file(target, "x")
+
+    def test_edge_names_get_their_tmp_sibling(self, tmp_path):
+        for name in ("no_suffix", ".hidden", "a.b.c"):
+            case_dir = tmp_path / name.replace(".", "_")
+            target = case_dir / name
+            _sp._write_prefs_file(target, "x")
+            assert target.read_text(encoding="utf-8") == "x"
+            # Only the final file remains — the .tmp sibling (whatever
+            # pathlib derived it to be) was consumed by the replace.
+            assert [p.name for p in sorted(case_dir.iterdir())] == [name]
+
+    def test_write_error_propagates(self, tmp_path):
+        target = tmp_path / "prefs.json"
+        (tmp_path / "prefs.json.tmp").mkdir()
+        with pytest.raises(OSError):
+            _sp._write_prefs_file(target, "x")
+        # The final file was never created.
+        assert not target.exists()
+
+    def test_drives_the_path_objects_own_protocol(self, tmp_path):
+        # The engine drives read/write through the path object's own
+        # methods, so a recording Path subclass steers both backends
+        # identically — the same contract the cache walk engines keep.
+        from pathlib import Path
+
+        calls: list[str] = []
+
+        class RecordingPath(Path):
+            def read_text(self, encoding=None, **kwargs):
+                calls.append("read_text")
+                return Path.read_text(self, encoding=encoding, **kwargs)
+
+            def write_text(self, data, encoding=None, **kwargs):
+                calls.append("write_text")
+                return Path.write_text(self, data, encoding=encoding, **kwargs)
+
+            def replace(self, target):
+                calls.append("replace")
+                return Path.replace(self, target)
+
+        target = RecordingPath(tmp_path / "prefs.json")
+        _sp._write_prefs_file(target, '{"a": true}')
+        assert "write_text" in calls
+        assert "replace" in calls
+        assert target.read_text(encoding="utf-8") == '{"a": true}'
+        assert _sp._read_prefs_file(target) == {"a": True}
+        assert "read_text" in calls
+
+    def test_stub_with_suffix_error_propagates(self):
+        class StubParent:
+            def mkdir(self, **kwargs):
+                return None
+
+        class StubPath:
+            parent = StubParent()
+
+            @property
+            def suffix(self):
+                return ".json"
+
+            def with_suffix(self, new_suffix):
+                raise ValueError("Invalid suffix %r" % (new_suffix,))
+
+        with pytest.raises(ValueError, match="Invalid suffix"):
+            _sp._write_prefs_file(StubPath(), "x")
+
+
+# ── file engines: native vs fallback parity ──────────────────────────
+
+# Op sequences the two file-engine implementations must agree on, case
+# for case, over a fresh directory each: the read across the JSON
+# payload shapes (dicts, non-dicts, the NaN/Infinity spellings, the
+# big-int and inf exponents, padded whitespace, unicode), the read
+# rejections (bad JSON shapes, an empty file, invalid UTF-8 bytes, a
+# directory, a missing file) and the write (plain, nested parents,
+# suffixless/hidden/multi-dot names, the overwrite, the tmp sibling
+# blocked by a directory).
+_FILE_PARITY_CASES: list = [
+    [["preset", "prefs.json", '{"a": true}'], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "[1, 2]"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", '"str"'], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "null"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "NaN"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "Infinity"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "-Infinity"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "1e999"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "123456789012345678901234567890"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", '  {"k": "v"}  '], ["read", "prefs.json"]],
+    [["preset", "prefs.json", '{"日本語": true, "emoji🎧": false}'], ["read", "prefs.json"]],
+    [["preset", "prefs.json", '{"a": "\\u00e9"}'], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "{bad}"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", ""], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "[1,"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "{'x': 1}"], ["read", "prefs.json"]],
+    [["preset", "prefs.json", '{"a": }'], ["read", "prefs.json"]],
+    [["preset", "prefs.json", "<undecodable>"], ["read", "prefs.json"]],
+    [["preset", "<dir>", ""], ["read", "<dir>"]],
+    [["read", "missing.json"]],
+    [
+        ["preset", "prefs.json", "old"],
+        ["write", "prefs.json", "new"],
+        ["read", "prefs.json"],
+        ["tree"],
+    ],
+    [["write", "nested/deeper/prefs.json", "1"], ["tree"]],
+    [["write", "no_suffix", "x"], ["tree"]],
+    [["write", ".hidden", "x"], ["tree"]],
+    [["write", "a.b.c", "x"], ["tree"]],
+    [["preset", "prefs.json.tmp", "<dir>"], ["write", "prefs.json", "x"], ["tree"]],
+]
+
+_FILE_CHILD_PROG = """
+import json, pathlib, sys
+sys.modules["ytm_player.utils._ytm_player_native"] = None
+from ytm_player.services.shuffle_prefs import _read_prefs_file, _write_prefs_file
+
+root = pathlib.Path(sys.argv[1])
+out = []
+for op in json.load(sys.stdin):
+    kind = op[0]
+    if kind == "preset":
+        name, payload = op[1], op[2]
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if payload == "<dir>":
+            path.mkdir(parents=True, exist_ok=True)
+        elif payload == "<undecodable>":
+            path.write_bytes('{"a": "\\udcff"}'.encode("utf-8", "surrogateescape"))
+        else:
+            path.write_text(payload, encoding="utf-8")
+        out.append(["preset"])
+    elif kind == "read":
+        try:
+            out.append(["ok", repr(_read_prefs_file(root / op[1]))])
+        except BaseException as exc:
+            out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+    elif kind == "write":
+        try:
+            _write_prefs_file(root / op[1], op[2])
+            out.append(["ok"])
+        except BaseException as exc:
+            out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+    elif kind == "tree":
+        entries = []
+        for path in sorted(root.rglob("*")):
+            rel = str(path.relative_to(root))
+            if path.is_dir():
+                entries.append([rel, "<dir>"])
+            else:
+                data = path.read_bytes()
+                try:
+                    entries.append([rel, data.decode("utf-8")])
+                except UnicodeDecodeError:
+                    entries.append([rel, repr(data)])
+        out.append(["tree", entries])
+    else:
+        raise AssertionError(kind)
+json.dump(out, sys.stdout)
+"""
+
+
+def _run_file_cases_native(cases: list, root) -> list:
+    """Run *cases* against the native file engines in-process, each
+    case's ops recorded exactly like the child program records them."""
+
+    def materialize(path, payload):
+        from pathlib import Path
+
+        path = Path(root) / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if payload == "<dir>":
+            path.mkdir(parents=True, exist_ok=True)
+        elif payload == "<undecodable>":
+            path.write_bytes('{"a": "\udcff"}'.encode("utf-8", "surrogateescape"))
+        else:
+            path.write_text(payload, encoding="utf-8")
+
+    out = []
+    for op in cases:
+        kind = op[0]
+        if kind == "preset":
+            materialize(op[1], op[2])
+            out.append(["preset"])
+        elif kind == "read":
+            try:
+                out.append(["ok", repr(_ytm_player_native.shuffle_prefs_read_file(root / op[1]))])
+            except BaseException as exc:
+                out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+        elif kind == "write":
+            try:
+                _ytm_player_native.shuffle_prefs_write_file(root / op[1], op[2])
+                out.append(["ok"])
+            except BaseException as exc:
+                out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+        elif kind == "tree":
+            entries = []
+            for path in sorted((root).rglob("*")):
+                rel = str(path.relative_to(root))
+                if path.is_dir():
+                    entries.append([rel, "<dir>"])
+                else:
+                    data = path.read_bytes()
+                    try:
+                        entries.append([rel, data.decode("utf-8")])
+                    except UnicodeDecodeError:
+                        entries.append([rel, repr(data)])
+            out.append(["tree", entries])
+        else:
+            raise AssertionError(kind)
+    return out
+
+
+def _run_file_cases_fallback(cases: list, root) -> list:
+    """Run *cases* against the pure-Python transcriptions in a child
+    interpreter with the native extension import blocked."""
+    result = subprocess.run(
+        [sys.executable, "-c", _FILE_CHILD_PROG, str(root)],
+        input=json.dumps(cases),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+class TestFileEngineParity:
+    """When the Rust extension is built, the native file engines must
+    answer every case exactly like the pure-Python transcriptions run
+    in a child interpreter with the extension import blocked — the
+    parsed payloads, the rejections with their error types and
+    messages, the resulting file trees and the tmp-sibling blocking
+    included — so the two implementations cannot drift.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_file_engines_match_fallback(self, tmp_path):
+        import shutil
+
+        native_root = tmp_path / "native"
+        fallback_root = tmp_path / "fallback"
+        for case in _FILE_PARITY_CASES:
+            native_root.mkdir()
+            fallback_root.mkdir()
+            try:
+                native = _run_file_cases_native(case, native_root)
+                fallback = _run_file_cases_fallback(case, fallback_root)
+            finally:
+                shutil.rmtree(native_root)
+                shutil.rmtree(fallback_root)
+            assert native == fallback, f"file-engine results differ for {case}"
