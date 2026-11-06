@@ -19,13 +19,19 @@ so users can self-discover which regions work for them.
 
 Layout: ``ZZ`` (Global) first as the default, then alphabetical by
 display name.
+
+The table (``CHART_REGIONS``) and the locale normaliser
+(``normalise_region``) are implemented by the Rust extension
+(``_ytm_player_native.chart_regions`` / ``normalise_region``) when it
+is built; the pure-Python literal and function below are the
+fallback otherwise.
 """
 
 from __future__ import annotations
 
-# Try to load the native Rust implementation via PyO3.  If the compiled
+# Try to load the native Rust implementations via PyO3.  If the compiled
 # extension is unavailable (e.g. during development without a Rust toolchain),
-# fall back to the pure-Python implementation defined below.  The extension
+# fall back to the pure-Python implementations defined below.  The extension
 # module lives in the utils package next to the other native bindings.
 try:
     from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -104,6 +110,23 @@ CHART_REGIONS: tuple[tuple[str, str], ...] = (
     ("VN", "Vietnam"),
     ("ZW", "Zimbabwe"),
 )
+
+# ── Native (Rust/PyO3) override, if available ──────────────────────────
+# The Rust extension implements the same table; this binding replaces the
+# pure-Python literal above when the extension is importable.  The
+# rebinding must happen AFTER the literal above — assigning the native
+# table any earlier would be clobbered by the tuple assignment.
+
+try:
+    from ..utils._ytm_player_native import (  # type: ignore[import-not-found]
+        chart_regions as _native_chart_regions,
+    )
+except ImportError:
+    pass
+else:
+    # The engine answers the pairs as a list of (code, name) tuples;
+    # wrap into the tuple-of-tuples shape the literal spells.
+    CHART_REGIONS = tuple(_native_chart_regions())
 
 
 def normalise_region(value: str) -> str:

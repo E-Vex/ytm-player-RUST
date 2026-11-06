@@ -121,3 +121,80 @@ class TestNormaliseRegion:
         from ytm_player.services.regions import normalise_region
 
         assert normalise_region("") == ""
+
+
+class TestChartRegionsEngine:
+    """The table on whichever backend is loaded — the native
+    ``chart_regions`` engine wrapped into the tuple-of-tuples shape when
+    the extension is built, the pure-Python literal otherwise."""
+
+    def test_exact_length_is_68(self):
+        """62 advertised codes (incl. ZZ) + 6 historically-supported extras."""
+        from ytm_player.services.regions import CHART_REGIONS
+
+        assert len(CHART_REGIONS) == 68
+
+    def test_entries_are_str_pairs(self):
+        from ytm_player.services.regions import CHART_REGIONS
+
+        for code, name in CHART_REGIONS:
+            assert type(code) is str
+            assert type(name) is str
+
+    def test_known_anchors(self):
+        from ytm_player.services.regions import CHART_REGIONS
+
+        table = dict(CHART_REGIONS)
+        assert table["ES"] == "Spain"
+        assert table["US"] == "United States"
+        assert table["JP"] == "Japan"
+        assert table["MY"] == "Malaysia"
+
+    def test_extras_outside_the_advertised_list_present(self):
+        """HK/MY/SG/TW/TH/VN — historically returned chart data even
+        though YouTube's advertised list omits them."""
+        from ytm_player.services.regions import CHART_REGIONS
+
+        codes = {c for c, _ in CHART_REGIONS}
+        assert {"HK", "MY", "SG", "TW", "TH", "VN"} <= codes
+
+
+# ── native vs fallback parity ────────────────────────────────────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+
+class TestNativeParity:
+    """When the Rust extension is built, the native chart-region table
+    must answer exactly the literal the pure-Python fallback binds —
+    every pair, in the reference's order — so the two spellings cannot
+    drift.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_native_table_matches_fallback_literal(self):
+        import json
+        import subprocess
+        import sys
+
+        prog = (
+            "import sys; "
+            "sys.modules['ytm_player.utils._ytm_player_native'] = None; "
+            "from ytm_player.services.regions import CHART_REGIONS; "
+            "import json; print(json.dumps(CHART_REGIONS))"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", prog], capture_output=True, text=True, check=True
+        )
+        fallback = [tuple(pair) for pair in json.loads(out.stdout)]
+        native = list(_ytm_player_native.chart_regions())
+        assert native == fallback
+        # And the module binding is the wrapped native table.
+        from ytm_player.services.regions import CHART_REGIONS
+
+        assert tuple(native) == CHART_REGIONS
