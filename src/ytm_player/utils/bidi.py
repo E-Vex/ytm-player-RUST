@@ -268,7 +268,10 @@ try:
         reorder_line as _native_reorder_line,
     )
     from ._ytm_player_native import (
-        wrap_line as _native_wrap_line,
+        reorder_rtl_line as _native_reorder_rtl_line,
+    )
+    from ._ytm_player_native import (
+        wrap_rtl_line as _native_wrap_rtl_line,
     )
 except ImportError:
     pass
@@ -279,17 +282,24 @@ else:
     _do_reorder = _native_reorder_line  # type: ignore[assignment]
 
     def reorder_rtl_line(text: str) -> str:  # noqa: F811
-        """Reorder words in a line for RTL display, if enabled (native)."""
-        if not text or not has_rtl(text):
+        """Reorder words in a line for RTL display, if enabled (native).
+
+        The falsy passthrough aside, the empty/no-RTL gates, the
+        ``bidi_mode`` verdict and the UAX #9 word-level reversal all
+        run inside one native call; only the cached settings read
+        stays here.
+        """
+        if not text:
             return text
-        if not _get_reorder_enabled():
-            return text
-        return _native_reorder_line(text)
+        return _native_reorder_rtl_line(text, _get_reorder_enabled())
 
     def wrap_rtl_line(text: str, width: int) -> str:  # noqa: F811
-        """Pre-wrap RTL text for multi-line display, with reordering (native)."""
-        if not text or not has_rtl(text):
+        """Pre-wrap RTL text for multi-line display, with reordering (native).
+
+        The falsy passthrough aside, the gates, the word wrap and the
+        per-line reorder join all run inside one native call; only the
+        cached settings read stays here.
+        """
+        if not text:
             return text
-        if not _get_reorder_enabled():
-            return text
-        return _native_wrap_line(text, width)
+        return _native_wrap_rtl_line(text, width, _get_reorder_enabled())

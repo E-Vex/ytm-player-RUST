@@ -129,6 +129,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(isolate_bidi, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(reorder_line, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(wrap_line, module)?)?;
+    // The gated public wrappers behind the render path — the hot
+    // per-fragment line reorder and the lyrics sidebar's multi-line
+    // pre-wrap, each with the empty/no-RTL passthrough and the
+    // bidi_mode verdict folded into one native call (the cached
+    // settings read stays Python-side, passed in as a bool).
+    module.add_function(pyo3::wrap_pyfunction!(reorder_rtl_line, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(wrap_rtl_line, module)?)?;
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
@@ -1625,15 +1632,17 @@ fn reorder_line(text: &str) -> String {
     do_reorder(text)
 }
 
-/// Pre-wrap RTL text for multi-line display with reordering applied.
-/// Raw version — the `bidi_mode` gate lives in Python.  Mirrors
-/// `bidi.wrap_rtl_line` *as if reordering were enabled*.
-#[pyfunction]
-fn wrap_line(text: &str, width: i64) -> String {
-    if text.is_empty() || !text.chars().any(is_rtl_char) {
-        return text.to_string();
-    }
-
+/// The wrap-then-reorder pipeline behind both wrap engines — the
+/// reorder-enabled body of `bidi.wrap_rtl_line`: the
+/// `len(text) <= width or width <= 0` short-circuit answering the bare
+/// line reorder, the whitespace word walk packing `needed <= width`
+/// runs (`needed` = the word alone for a fresh line, the running length
+/// plus one plus the word otherwise — the reference's `+ 1 +` join
+/// budget), an over-wide word starting its own line with the pending
+/// run flushed first, and the join with every line reordered through
+/// `_do_reorder` exactly like the reference's generator join. Called
+/// only after the caller's empty/no-RTL gate.
+fn wrap_line_impl(text: &str, width: i64) -> String {
     let char_count = text.chars().count() as i64;
     if char_count <= width || width <= 0 {
         return do_reorder(text);
@@ -1675,6 +1684,60 @@ fn wrap_line(text: &str, width: i64) -> String {
         .map(|line| do_reorder(line))
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+/// Pre-wrap RTL text for multi-line display with reordering applied.
+/// Raw version — the `bidi_mode` gate lives in Python.  Mirrors
+/// `bidi.wrap_rtl_line` *as if reordering were enabled*.
+#[pyfunction]
+fn wrap_line(text: &str, width: i64) -> String {
+    if text.is_empty() || !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    wrap_line_impl(text, width)
+}
+
+/// The gated line reorder every rendered RTL fragment funnels through —
+/// the public `reorder_rtl_line` of `bidi.py` with the `bidi_mode` gate
+/// folded in. The track-table cells, the playback-bar fragments and the
+/// lyric lines all pass through here once per render.
+///
+/// Mirrors the pure-Python reference: empty text, text without any RTL
+/// script character (the `has_rtl` scan) and a disabled reorder flag
+/// (the cached `bidi_mode` verdict, read Python-side so user settings
+/// keep steering both backends) all answer *text* unchanged — the
+/// passthrough that keeps `bidi_mode="auto"` and `"passthrough"`
+/// free of any transformation; otherwise the UAX #9 L2 word-level
+/// reversal of `_do_reorder`. The gate order differs from the
+/// reference's statement order (the flag read before the RTL scan) but
+/// no observable behaviour does: neither test has a side effect, and
+/// every gate answers the same *text* back.
+#[pyfunction]
+#[pyo3(signature = (text, reorder_enabled))]
+fn reorder_rtl_line(text: &str, reorder_enabled: bool) -> String {
+    if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    do_reorder(text)
+}
+
+/// The gated multi-line pre-wrap behind the lyrics sidebar's line
+/// rendering — the public `wrap_rtl_line` of `bidi.py` with the
+/// `bidi_mode` gate folded in.
+///
+/// Mirrors the pure-Python reference: the same empty/no-RTL/disabled
+/// passthrough as the line reorder, then the wrap-then-reorder pipeline
+/// of `wrap_line_impl` (the width short-circuit, the word walk, the
+/// per-line reorder join). The reorder-enabled flag is read Python-side
+/// (the cached `bidi_mode` verdict) and travels in as a plain bool, so
+/// one native call renders a whole gated wrap.
+#[pyfunction]
+#[pyo3(signature = (text, width, reorder_enabled))]
+fn wrap_rtl_line(text: &str, width: i64, reorder_enabled: bool) -> String {
+    if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
+        return text.to_string();
+    }
+    wrap_line_impl(text, width)
 }
 
 // ---------------------------------------------------------------------------

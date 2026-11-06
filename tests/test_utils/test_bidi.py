@@ -9,8 +9,11 @@ Tests for the internal _do_reorder function verify the UAX #9 logic
 still works when bidi_mode="reorder" is explicitly set.
 """
 
+import sys
+
 import pytest
 
+import ytm_player.utils.bidi as bidi
 from ytm_player.utils.bidi import (
     FSI,
     PDI,
@@ -224,4 +227,235 @@ class TestIsolateBidiCallSites:
                 f"{rel_path} must call {token} to prevent RTL BiDi bleed. "
                 "Wrap user text fragments (title, artist, album, lyrics) "
                 "with isolate_bidi() AFTER truncate()."
+            )
+
+
+# ── Gated reorder (bidi_mode="reorder" forced on) ────────────────────
+
+
+class TestGatedReorderEnabled:
+    """The public reorder_rtl_line/wrap_rtl_line with the cached
+    ``bidi_mode`` verdict forced on — the render-path behaviour every
+    fragment funnels through when a user opts into reordering."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        reset_bidi_cache()
+        bidi._should_reorder = True
+        yield
+        reset_bidi_cache()
+
+    def test_reorder_reverses_rtl_words(self):
+        assert reorder_rtl_line("عيون القلب") == "القلب عيون"
+
+    def test_reorder_mixed_keeps_ltr_blocks(self):
+        assert reorder_rtl_line("كلمات DJ Khaled أغنية") == "أغنية DJ Khaled كلمات"
+
+    def test_reorder_ltr_text_unchanged(self):
+        assert reorder_rtl_line("Hello World") == "Hello World"
+
+    def test_reorder_empty_unchanged(self):
+        assert reorder_rtl_line("") == ""
+
+    def test_reorder_falsy_passthrough(self):
+        # The falsy gate runs before any native call, so None (and any
+        # other falsy input a defensive caller might pass) passes
+        # through exactly like the pure-Python reference.
+        assert reorder_rtl_line(None) is None  # type: ignore[arg-type]
+
+    def test_wrap_short_line_reorders_without_wrapping(self):
+        # len(text) <= width answers the bare line reorder.
+        assert wrap_rtl_line("عيون القلب", 80) == "القلب عيون"
+
+    def test_wrap_zero_width_reorders_without_wrapping(self):
+        # width <= 0 answers the bare line reorder too.
+        assert wrap_rtl_line("عيون القلب", 0) == "القلب عيون"
+
+    def test_wrap_negative_width_reorders_without_wrapping(self):
+        assert wrap_rtl_line("عيون القلب", -3) == "القلب عيون"
+
+    def test_wrap_splits_over_wide_lines(self):
+        assert wrap_rtl_line("يا ليل يا عين طويل", 9) == "يا ليل يا\nطويل عين"
+
+    def test_wrap_over_wide_word_gets_its_own_line(self):
+        assert wrap_rtl_line("مرحبا", 2) == "مرحبا"
+
+    def test_wrap_ltr_text_unchanged(self):
+        assert wrap_rtl_line("Hello World", 4) == "Hello World"
+
+
+class TestGatedReorderDisabled:
+    """The same public functions with the cached verdict forced off —
+    the passthrough every fragment answers when reordering is disabled
+    (the default ``bidi_mode="auto"``), RTL text included."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        reset_bidi_cache()
+        bidi._should_reorder = False
+        yield
+        reset_bidi_cache()
+
+    def test_reorder_rtl_unchanged(self):
+        assert reorder_rtl_line("عيون القلب") == "عيون القلب"
+
+    def test_wrap_rtl_unchanged(self):
+        assert wrap_rtl_line("يا ليل يا عين طويل", 9) == "يا ليل يا عين طويل"
+
+
+# ── native vs fallback parity ────────────────────────────────────────
+
+try:
+    from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
+except ImportError:
+    _ytm_player_native = None
+
+_HAVE_NATIVE = _ytm_player_native is not None
+
+
+@pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+class TestGatedEngineContract:
+    """The gated native engines taken directly — the empty/no-RTL/disabled
+    passthroughs and the folded ``bidi_mode`` verdict, independent of the
+    Python wrappers that read the cached setting."""
+
+    def test_reorder_passthrough_when_disabled(self):
+        assert _ytm_player_native.reorder_rtl_line("عيون القلب", False) == "عيون القلب"
+
+    def test_reorder_passthrough_without_rtl(self):
+        assert _ytm_player_native.reorder_rtl_line("Hello World", True) == "Hello World"
+
+    def test_reorder_passthrough_empty(self):
+        assert _ytm_player_native.reorder_rtl_line("", True) == ""
+
+    def test_reorder_reverses_when_enabled(self):
+        assert _ytm_player_native.reorder_rtl_line("عيون القلب", True) == "القلب عيون"
+
+    def test_wrap_passthrough_when_disabled(self):
+        assert _ytm_player_native.wrap_rtl_line("يا ليل يا عين طويل", 9, False) == (
+            "يا ليل يا عين طويل"
+        )
+
+    def test_wrap_passthrough_without_rtl(self):
+        assert _ytm_player_native.wrap_rtl_line("Hello World", 4, True) == "Hello World"
+
+    def test_wrap_passthrough_empty(self):
+        assert _ytm_player_native.wrap_rtl_line("", 4, True) == ""
+
+    def test_wrap_pipeline_when_enabled(self):
+        assert _ytm_player_native.wrap_rtl_line("يا ليل يا عين طويل", 9, True) == (
+            "يا ليل يا\nطويل عين"
+        )
+
+    def test_wrap_short_line_becomes_bare_reorder(self):
+        assert _ytm_player_native.wrap_rtl_line("عيون القلب", 80, True) == "القلب عيون"
+
+
+# Op sequences the two implementations must agree on, case for case:
+# the reorder across pure-RTL / mixed / neutral / empty / whitespace
+# inputs with the gate both on and off, and the wrap across the width
+# short-circuit edges (0, negative, exact-len, len+1), the join-budget
+# splits, the over-wide-word own line and the per-line reorder join.
+_PARITY_CASES: list = [
+    ["reorder", "عيون القلب", 0, True],
+    ["reorder", "يا ليل يا عين", 0, True],
+    ["reorder", "بِسْمِ اللَّهِ", 0, True],
+    ["reorder", "שלום עולם", 0, True],
+    ["reorder", "Beautiful Day - محمد حماقي", 0, True],
+    ["reorder", "كلمات DJ Khaled أغنية", 0, True],
+    ["reorder", "فيروز feat. Rahbani", 0, True],
+    ["reorder", "أغنية رقم 3", 0, True],
+    ["reorder", "أنشودة (رائعة)", 0, True],
+    ["reorder", "🎵 أغنية جميلة", 0, True],
+    ["reorder", "أحمد، محمد", 0, True],
+    ["reorder", "مرحبا", 0, True],
+    ["reorder", "Hello World", 0, True],
+    ["reorder", "12345", 0, True],
+    ["reorder", "\U0001f3b5 Music", 0, True],
+    ["reorder", "", 0, True],
+    ["reorder", "   ", 0, True],
+    ["reorder", "عيون القلب", 0, False],
+    ["reorder", "يا ليل يا عين", 0, False],
+    ["reorder", "Hello World", 0, False],
+    ["wrap", "يا ليل يا عين طويل", 9, True],
+    ["wrap", "يا ليل يا عين طويل", 9, False],
+    ["wrap", "أغنية جميلة جدا جدا جدا", 5, True],
+    ["wrap", "مرحبا", 2, True],
+    ["wrap", "مرحبا", 3, True],
+    ["wrap", "مرحبا", 4, True],
+    ["wrap", "مرحبا", 80, True],
+    ["wrap", "مرحبا", 0, True],
+    ["wrap", "مرحبا", -3, True],
+    ["wrap", "عيون القلب", 0, True],
+    ["wrap", "عيون القلب", -1, True],
+    ["wrap", "Hello عالم", 4, True],
+    ["wrap", "ش ك ي", 1, True],
+    ["wrap", "Hello World", 4, True],
+    ["wrap", "  ", 1, True],
+    ["wrap", "", 3, True],
+]
+
+_CHILD_PROG = """
+import json, sys
+sys.modules["ytm_player.utils._ytm_player_native"] = None
+import ytm_player.utils.bidi as bidi
+out = []
+for op, text, width, enabled in json.load(sys.stdin):
+    bidi._should_reorder = enabled
+    if op == "reorder":
+        out.append(bidi.reorder_rtl_line(text))
+    else:
+        out.append(bidi.wrap_rtl_line(text, width))
+print(json.dumps(out, ensure_ascii=False))
+"""
+
+
+def _run_cases(cases: list, in_child: bool) -> list:
+    """Run *cases* against the public gated functions — in a child
+    interpreter with the extension import blocked (the pure-Python
+    fallback) when *in_child*, in-process (the native-backed module)
+    otherwise."""
+    import json
+    import subprocess
+
+    if in_child:
+        out = subprocess.run(
+            [sys.executable, "-c", _CHILD_PROG],
+            input=json.dumps(cases),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(out.stdout)
+    results = []
+    saved = bidi._should_reorder
+    try:
+        for op, text, width, enabled in cases:
+            bidi._should_reorder = enabled
+            if op == "reorder":
+                results.append(bidi.reorder_rtl_line(text))
+            else:
+                results.append(bidi.wrap_rtl_line(text, width))
+    finally:
+        bidi._should_reorder = saved
+        reset_bidi_cache()
+    return results
+
+
+@pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+class TestNativeParity:
+    """When the Rust extension is built, the gated public functions must
+    answer every case exactly like the pure-Python fallback run in a
+    child interpreter with the extension import blocked — the passthrough
+    gates, the reorder reversals and the wrap splits included — so the
+    two implementations cannot drift.
+    """
+
+    def test_gated_functions_match_fallback(self):
+        native = _run_cases(_PARITY_CASES, in_child=False)
+        fallback = _run_cases(_PARITY_CASES, in_child=True)
+        for case, native_result, fallback_result in zip(_PARITY_CASES, native, fallback):
+            assert native_result == fallback_result, (
+                f"native and fallback bidi results differ for {case}: "
+                f"{native_result!r} != {fallback_result!r}"
             )
