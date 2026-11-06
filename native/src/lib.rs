@@ -715,7 +715,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // reset, or install the built one). The signature probe, the
     // locks, the YoutubeDL construction and the _active_resolves
     // accounting stay Python-side in the resolver.
-    module.add_function(pyo3::wrap_pyfunction!(stream_ydl_cookiejar_current, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        stream_ydl_cookiejar_current,
+        module
+    )?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_ydl_publish_verdict, module)?)?;
 
     // Download-service engines (services/download.py equivalents): the
@@ -14817,7 +14820,10 @@ fn ipc_request_gate<'py>(
         let presented_bytes = presented.getattr("encode")?.call1(("utf-8",))?;
         let token_bytes = token.getattr("encode")?.call1(("utf-8",))?;
         let compare_digest = ipc_module_compare_digest(py)?;
-        if !compare_digest.call1((presented_bytes, token_bytes))?.is_truthy()? {
+        if !compare_digest
+            .call1((presented_bytes, token_bytes))?
+            .is_truthy()?
+        {
             return ipc_gate_reject(py, "authentication failed");
         }
     }
