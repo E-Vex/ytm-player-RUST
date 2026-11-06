@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from ytm_player.ipc import (
     _MAX_MSG,
     _VALID_COMMANDS,
     IPCServer,
+    _ipc_request_gate,
     _ipc_request_tcp,
     _ipc_request_unix,
     get_running_pid,
@@ -440,6 +442,160 @@ class TestIPCPayloadValidation:
         assert len(payload.encode()) > 65536
 
 
+class TestIpcRequestGate:
+    """The token gate + command whitelist engine behind _client_connected.
+
+    These pin the engine's contract on whichever backend is loaded — the
+    pure-Python transcription when the extension is absent, the native
+    engine when it is built. The end-to-end transport suites above keep
+    exercising the whole _client_connected path on both backends.
+    """
+
+    def test_unix_transport_dispatches_without_a_token(self):
+        gate = _ipc_request_gate({"command": "play"}, None, _VALID_COMMANDS)
+        assert gate == {"verdict": "accept", "command": "play", "args": {}}
+
+    def test_tcp_matching_token_is_accepted(self):
+        gate = _ipc_request_gate({"command": "play", "token": "s3cret"}, "s3cret", _VALID_COMMANDS)
+        assert gate["verdict"] == "accept"
+        assert gate["command"] == "play"
+        assert gate["args"] == {}
+
+    def test_tcp_wrong_token_is_rejected(self):
+        gate = _ipc_request_gate(
+            {"command": "play", "token": "deadbeef"}, "s3cret", _VALID_COMMANDS
+        )
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_tcp_missing_token_is_rejected(self):
+        gate = _ipc_request_gate({"command": "play"}, "s3cret", _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_a_non_str_token_is_rejected_without_digesting(self, monkeypatch):
+        # A non-str member must fail through the isinstance gate before
+        # the digest ever runs — compare_digest would raise TypeError on
+        # a non-str/non-bytes operand and surface as "internal error".
+        def _boom(*args):
+            raise AssertionError("compare_digest must not run")
+
+        monkeypatch.setattr("ytm_player.ipc.secrets", SimpleNamespace(compare_digest=_boom))
+        for junk in (b"s3cret", 42, True, None):
+            gate = _ipc_request_gate({"command": "play", "token": junk}, "s3cret", _VALID_COMMANDS)
+            assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_the_token_gate_is_identity_not_truthiness(self):
+        """``token is not None`` — an empty-string server token still gates."""
+        gate = _ipc_request_gate({"command": "play"}, "", _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+        gate = _ipc_request_gate({"command": "play", "token": ""}, "", _VALID_COMMANDS)
+        assert gate["verdict"] == "accept"
+
+    def test_non_ascii_tokens_compare_on_their_bytes(self):
+        gate = _ipc_request_gate(
+            {"command": "play", "token": "caf\u00e9"}, "caf\u00e9", _VALID_COMMANDS
+        )
+        assert gate["verdict"] == "accept"
+        gate = _ipc_request_gate(
+            {"command": "play", "token": "cafe\u0301"}, "caf\u00e9", _VALID_COMMANDS
+        )
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_the_digest_is_read_through_the_module_name(self, monkeypatch):
+        """secrets.compare_digest resolves through ipc.py's own ``secrets``
+        name at call time — a patched namespace steers both backends, and
+        the encode order is the reference's (presented side first)."""
+        import secrets as real_secrets
+
+        calls = []
+
+        def spy(presented_bytes, token_bytes):
+            calls.append((presented_bytes, token_bytes))
+            return real_secrets.compare_digest(presented_bytes, token_bytes)
+
+        monkeypatch.setattr("ytm_player.ipc.secrets", SimpleNamespace(compare_digest=spy))
+        gate = _ipc_request_gate({"command": "play", "token": "t"}, "t", _VALID_COMMANDS)
+        assert gate["verdict"] == "accept"
+        assert calls == [(b"t", b"t")]
+
+    def test_the_digest_verdict_is_its_truthiness(self, monkeypatch):
+        monkeypatch.setattr(
+            "ytm_player.ipc.secrets", SimpleNamespace(compare_digest=lambda a, b: "yes")
+        )
+        gate = _ipc_request_gate({"command": "play", "token": "t"}, "t", _VALID_COMMANDS)
+        assert gate["verdict"] == "accept"
+
+        monkeypatch.setattr(
+            "ytm_player.ipc.secrets", SimpleNamespace(compare_digest=lambda a, b: "")
+        )
+        gate = _ipc_request_gate({"command": "play", "token": "t"}, "t", _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_a_str_subclass_token_passes_the_isinstance_gate(self):
+        class MyStr(str):
+            pass
+
+        gate = _ipc_request_gate(
+            {"command": "play", "token": MyStr("s3cret")}, "s3cret", _VALID_COMMANDS
+        )
+        assert gate["verdict"] == "accept"
+
+    def test_the_token_reject_precedes_the_whitelist(self):
+        gate = _ipc_request_gate({"command": "drop_tables"}, "s3cret", _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "authentication failed"}
+
+    def test_unknown_command_is_rejected_with_the_reference_message(self):
+        gate = _ipc_request_gate({"command": "drop_tables"}, None, _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "unknown command: drop_tables"}
+
+    def test_missing_command_is_the_empty_string(self):
+        gate = _ipc_request_gate({}, None, _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "unknown command: "}
+
+    def test_a_non_str_command_is_interpolated_through_str(self):
+        gate = _ipc_request_gate({"command": 42}, None, _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "unknown command: 42"}
+
+    def test_a_bool_command_is_interpolated_through_str(self):
+        gate = _ipc_request_gate({"command": True}, None, _VALID_COMMANDS)
+        assert gate == {"verdict": "reject", "error": "unknown command: True"}
+
+    def test_the_whitelist_passes_through(self):
+        """The containment runs against the very whitelist the caller
+        passes — the module's own _VALID_COMMANDS in production, a stub
+        here."""
+        gate = _ipc_request_gate({"command": "custom"}, None, {"custom"})
+        assert gate["verdict"] == "accept"
+        gate = _ipc_request_gate({"command": "play"}, None, {"custom"})
+        assert gate == {"verdict": "reject", "error": "unknown command: play"}
+
+    def test_every_whitelisted_command_is_accepted(self):
+        for command in sorted(_VALID_COMMANDS):
+            gate = _ipc_request_gate({"command": command}, None, _VALID_COMMANDS)
+            assert gate["verdict"] == "accept", command
+
+    def test_args_pass_through_as_the_object(self):
+        args = {"video_id": "abc"}
+        gate = _ipc_request_gate({"command": "queue_add", "args": args}, None, _VALID_COMMANDS)
+        assert gate["args"] is args
+
+    def test_missing_args_default_to_a_fresh_dict(self):
+        gate = _ipc_request_gate({"command": "play"}, None, _VALID_COMMANDS)
+        again = _ipc_request_gate({"command": "play"}, None, _VALID_COMMANDS)
+        assert gate["args"] == {}
+        assert again["args"] == {}
+        assert gate["args"] is not again["args"]
+
+    def test_non_dict_args_are_coerced_to_a_fresh_dict(self):
+        for junk in ("bad", [1, 2], 42, None, True):
+            gate = _ipc_request_gate({"command": "play", "args": junk}, None, _VALID_COMMANDS)
+            assert gate["verdict"] == "accept", junk
+            assert gate["args"] == {}
+
+    def test_command_passes_through_as_the_object(self):
+        gate = _ipc_request_gate({"command": "play"}, None, _VALID_COMMANDS)
+        assert gate["command"] == "play"
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="IPCServerHandler tests use AF_UNIX which Windows doesn't support",
@@ -796,3 +952,90 @@ def test_whitelist_matches_handler_cases():
     assert table_match, "the dispatch table literal was not found in app/_ipc.py"
     rows = re.findall(r'\("(\w+)", "\w+", ', table_match.group(1))
     assert rows and set(rows) == set(_VALID_COMMANDS)
+
+
+# ── native vs fallback parity for the request gate ────────────────────
+
+# Each parity case: [request, token, valid_commands] as JSON-round-trippable
+# values — the request a parsed JSON line, the token the server's (None on
+# the Unix transport), the whitelist the list both sides convert to the
+# module's frozenset shape. The gate's answers are plain dicts of str /
+# dict / bool values, so they compare directly across the child's
+# json.loads and the parent's native objects.
+_GATE_PARITY_CASES = [
+    [{"command": "play", "args": {"video_id": "abc"}}, None, ["play", "pause"]],
+    [{"command": "play", "args": {"video_id": "abc"}}, "s3cret", ["play"]],
+    [{"command": "play", "token": "s3cret"}, "s3cret", ["play"]],
+    [{"command": "play", "token": "deadbeef"}, "s3cret", ["play"]],
+    [{"command": "play", "token": 42}, "s3cret", ["play"]],
+    [{"command": "play", "token": True}, "s3cret", ["play"]],
+    [{"command": "play"}, "s3cret", ["play"]],
+    [{"command": "play"}, "", ["play"]],
+    [{"command": "play", "token": ""}, "", ["play"]],
+    [{"command": "play", "token": "caf\u00e9"}, "caf\u00e9", ["play"]],
+    [{"command": "play", "token": "cafe\u0301"}, "caf\u00e9", ["play"]],
+    [{"command": "drop_tables"}, None, ["play"]],
+    [{"command": "drop_tables"}, "s3cret", ["play"]],
+    [{}, None, ["play"]],
+    [{"command": 42}, None, ["play"]],
+    [{"command": True}, None, ["play"]],
+    [{"command": "play", "args": "bad"}, None, ["play"]],
+    [{"command": "play", "args": [1, 2]}, None, ["play"]],
+    [{"command": "play", "args": {"offset": 10}}, None, ["play"]],
+    [{"command": "custom", "args": {"k": 1}}, None, ["custom", "play"]],
+    [{"command": "pause", "args": {}}, None, ["play"]],
+]
+
+_GATE_CHILD_PROG = """
+import json
+import sys
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.ipc import _ipc_request_gate
+
+payload = json.load(sys.stdin)
+out = []
+for request, token, valid in payload:
+    try:
+        result = _ipc_request_gate(request, token, frozenset(valid))
+    except Exception as exc:
+        out.append({"error": f"{type(exc).__name__}: {exc}"})
+    else:
+        out.append(result)
+json.dump(out, sys.stdout)
+"""
+
+
+class TestIpcRequestGateNativeParity:
+    """When the Rust extension is built, the native request gate must
+    answer exactly like the pure-Python fallback — same verdicts, same
+    response errors, same coercions — for every JSON-shape a parsed
+    request line can carry, so the two implementations cannot drift.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_native_matches_fallback(self):
+        import subprocess
+
+        import ytm_player.ipc as ipc_mod
+
+        result = subprocess.run(
+            [sys.executable, "-c", _GATE_CHILD_PROG],
+            input=json.dumps(_GATE_PARITY_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = [
+            ipc_mod._ipc_request_gate(request, token, frozenset(valid))
+            for request, token, valid in _GATE_PARITY_CASES
+        ]
+        assert len(fallback) == len(_GATE_PARITY_CASES)
+        for case, n, f in zip(_GATE_PARITY_CASES, native, fallback):
+            assert n == f, (
+                f"native and fallback _ipc_request_gate differ for {case!r}:\n"
+                f"native:   {n!r}\n"
+                f"fallback: {f!r}"
+            )

@@ -13,9 +13,17 @@ field values behind ``_try_resolve``), the DownloadError hint
 ``_download_error_hint`` (the stale-cookiejar diagnostic the error
 handler appends), the expired-entry walk ``_cache_expired_ids`` (the
 prune phase behind both ``_put_cache``'s and ``prune_expired``'s
-maintenance) and the over-cap eviction walk ``_cache_cap_evictions``
+maintenance), the over-cap eviction walk ``_cache_cap_evictions``
 (the oldest-by-``expires_at`` excess ``_put_cache`` drops once the
-prune has run). All are implemented by the Rust extension
+prune has run), the cookiejar-signature reuse gate
+``_ydl_cookiejar_current`` (the verdict behind ``_get_ydl``'s reuse
+arm — the cached YoutubeDL instance's baked cookiejar signature
+against the signature the resolver should be using right now, so a
+rewritten jar rebuilds the instance instead of serving stale cookies)
+and the mid-build publication verdict ``_ydl_publish_verdict`` (the
+decision behind ``_get_ydl``'s post-build re-entry — adopt another
+thread's instance, retry after a mid-build reset, or install the built
+one). All are implemented by the Rust extension
 (``_ytm_player_native.is_stale`` /
 ``_ytm_player_native.wait_seconds`` /
 ``_ytm_player_native.validate_quality`` /
@@ -23,13 +31,16 @@ prune has run). All are implemented by the Rust extension
 ``_ytm_player_native.stream_info_fields`` /
 ``_ytm_player_native.download_error_hint`` /
 ``_ytm_player_native.stream_cache_expired_ids`` /
-``_ytm_player_native.stream_cache_cap_evictions``) when it is built
+``_ytm_player_native.stream_cache_cap_evictions`` /
+``_ytm_player_native.stream_ydl_cookiejar_current`` /
+``_ytm_player_native.stream_ydl_publish_verdict``) when it is built
 and by the pure-Python transcriptions below otherwise; the YoutubeDL
-construction, the cookiejar vouching, the network extraction, the
-cache state and the pending-future bookkeeping stay Python-side in
-the resolver. The clock-reading engines resolve ``time.time()``
-through this module's own ``time`` name at call time, so a patched or
-frozen clock steers both backends identically.
+construction, the cookiejar vouching and its signature probe, the
+network extraction, the cache state and the pending-future
+bookkeeping stay Python-side in the resolver. The clock-reading
+engines resolve ``time.time()`` through this module's own ``time``
+name at call time, so a patched or frozen clock steers both backends
+identically.
 """
 
 from __future__ import annotations
@@ -141,6 +152,56 @@ def _session_cookiejar_signature() -> tuple[Any, ...] | None:
     session = _detect_session_record()
     auth_path, record_path = session if session is not None else (None, None)
     return (path, file_signature(path), file_signature(auth_path), file_signature(record_path))
+
+
+def _ydl_cookiejar_current(cached_sig: Any, current_sig: Any) -> bool:
+    """The cookiejar-signature reuse gate behind ``StreamResolver._get_ydl``.
+
+    True when the signature the cached YoutubeDL instance was built
+    against still equals the signature the resolver should be using
+    right now — ``None`` matching ``None`` (an instance built anonymous
+    while streaming is still anonymous), element-wise over the
+    signature tuples otherwise — so a change to ANY of the three files
+    the signature stats (a stream cookiejar rewritten by ``ytm setup``
+    or a mid-session auto-refresh, but also an auth.json or
+    account.json replaced on its own) answers False and the caller
+    discards the instance and rebuilds one that loads the new cookies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_ydl_cookiejar_current``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    The signature probe itself (the settings read and the three file
+    stats — ``_session_cookiejar_signature``, evaluated by the caller
+    only when an instance exists) and the instance state stay with the
+    caller.
+    """
+    return cached_sig == current_sig
+
+
+def _ydl_publish_verdict(instance: Any, snapshot_generation: Any, current_generation: Any) -> str:
+    """The mid-build publication verdict behind ``StreamResolver._get_ydl``.
+
+    The second locked section's decision, consulted after the unlocked
+    ``_build_ydl_opts()`` pass: ``"adopt"`` when another thread's build
+    published an instance meanwhile (any instance is strictly fresher
+    than this caller's in-flight opts — never construct a duplicate),
+    ``"retry"`` when a ``_reset_ydl()`` landed while the opts were
+    building (the just-built opts already have pre-reset settings baked
+    in, so the build is discarded and the loop re-reads current
+    settings), and ``"install"`` otherwise — the built instance is
+    published with the signature it vouched for.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_ydl_publish_verdict``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    The locks, the ``_active_resolves`` accounting, the YoutubeDL
+    construction and the cached instance fields stay with the caller.
+    """
+    if instance is not None:
+        return "adopt"
+    if current_generation != snapshot_generation:
+        return "retry"
+    return "install"
 
 
 class _YtDlpLogger:
@@ -494,11 +555,21 @@ class StreamResolver:
         instance with pre-reset settings. The generation check below
         catches that: a reset landing mid-build invalidates that build's
         result and the loop re-reads current settings.
+
+        The cookiejar-signature reuse gate is resolved by the
+        ``_ydl_cookiejar_current`` engine and the post-build publication
+        decision by the ``_ydl_publish_verdict`` engine (native when the
+        Rust extension is built, the pure-Python transcriptions
+        otherwise); the signature probe, the locks, the opts build, the
+        YoutubeDL construction and the _active_resolves accounting stay
+        here.
         """
         while True:
             with self._ydl_lock:
                 if self._ydl is not None:
-                    if self._ydl_cookiejar_sig == _session_cookiejar_signature():
+                    if _ydl_cookiejar_current(
+                        self._ydl_cookiejar_sig, _session_cookiejar_signature()
+                    ):
                         self._active_resolves += 1
                         return self._ydl
                     # The jar file changed since this instance loaded it
@@ -510,10 +581,11 @@ class StreamResolver:
             opts = self._build_ydl_opts()
 
             with self._ydl_lock:
-                if self._ydl is not None:
+                verdict = _ydl_publish_verdict(self._ydl, generation, self._ydl_generation)
+                if verdict == "adopt":
                     self._active_resolves += 1
                     return self._ydl
-                if self._ydl_generation != generation:
+                if verdict == "retry":
                     continue  # reset landed mid-build; opts are stale, retry
                 self._ydl, self._ydl_cookiejar_sig = self._build_ydl(opts)
                 self._active_resolves += 1
@@ -845,6 +917,12 @@ try:
         stream_info_fields as _native_stream_info_fields,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_ydl_cookiejar_current as _native_stream_ydl_cookiejar_current,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_ydl_publish_verdict as _native_stream_ydl_publish_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         validate_quality as _native_validate_quality,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -855,6 +933,8 @@ except ImportError:
 else:
     _is_stale = _native_is_stale  # type: ignore[assignment]
     _wait_seconds = _native_wait_seconds  # type: ignore[assignment]
+    _ydl_cookiejar_current = _native_stream_ydl_cookiejar_current  # type: ignore[assignment]
+    _ydl_publish_verdict = _native_stream_ydl_publish_verdict  # type: ignore[assignment]
     _validate_quality = _native_validate_quality  # type: ignore[assignment]
     _base_ydl_opts = _native_stream_base_opts  # type: ignore[assignment]
     _stream_info_fields = _native_stream_info_fields  # type: ignore[assignment]

@@ -359,6 +359,17 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // seconds, with the missing/invalid verdicts the response carries.
     module.add_function(pyo3::wrap_pyfunction!(ipc_seek_offset, module)?)?;
 
+    // IPC request gate (ipc.py _ipc_request_gate equivalent): the
+    // key-exchange body behind IPCServer._client_connected — the TCP
+    // transport's token gate (the presented token compared through the
+    // module's own secrets.compare_digest name over both sides' utf-8
+    // bytes) and the command whitelist (the containment protocol over
+    // the module's own _VALID_COMMANDS frozenset), with the args
+    // coercion the dispatch runs with. The framing, the JSON parse,
+    // the handler await and the response writes stay Python-side in
+    // the server.
+    module.add_function(pyo3::wrap_pyfunction!(ipc_request_gate, module)?)?;
+
     // CLI JSON serialisation (cli.py _json_output equivalent): the
     // json.dumps(data, indent=..., default=str) text behind every
     // JSON-emitting CLI command — the ensure_ascii escaping, the
@@ -692,6 +703,20 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(download_error_hint, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_cache_expired_ids, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_cache_cap_evictions, module)?)?;
+
+    // Stream yt-dlp instance-gate engines (services/stream.py
+    // equivalents): the acquisition loop around the extract_info
+    // sites' remaining pure cores — the cookiejar-signature reuse
+    // gate behind _get_ydl's locked reuse arm (the cached instance's
+    // baked signature against the signature the resolver should be
+    // using right now, through CPython's own ==) and the mid-build
+    // publication verdict behind _get_ydl's second locked section
+    // (adopt another thread's instance, retry after a mid-build
+    // reset, or install the built one). The signature probe, the
+    // locks, the YoutubeDL construction and the _active_resolves
+    // accounting stay Python-side in the resolver.
+    module.add_function(pyo3::wrap_pyfunction!(stream_ydl_cookiejar_current, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stream_ydl_publish_verdict, module)?)?;
 
     // Download-service engines (services/download.py equivalents): the
     // base yt-dlp options dict behind DownloadService._build_opts (the
@@ -14709,4 +14734,179 @@ fn player_command_current(
         return Ok(true);
     }
     Ok(command.eq(generation)? && !current_track.is_none())
+}
+
+// ---------------------------------------------------------------------------
+// IPC request gate (mirror ytm_player/ipc.py)
+// ---------------------------------------------------------------------------
+
+/// A fresh `{"verdict": "reject", "error": …}` outcome row for the
+/// request gate, carrying the response error the reference spells.
+fn ipc_gate_reject<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("verdict", "reject")?;
+    out.set_item("error", error)?;
+    Ok(out)
+}
+
+/// The ipc module's own `secrets` name — the `compare_digest` the
+/// reference's global lookup would call, read through the module
+/// attribute at call time. A test (or any caller) that swaps
+/// `ytm_player.ipc`'s `secrets` for a stub namespace steers the native
+/// engine exactly like the fallback: the digest the reference would
+/// call is the digest the engine calls.
+fn ipc_module_compare_digest(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.ipc")?
+        .getattr("secrets")?
+        .getattr("compare_digest")
+}
+
+/// The request gate — `ipc.py`'s `_ipc_request_gate`, the
+/// key-exchange body behind `IPCServer._client_connected`: the token
+/// gate and command whitelist a parsed request must pass before the
+/// handler dispatches with its args.
+///
+/// Mirrors the reference's three gates in their exact order, every
+/// read through CPython's own protocol. On the TCP transport (*token*
+/// not `None` — identity, not truthiness, so an empty-string token
+/// still gates; the Unix-socket transport passes `None` and its 0600
+/// socket perms are the gate), the request's `token` member —
+/// `request.get("token")` through the mapping's own method — must be
+/// a `str` (the subclass-aware isinstance gate, short-circuited
+/// before any digest, exactly like the reference's `or`) comparing
+/// equal to the server's token through `secrets.compare_digest` over
+/// both sides' `.encode("utf-8")` — the presented side encoded first,
+/// the digest fetched from the module's own `secrets` name at call
+/// time (a patched namespace steers both backends identically) — and
+/// a missing or non-str member, or any mismatch, rejects with the
+/// reference's `authentication failed`. `command` —
+/// `request.get("command", "")` — must then be a `str` in
+/// *valid_commands* (the containment protocol over the module's own
+/// `_VALID_COMMANDS` frozenset, passed through so a patched whitelist
+/// steers both backends identically), and anything else rejects with
+/// the reference's f-string — the raw command object interpolated
+/// through `str()`. `args` — `request.get("args", {})`, the fresh
+/// default dict built before the lookup runs — passes through as the
+/// object it is when it is a dict (the subclass-aware check) and is
+/// another fresh dict otherwise. The accept verdict carries the
+/// command and the args as the objects the handler dispatches with;
+/// the framing, the JSON parse, the handler await and the response
+/// writes stay Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (request, token, valid_commands))]
+fn ipc_request_gate<'py>(
+    py: Python<'py>,
+    request: &Bound<'py, PyAny>,
+    token: &Bound<'py, PyAny>,
+    valid_commands: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let get = request.getattr("get")?;
+    // if token is not None — identity, not truthiness.
+    if !token.is_none() {
+        // presented = request.get("token")
+        let presented = get.call1(("token",))?;
+        // not isinstance(presented, str) — short-circuited before the
+        // digest, exactly like the reference's `or`.
+        if !presented.is_instance_of::<PyString>() {
+            return ipc_gate_reject(py, "authentication failed");
+        }
+        // secrets.compare_digest(presented.encode("utf-8"),
+        //                         token.encode("utf-8")) — the
+        // presented side encoded first, the digest read through the
+        // ipc module's own secrets name.
+        let presented_bytes = presented.getattr("encode")?.call1(("utf-8",))?;
+        let token_bytes = token.getattr("encode")?.call1(("utf-8",))?;
+        let compare_digest = ipc_module_compare_digest(py)?;
+        if !compare_digest.call1((presented_bytes, token_bytes))?.is_truthy()? {
+            return ipc_gate_reject(py, "authentication failed");
+        }
+    }
+    // command = request.get("command", "")
+    let command = get.call1(("command", ""))?;
+    // not isinstance(command, str) or command not in valid_commands
+    if !command.is_instance_of::<PyString>() || !valid_commands.contains(&command)? {
+        // f"unknown command: {command}" — the object interpolated
+        // through str().
+        return ipc_gate_reject(py, &format!("unknown command: {}", py_str(&command)?));
+    }
+    // args = request.get("args", {}) — the fresh default built before
+    // the lookup runs, exactly like the reference's argument
+    // evaluation.
+    let args_default = PyDict::new(py).into_any();
+    let args_raw = get.call1(("args", &args_default))?;
+    let args = if args_raw.is_instance_of::<PyDict>() {
+        args_raw
+    } else {
+        PyDict::new(py).into_any()
+    };
+    let out = PyDict::new(py);
+    out.set_item("verdict", "accept")?;
+    out.set_item("command", command)?;
+    out.set_item("args", args)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// yt-dlp instance gates (mirror the resolver's acquisition loop in
+// ytm_player/services/stream.py)
+// ---------------------------------------------------------------------------
+
+/// The cookiejar-signature reuse gate — `services/stream.py`'s
+/// `_ydl_cookiejar_current`, the gate behind `_get_ydl`'s locked
+/// reuse arm.
+///
+/// Mirrors the reference's single comparison through CPython's own
+/// `==` (the `__eq__` protocol — identity-matched singletons, the
+/// element-wise tuple walk, reflected lookups and every error shape
+/// the interpreter's): `None` matches `None` — an instance built
+/// anonymous while streaming is still anonymous is reused — and the
+/// signature tuples match element-wise, so a change to any of the
+/// three files the signature stats (the stream cookiejar rewritten by
+/// `ytm setup` or a mid-session auto-refresh, but also auth.json or
+/// account.json replaced on its own) answers False and the caller
+/// discards the instance and rebuilds one that loads the new cookies.
+/// The signature probe itself (the settings read and the three file
+/// stats — `_session_cookiejar_signature`, evaluated by the caller
+/// only when an instance exists) and the instance state stay
+/// Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (cached_sig, current_sig))]
+fn stream_ydl_cookiejar_current(
+    cached_sig: &Bound<'_, PyAny>,
+    current_sig: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    cached_sig.eq(current_sig)
+}
+
+/// The mid-build publication verdict — `services/stream.py`'s
+/// `_ydl_publish_verdict`, the gate behind `_get_ydl`'s second locked
+/// section, consulted after the unlocked `_build_ydl_opts()` pass.
+///
+/// Mirrors the reference's two checks in order: the
+/// `instance is not None` identity test (another thread's build
+/// published an instance while this caller's opts were building —
+/// adopt the winner's and never construct a duplicate) answered
+/// `"adopt"`, then the `current_generation != snapshot_generation`
+/// inequality through CPython's own `!=` (a `_reset_ydl()` landing
+/// while the opts built invalidates them — pre-reset settings are
+/// baked in — so the loop discards the just-built opts and re-reads
+/// current settings) answered `"retry"`, and otherwise the
+/// `"install"` verdict that publishes the built instance with the
+/// signature it vouched for. The locks, the `_active_resolves`
+/// accounting, the YoutubeDL construction and the cached instance
+/// fields stay Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (instance, snapshot_generation, current_generation))]
+fn stream_ydl_publish_verdict(
+    instance: &Bound<'_, PyAny>,
+    snapshot_generation: &Bound<'_, PyAny>,
+    current_generation: &Bound<'_, PyAny>,
+) -> PyResult<&'static str> {
+    if !instance.is_none() {
+        return Ok("adopt");
+    }
+    if current_generation.ne(snapshot_generation)? {
+        return Ok("retry");
+    }
+    Ok("install")
 }

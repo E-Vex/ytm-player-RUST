@@ -6,6 +6,20 @@ app calls ``remove_pid()`` on shutdown, and creates an ``IPCServer`` so CLI
 commands can talk to the running TUI via ``ipc_request()``.
 
 On Linux/macOS, uses Unix domain sockets.  On Windows, uses TCP on localhost.
+
+The module's pure cores are dual-implemented: the single-instance argv
+heuristic ``_looks_like_ytm`` (the conservative entry-point match behind
+``_is_ytm_process``'s recycled-PID probe) and the request gate
+``_ipc_request_gate`` (the token gate and command whitelist behind
+``IPCServer._client_connected`` — the TCP transport's key exchange, where
+the request's ``token`` member must match the owner-only token file's
+secret through ``secrets.compare_digest`` before any command is
+considered, only whitelisted commands ever reach the handler, and the
+``args`` payload is coerced to the dict the dispatch runs with). Both are
+implemented by the Rust extension (``_ytm_player_native.looks_like_ytm`` /
+``_ytm_player_native.ipc_request_gate``) when it is built and by the
+pure-Python transcriptions below otherwise; the framing, the JSON parse,
+the handler await and the response writes stay Python-side in the server.
 """
 
 from __future__ import annotations
@@ -387,6 +401,52 @@ def _read_token() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# IPC request gate (the token check + command whitelist behind the server)
+# ---------------------------------------------------------------------------
+
+
+def _ipc_request_gate(request: Any, token: Any, valid_commands: Any) -> dict[str, Any]:
+    """The token gate and command whitelist behind ``IPCServer._client_connected``.
+
+    The pure half of the request dispatch: whether a parsed request may
+    reach the handler, and what it dispatches with. On the TCP transport
+    (*token* is not ``None`` — an empty-string token still gates; the
+    Unix-socket transport leaves it ``None`` and its 0600 socket perms are
+    the gate) the request's ``token`` member must be a ``str`` comparing
+    equal to the server's token through ``secrets.compare_digest`` — on the
+    utf-8 bytes of both sides, because ``compare_digest`` raises
+    ``TypeError`` on non-ASCII ``str`` input, which would surface as an
+    internal error instead of a proper auth rejection — and a missing or
+    non-str member, or any mismatch, rejects with ``authentication failed``.
+    ``command`` (the ``""`` default when missing) must then be a ``str`` in
+    *valid_commands* (the module's own ``_VALID_COMMANDS`` frozenset in
+    production), and anything else rejects with the reference's f-string
+    naming the raw command object. ``args`` defaults to a fresh dict and is
+    coerced to one whenever it is anything else; the accept verdict carries
+    the command and the args as the objects the handler dispatches with.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ipc_request_gate``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The framing, the
+    JSON parse, the handler await and the response writes stay with the
+    caller.
+    """
+    if token is not None:
+        presented = request.get("token")
+        if not isinstance(presented, str) or not secrets.compare_digest(
+            presented.encode("utf-8"), token.encode("utf-8")
+        ):
+            return {"verdict": "reject", "error": "authentication failed"}
+    command = request.get("command", "")
+    if not isinstance(command, str) or command not in valid_commands:
+        return {"verdict": "reject", "error": f"unknown command: {command}"}
+    args = request.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+    return {"verdict": "accept", "command": command, "args": args}
+
+
+# ---------------------------------------------------------------------------
 # IPC Server (runs inside the TUI's asyncio loop)
 # ---------------------------------------------------------------------------
 
@@ -508,29 +568,21 @@ class IPCServer:
                 await self._respond(writer, {"ok": False, "error": "expected JSON object"})
                 return
 
-            # TCP transport has no socket-permission auth — require a matching
-            # token before dispatching (rejects any local process without it).
-            if self._token is not None:
-                token = request.get("token")
-                # Compare as bytes: compare_digest raises TypeError on
-                # non-ASCII str input, which would surface as "internal
-                # error" instead of a proper auth rejection.
-                if not isinstance(token, str) or not secrets.compare_digest(
-                    token.encode("utf-8"), self._token.encode("utf-8")
-                ):
-                    await self._respond(writer, {"ok": False, "error": "authentication failed"})
-                    return
-
-            command = request.get("command", "")
-            if not isinstance(command, str) or command not in _VALID_COMMANDS:
-                await self._respond(writer, {"ok": False, "error": f"unknown command: {command}"})
+            # TCP transport has no socket-permission auth, so the request
+            # must present the owner-only token file's secret through
+            # secrets.compare_digest before anything is dispatched (rejects
+            # any local process without it), and only whitelisted commands
+            # ever reach the handler — both gates, and the args coercion the
+            # dispatch runs with, are resolved by the ``_ipc_request_gate``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise); the framing, the JSON
+            # parse, the handler await and the response writes stay here.
+            gate = _ipc_request_gate(request, self._token, _VALID_COMMANDS)
+            if gate["verdict"] != "accept":
+                await self._respond(writer, {"ok": False, "error": gate["error"]})
                 return
 
-            args = request.get("args", {})
-            if not isinstance(args, dict):
-                args = {}
-
-            response = await self._handler(command, args)
+            response = await self._handler(gate["command"], gate["args"])
             await self._respond(writer, response)
         except asyncio.TimeoutError:
             logger.debug("IPC client timed out")
@@ -631,3 +683,22 @@ def _ipc_request_tcp(
         return _ipc_exchange(sock, {"command": command, "args": args or {}, "token": token})
     finally:
         sock.close()
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same request-gate engine; this binding
+# replaces the pure-Python transcription above when the extension is
+# importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement.  ``_looks_like_ytm`` is NOT rebound here: its native
+# binding was resolved at the top of the module with a call-time check, the
+# established pattern for that first engine, and both coexist.
+
+try:
+    from .utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ipc_request_gate as _native_ipc_request_gate,
+    )
+except ImportError:
+    pass
+else:
+    _ipc_request_gate = _native_ipc_request_gate  # type: ignore[assignment]

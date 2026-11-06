@@ -1,6 +1,6 @@
 """Tests for the stream resolver-glue engines.
 
-The eight pure cores of ``services/stream.py`` run with two
+The ten pure cores of ``services/stream.py`` run with two
 interchangeable backends: the pure-Python transcriptions in the module
 and, when the Rust extension is built, the native implementations
 bound at the module's tail. ``_is_stale`` is the buffered expiry gate
@@ -16,11 +16,17 @@ stale-cookiejar diagnostic the DownloadError handler appends;
 ``_put_cache``'s and ``prune_expired``'s prune phase;
 ``_cache_cap_evictions`` is the over-cap eviction walk behind
 ``_put_cache``'s second phase (the cap read through the module's own
-``_CACHE_MAX_SIZE`` name). The three clock-reading engines resolve
-``time.time()`` through the module's own ``time`` name at call time —
-a frozen or patched clock steers both backends identically, which the
-tests below use for determinism and the parity class pins as the
-contract.
+``_CACHE_MAX_SIZE`` name); ``_ydl_cookiejar_current`` is the
+cookiejar-signature reuse gate behind ``_get_ydl``'s locked reuse arm
+(the cached instance's baked signature against the signature the
+resolver should be using right now); and ``_ydl_publish_verdict`` is
+the mid-build publication verdict behind ``_get_ydl``'s second locked
+section (adopt another thread's instance, retry after a mid-build
+reset, or install the built one). The three clock-reading engines
+resolve ``time.time()`` through the module's own ``time`` name at call
+time — a frozen or patched clock steers both backends identically,
+which the tests below use for determinism and the parity class pins
+as the contract.
 
 The unit tests below assert each engine's contract on whichever
 backend is loaded. When the extension is built, the parity tests
@@ -50,6 +56,8 @@ from ytm_player.services.stream import (
     _stream_info_fields,
     _validate_quality,
     _wait_seconds,
+    _ydl_cookiejar_current,
+    _ydl_publish_verdict,
 )
 
 try:
@@ -371,6 +379,15 @@ def _entry(expires_at):
     return SimpleNamespace(expires_at=expires_at)
 
 
+def _json_sig_case(value):
+    """The JSON case's signature re-packed as the nested tuples the
+    reference builds (a list never equals a tuple, so both sides of the
+    parity comparison must spell the same shape)."""
+    if isinstance(value, list):
+        return tuple(_json_sig_case(item) for item in value)
+    return value
+
+
 class TestCacheExpiredIds:
     """The expired-entry walk behind ``_put_cache`` and ``prune_expired``."""
 
@@ -487,6 +504,118 @@ class TestCacheCapEvictions:
             _cache_cap_evictions({"a": SimpleNamespace()})
 
 
+class TestYdlCookiejarCurrent:
+    """The cookiejar-signature reuse gate behind _get_ydl's reuse arm."""
+
+    def test_none_matches_none(self):
+        # An instance built anonymous while streaming is still anonymous.
+        assert _ydl_cookiejar_current(None, None) is True
+
+    def test_equal_signatures_are_current(self):
+        sig = ("/path/jar", (1, 2, 3), None, (5, 6, 7))
+        assert _ydl_cookiejar_current(sig, sig) is True
+        assert _ydl_cookiejar_current(sig, tuple(sig)) is True
+
+    def test_a_rewritten_jar_is_not_current(self):
+        cached = ("/p", (1, 2, 3), (4, 5), (6, 7))
+        current = ("/p", (1, 9, 3), (4, 5), (6, 7))
+        assert _ydl_cookiejar_current(cached, current) is False
+
+    def test_a_replaced_record_is_not_current(self):
+        cached = ("/p", (1, 2, 3), (4, 5), (6, 7))
+        assert _ydl_cookiejar_current(cached, ("/p", (1, 2, 3), (4, 5), (6, 8))) is False
+
+    def test_a_changed_jar_path_is_not_current(self):
+        cached = ("/old", (1, 2, 3), None, None)
+        assert _ydl_cookiejar_current(cached, ("/new", (1, 2, 3), None, None)) is False
+
+    def test_signed_in_now_means_rebuild(self):
+        assert _ydl_cookiejar_current(None, ("/p", (1, 2, 3), None, None)) is False
+
+    def test_anonymous_now_means_rebuild(self):
+        assert _ydl_cookiejar_current(("/p", (1, 2, 3), None, None), None) is False
+
+    def test_a_list_is_not_the_tuples_it_ressembles(self):
+        # CPython == semantics: a list-spelled signature never matches
+        # the tuple the reference builds — even with equal contents.
+        assert _ydl_cookiejar_current(["/p", [1]], ("/p", (1,))) is False
+        assert _ydl_cookiejar_current(("/p", (1,)), ["/p", [1]]) is False
+
+    def test_int_and_float_sigs_match(self):
+        assert _ydl_cookiejar_current(("/p", (1, 5), None, None), ("/p", (1, 5.0), None, None)) is (
+            True
+        )
+
+    def test_the_comparison_is_the_eq_protocol(self):
+        class Sig:
+            def __init__(self, verdict):
+                self.verdict = verdict
+
+            def __eq__(self, other):
+                return self.verdict
+
+        # A truthy __eq__ verdict means current — the truthiness of the
+        # comparison is the gate, the same one the reference's `if`
+        # applies; a falsy one means not.
+        assert _ydl_cookiejar_current(Sig("yes"), object())
+        assert not _ydl_cookiejar_current(Sig(""), object())
+
+
+class TestYdlPublishVerdict:
+    """The mid-build publication verdict behind _get_ydl's second arm."""
+
+    def test_an_instance_published_meanwhile_is_adopted(self):
+        assert _ydl_publish_verdict(object(), 1, 1) == "adopt"
+        assert _ydl_publish_verdict("ydl", 1, 99) == "adopt"
+
+    def test_a_mid_build_reset_forces_a_retry(self):
+        assert _ydl_publish_verdict(None, 1, 2) == "retry"
+        assert _ydl_publish_verdict(None, 0, 1) == "retry"
+
+    def test_the_steady_state_installs(self):
+        assert _ydl_publish_verdict(None, 3, 3) == "install"
+        assert _ydl_publish_verdict(None, 0, 0) == "install"
+
+    def test_the_instance_check_beats_the_generation_check(self):
+        # The identity check runs first: an instance present with a moved
+        # generation is still adopted.
+        assert _ydl_publish_verdict("ydl", 1, 2) == "adopt"
+
+    def test_generation_equality_is_value_equality(self):
+        # current != snapshot through CPython's !=, so equal-valued
+        # int/float/bool generations never retry.
+        assert _ydl_publish_verdict(None, 1, 1.0) == "install"
+        assert _ydl_publish_verdict(None, True, 1) == "install"
+
+    def test_string_generations_compare_by_value(self):
+        assert _ydl_publish_verdict(None, "a", "a") == "install"
+        assert _ydl_publish_verdict(None, "a", "b") == "retry"
+
+    def test_the_inequality_verdict_is_its_truthiness(self):
+        class Weird:
+            def __ne__(self, other):
+                return "yes"
+
+        class Quiet:
+            def __ne__(self, other):
+                return ""
+
+        # != through CPython's own protocol: the retry gate is the
+        # truthiness of the comparison's result, not the result's type.
+        assert _ydl_publish_verdict(None, 1, Weird()) == "retry"
+        assert _ydl_publish_verdict(None, 1, Quiet()) == "install"
+
+    def test_a_raising_ne_propagates(self):
+        class Boom:
+            def __ne__(self, other):
+                raise RuntimeError("boom")
+
+        # The current generation is the comparison's subject (the left
+        # operand), exactly like the reference's self._ydl_generation.
+        with pytest.raises(RuntimeError, match="boom"):
+            _ydl_publish_verdict(None, 1, Boom())
+
+
 # Each parity case: the engine's arguments as JSON-round-trippable
 # lists, keyed by the engine's native name (the Python module-level
 # fallback spells the same name with a leading underscore). Both the
@@ -494,10 +623,13 @@ class TestCacheCapEvictions:
 # every clock-derived value is exact on both sides. The cache is
 # carried as a {video_id: expires_at} mapping and rebuilt as the
 # attribute-bearing objects the walks read; the cap engine's first
-# argument is the _CACHE_MAX_SIZE both sides install before the call.
-# (expires_at never spells NaN in these cases: the ranking of a NaN
-# key is sort-algorithm-dependent, so only totally ordered values are
-# parity-pinned.)
+# argument is the _CACHE_MAX_SIZE both sides install before the call;
+# the cookiejar-signature engine's cases are carried as (nested) JSON
+# lists and rebuilt as the tuples the reference builds, so the
+# element-wise tuple comparison — a list never matching a tuple — is
+# exercised on both sides. (expires_at never spells NaN in these
+# cases: the ranking of a NaN key is sort-algorithm-dependent, so only
+# totally ordered values are parity-pinned.)
 _PARITY_CASES = {
     "is_stale": [
         [1300.0],
@@ -598,6 +730,29 @@ _PARITY_CASES = {
         [2, {"z": 900.0, "y": 100.0, "x": 900.0, "w": 100.0}],
         [2, {"a": 100000000000000000000, "b": 1.5, "c": -3}],
     ],
+    "stream_ydl_cookiejar_current": [
+        [None, None],
+        [["/p", [1, 2, 3], None, [5, 6, 7]], ["/p", [1, 2, 3], None, [5, 6, 7]]],
+        [["/p", [1, 2, 3], [4, 5], [6, 7]], ["/p", [1, 9, 3], [4, 5], [6, 7]]],
+        [["/p", [1, 2, 3], [4, 5], [6, 7]], ["/p", [1, 2, 3], [4, 5], [6, 8]]],
+        [["/old", [1, 2, 3], None, None], ["/new", [1, 2, 3], None, None]],
+        [["/p", [1, 2, 3], None, None], None],
+        [None, ["/p", [1, 2, 3], None, None]],
+        [["/p", [1, 5], None, None], ["/p", [1, 5.0], None, None]],
+        [[], []],
+    ],
+    "stream_ydl_publish_verdict": [
+        ["ydl", 1, 1],
+        ["ydl", 1, 2],
+        [None, 1, 2],
+        [None, 0, 1],
+        [None, 3, 3],
+        [None, 0, 0],
+        [None, 1, 1.0],
+        [None, True, 1],
+        [None, "a", "a"],
+        [None, "a", "b"],
+    ],
 }
 
 _CHILD_PROG = """
@@ -620,7 +775,18 @@ PY_NAMES = {
     "download_error_hint": "_download_error_hint",
     "stream_cache_expired_ids": "_cache_expired_ids",
     "stream_cache_cap_evictions": "_cache_cap_evictions",
+    "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
+    "stream_ydl_publish_verdict": "_ydl_publish_verdict",
 }
+
+
+def json_sig(value):
+    # The JSON case's signature re-packed as the nested tuples the
+    # reference builds (a list never equals a tuple, so both sides
+    # must spell the same shape).
+    if isinstance(value, list):
+        return tuple(json_sig(item) for item in value)
+    return value
 
 
 def call_args(name, args):
@@ -629,6 +795,8 @@ def call_args(name, args):
     if name == "stream_cache_cap_evictions":
         stream._CACHE_MAX_SIZE = args[0]
         return [{vid: SimpleNamespace(expires_at=exp) for vid, exp in args[1].items()}]
+    if name == "stream_ydl_cookiejar_current":
+        return [json_sig(args[0]), json_sig(args[1])]
     return args
 
 
@@ -662,6 +830,8 @@ _PY_NAMES = {
     "download_error_hint": "_download_error_hint",
     "stream_cache_expired_ids": "_cache_expired_ids",
     "stream_cache_cap_evictions": "_cache_cap_evictions",
+    "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
+    "stream_ydl_publish_verdict": "_ydl_publish_verdict",
 }
 
 
@@ -669,7 +839,8 @@ def _cache_call_args(name, args):
     """The cache rebuilt from the JSON case as the attribute-bearing
     objects the walks read; the cap engine's case also installs its
     cap first (the caller restores it once the engine has run, so the
-    module constant never leaks)."""
+    module constant never leaks); the cookiejar-signature engine's
+    cases are re-packed as the nested tuples the reference builds."""
     from ytm_player.services import stream
 
     if name == "stream_cache_expired_ids":
@@ -678,6 +849,8 @@ def _cache_call_args(name, args):
         saved = stream._CACHE_MAX_SIZE
         stream._CACHE_MAX_SIZE = args[0]
         return [{vid: _entry(exp) for vid, exp in args[1].items()}], saved
+    if name == "stream_ydl_cookiejar_current":
+        return [_json_sig_case(args[0]), _json_sig_case(args[1])], None
     return args, None
 
 
