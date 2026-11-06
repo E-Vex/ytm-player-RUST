@@ -23,7 +23,11 @@ rewritten jar rebuilds the instance instead of serving stale cookies)
 and the mid-build publication verdict ``_ydl_publish_verdict`` (the
 decision behind ``_get_ydl``'s post-build re-entry — adopt another
 thread's instance, retry after a mid-build reset, or install the built
-one). All are implemented by the Rust extension
+one). The resolver's remaining pure core — the retry-delay
+iteration ``_retry_delays`` (the ``(attempt, delay)`` schedule walk
+behind ``_resolve_sync``'s retry loop) — answers the attempts the
+resolve makes and the waits between them. All are implemented by the
+Rust extension
 (``_ytm_player_native.is_stale`` /
 ``_ytm_player_native.wait_seconds`` /
 ``_ytm_player_native.validate_quality`` /
@@ -33,14 +37,15 @@ one). All are implemented by the Rust extension
 ``_ytm_player_native.stream_cache_expired_ids`` /
 ``_ytm_player_native.stream_cache_cap_evictions`` /
 ``_ytm_player_native.stream_ydl_cookiejar_current`` /
-``_ytm_player_native.stream_ydl_publish_verdict``) when it is built
+``_ytm_player_native.stream_ydl_publish_verdict`` /
+``_ytm_player_native.stream_retry_delays``) when it is built
 and by the pure-Python transcriptions below otherwise; the YoutubeDL
 construction, the cookiejar vouching and its signature probe, the
-network extraction, the cache state and the pending-future
-bookkeeping stay Python-side in the resolver. The clock-reading
-engines resolve ``time.time()`` through this module's own ``time``
-name at call time, so a patched or frozen clock steers both backends
-identically.
+network extraction, the sleeps, the cache state and the
+pending-future bookkeeping stay Python-side in the resolver. The
+clock-reading engines resolve ``time.time()`` through this module's
+own ``time`` name at call time, so a patched or frozen clock steers
+both backends identically.
 """
 
 from __future__ import annotations
@@ -74,6 +79,12 @@ _CACHE_MAX_SIZE = 128
 # playback is never handed a URL that dies mid-stream.  Applied consistently
 # by every read path (_get_cached, is_expired, resolve).
 _EXPIRY_BUFFER_SECONDS = 300
+
+# The retry schedule _resolve_sync walks: the initial attempt (no wait)
+# followed by two retries after short back-offs.  Read through this
+# module's own name by the _retry_delays engine, so a patched schedule
+# steers both backends identically.
+_RETRY_DELAYS: list[float] = [0, 1.0, 2.0]
 
 
 def _is_stale(expires_at: float) -> bool:
@@ -404,6 +415,26 @@ def _cache_cap_evictions(cache: dict[str, StreamInfo]) -> list[str]:
     return sorted_ids[:excess]
 
 
+def _retry_delays() -> list[tuple[int, float]]:
+    """The ``(attempt, delay)`` iteration the resolve loop walks.
+
+    The pure half of ``StreamResolver._resolve_sync``'s retry loop:
+    the retry schedule — the module's own ``_RETRY_DELAYS`` — paired
+    with each attempt's index exactly like the reference's
+    ``enumerate`` walk, so the loop can break out early on the first
+    success without walking the rest of the schedule. The schedule is
+    read through this module's own ``_RETRY_DELAYS`` name (the walk
+    itself the iterator protocol, so any iterable schedule steers
+    both backends identically); the sleep gate, the ``time.sleep``
+    call and the extraction attempts stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_retry_delays``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return list(enumerate(_RETRY_DELAYS))
+
+
 @dataclass(frozen=True, slots=True)
 class StreamInfo:
     """Resolved stream information for a YouTube Music track."""
@@ -626,15 +657,20 @@ class StreamResolver:
             pass
 
     def _resolve_sync(self, video_id: str) -> StreamInfo | None:
-        """Synchronous stream resolution (runs in a thread) with retry."""
+        """Synchronous stream resolution (runs in a thread) with retry.
+
+        The retry-delay iteration is resolved by the ``_retry_delays``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the sleeps, the
+        extraction attempts and the early return stay here.
+        """
 
         if not VALID_VIDEO_ID.match(video_id):
             logger.warning("Invalid video_id rejected: %r", video_id)
             return None
         url = f"https://music.youtube.com/watch?v={video_id}"
-        delays = [0, 1.0, 2.0]  # initial attempt + 2 retries
 
-        for attempt, delay in enumerate(delays):
+        for attempt, delay in _retry_delays():
             if delay > 0:
                 time.sleep(delay)
             info = self._try_resolve(url, video_id, attempt)
@@ -917,6 +953,9 @@ try:
         stream_info_fields as _native_stream_info_fields,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_retry_delays as _native_stream_retry_delays,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         stream_ydl_cookiejar_current as _native_stream_ydl_cookiejar_current,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -941,3 +980,4 @@ else:
     _download_error_hint = _native_download_error_hint  # type: ignore[assignment]
     _cache_expired_ids = _native_stream_cache_expired_ids  # type: ignore[assignment]
     _cache_cap_evictions = _native_stream_cache_cap_evictions  # type: ignore[assignment]
+    _retry_delays = _native_stream_retry_delays  # type: ignore[assignment]

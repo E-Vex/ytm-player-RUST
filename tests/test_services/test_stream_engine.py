@@ -1,6 +1,6 @@
 """Tests for the stream resolver-glue engines.
 
-The ten pure cores of ``services/stream.py`` run with two
+The eleven pure cores of ``services/stream.py`` run with two
 interchangeable backends: the pure-Python transcriptions in the module
 and, when the Rust extension is built, the native implementations
 bound at the module's tail. ``_is_stale`` is the buffered expiry gate
@@ -19,14 +19,16 @@ stale-cookiejar diagnostic the DownloadError handler appends;
 ``_CACHE_MAX_SIZE`` name); ``_ydl_cookiejar_current`` is the
 cookiejar-signature reuse gate behind ``_get_ydl``'s locked reuse arm
 (the cached instance's baked signature against the signature the
-resolver should be using right now); and ``_ydl_publish_verdict`` is
-the mid-build publication verdict behind ``_get_ydl``'s second locked
+resolver should be using right now); ``_ydl_publish_verdict`` is the
+mid-build publication verdict behind ``_get_ydl``'s second locked
 section (adopt another thread's instance, retry after a mid-build
-reset, or install the built one). The three clock-reading engines
-resolve ``time.time()`` through the module's own ``time`` name at call
-time — a frozen or patched clock steers both backends identically,
-which the tests below use for determinism and the parity class pins
-as the contract.
+reset, or install the built one); and ``_retry_delays`` is the
+``(attempt, delay)`` schedule walk behind ``_resolve_sync``'s retry
+loop (the schedule read through the module's own ``_RETRY_DELAYS``
+name). The three clock-reading engines resolve ``time.time()``
+through the module's own ``time`` name at call time — a frozen or
+patched clock steers both backends identically, which the tests below
+use for determinism and the parity class pins as the contract.
 
 The unit tests below assert each engine's contract on whichever
 backend is loaded. When the extension is built, the parity tests
@@ -53,6 +55,7 @@ from ytm_player.services.stream import (
     _cache_expired_ids,
     _download_error_hint,
     _is_stale,
+    _retry_delays,
     _stream_info_fields,
     _validate_quality,
     _wait_seconds,
@@ -616,6 +619,151 @@ class TestYdlPublishVerdict:
             _ydl_publish_verdict(None, 1, Boom())
 
 
+class TestRetryDelays:
+    """The ``(attempt, delay)`` iteration behind ``_resolve_sync``'s
+    retry loop."""
+
+    def test_the_default_schedule_pairs_attempts_with_delays(self):
+        assert _retry_delays() == [(0, 0), (1, 1.0), (2, 2.0)]
+
+    def test_the_pairs_carry_the_schedules_own_objects(self):
+        # The walk yields the schedule's very objects — enumerate (and
+        # the native walk, the same iterator protocol) never copies
+        # the delays. Small ints are interned, so the float arms are
+        # the meaningful identity pins.
+        from ytm_player.services import stream
+
+        steps = _retry_delays()
+        assert steps[0][1] is stream._RETRY_DELAYS[0]
+        assert steps[1][1] is stream._RETRY_DELAYS[1]
+        assert steps[2][1] is stream._RETRY_DELAYS[2]
+
+    def test_a_fresh_list_every_call(self):
+        from ytm_player.services import stream
+
+        first = _retry_delays()
+        first.append("junk")
+        assert _retry_delays() == [(0, 0), (1, 1.0), (2, 2.0)]
+        assert stream._RETRY_DELAYS == [0, 1.0, 2.0]  # never mutated
+
+    def test_the_schedule_is_read_through_the_module_name(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", [5, 0.5, 0.25, 7])
+        assert _retry_delays() == [(0, 5), (1, 0.5), (2, 0.25), (3, 7)]
+
+    def test_an_empty_schedule_answers_no_attempts(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", [])
+        assert _retry_delays() == []
+
+    def test_the_walk_is_the_iterator_protocol(self, monkeypatch):
+        # enumerate runs over any iterable, and both backends walk the
+        # schedule through the same protocol — so tuple and string
+        # schedules steer identically.
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", (9, 0.5))
+        assert _retry_delays() == [(0, 9), (1, 0.5)]
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", "ab")
+        assert _retry_delays() == [(0, "a"), (1, "b")]
+
+
+class TestResolveSyncRetryWalk:
+    """The retry-delay engine inside the resolver's own retry loop, on
+    whichever backend is loaded — the attempts made, the waits slept
+    between them, the early exit on the first success and the gates
+    that never walk the schedule at all."""
+
+    @staticmethod
+    def _scripted(monkeypatch, outcomes):
+        """A resolver whose ``_try_resolve`` answers the scripted
+        *outcomes* (popped left to right, ``None`` once exhausted),
+        recording every attempt, every URL and every sleep — the last
+        through the module's own ``time`` name swapped for a recording
+        sleeper, the steering ``_resolve_sync``'s ``time.sleep`` reads
+        through."""
+        from ytm_player.services import stream
+
+        resolver = StreamResolver()
+        seen: dict[str, list] = {"attempts": [], "urls": [], "sleeps": []}
+        monkeypatch.setattr(stream, "time", SimpleNamespace(sleep=seen["sleeps"].append))
+        scripted = list(outcomes)
+
+        def fake_try_resolve(url, video_id, attempt):
+            seen["attempts"].append(attempt)
+            seen["urls"].append(url)
+            return scripted.pop(0) if scripted else None
+
+        resolver._try_resolve = fake_try_resolve
+        return resolver, seen
+
+    def test_the_full_budget_walks_every_attempt(self, monkeypatch):
+        resolver, seen = self._scripted(monkeypatch, [None, None, None])
+        assert resolver._resolve_sync("abc12345678") is None
+        assert seen["attempts"] == [0, 1, 2]
+        assert seen["sleeps"] == [1.0, 2.0]
+
+    def test_every_attempt_hits_the_watch_url(self, monkeypatch):
+        resolver, seen = self._scripted(monkeypatch, [None, None, None])
+        resolver._resolve_sync("abc12345678")
+        assert seen["urls"] == ["https://music.youtube.com/watch?v=abc12345678"] * 3
+
+    def test_a_success_stops_the_walk(self, monkeypatch):
+        sentinel = StreamInfo(
+            url="https://x",
+            video_id="abc12345678",
+            format="opus",
+            bitrate=1,
+            duration=1,
+            expires_at=1.0,
+        )
+        resolver, seen = self._scripted(monkeypatch, [None, sentinel])
+        assert resolver._resolve_sync("abc12345678") is sentinel
+        assert seen["attempts"] == [0, 1]
+        assert seen["sleeps"] == [1.0]  # the third attempt's 2.0 wait never slept
+
+    def test_a_first_try_success_never_sleeps(self, monkeypatch):
+        sentinel = StreamInfo(
+            url="https://x",
+            video_id="abc12345678",
+            format="opus",
+            bitrate=1,
+            duration=1,
+            expires_at=1.0,
+        )
+        resolver, seen = self._scripted(monkeypatch, [sentinel])
+        assert resolver._resolve_sync("abc12345678") is sentinel
+        assert seen["attempts"] == [0]
+        assert seen["sleeps"] == []
+
+    def test_a_patched_schedule_steers_the_resolver(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", [0, 0.5])
+        resolver, seen = self._scripted(monkeypatch, [None, None])
+        assert resolver._resolve_sync("abc12345678") is None
+        assert seen["attempts"] == [0, 1]
+        assert seen["sleeps"] == [0.5]
+
+    def test_an_empty_schedule_makes_no_attempts(self, monkeypatch):
+        from ytm_player.services import stream
+
+        monkeypatch.setattr(stream, "_RETRY_DELAYS", [])
+        resolver, seen = self._scripted(monkeypatch, [object()])
+        assert resolver._resolve_sync("abc12345678") is None
+        assert seen["attempts"] == []
+        assert seen["sleeps"] == []
+
+    def test_an_invalid_video_id_never_walks_the_schedule(self, monkeypatch):
+        # Rejected before the loop: no attempt, no sleep.
+        resolver, seen = self._scripted(monkeypatch, [object()])
+        assert resolver._resolve_sync("not a video id!") is None
+        assert seen["attempts"] == []
+        assert seen["sleeps"] == []
+
+
 # Each parity case: the engine's arguments as JSON-round-trippable
 # lists, keyed by the engine's native name (the Python module-level
 # fallback spells the same name with a leading underscore). Both the
@@ -753,6 +901,20 @@ _PARITY_CASES = {
         [None, "a", "a"],
         [None, "a", "b"],
     ],
+    # Each case installs its schedule as the module's _RETRY_DELAYS on
+    # both sides before the call (the default shape included); the
+    # string case pins the walk's iterator protocol — enumerate runs
+    # over any iterable, and so does the native engine.
+    "stream_retry_delays": [
+        [[0, 1.0, 2.0]],
+        [[]],
+        [[0]],
+        [[5]],
+        [[0, 0.5, 0.25, 7]],
+        [[2.0, 1]],
+        [[True, None, 0.0]],
+        ["ab"],
+    ],
 }
 
 _CHILD_PROG = """
@@ -775,6 +937,7 @@ PY_NAMES = {
     "download_error_hint": "_download_error_hint",
     "stream_cache_expired_ids": "_cache_expired_ids",
     "stream_cache_cap_evictions": "_cache_cap_evictions",
+    "stream_retry_delays": "_retry_delays",
     "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
     "stream_ydl_publish_verdict": "_ydl_publish_verdict",
 }
@@ -795,6 +958,9 @@ def call_args(name, args):
     if name == "stream_cache_cap_evictions":
         stream._CACHE_MAX_SIZE = args[0]
         return [{vid: SimpleNamespace(expires_at=exp) for vid, exp in args[1].items()}]
+    if name == "stream_retry_delays":
+        stream._RETRY_DELAYS = args[0]
+        return []
     if name == "stream_ydl_cookiejar_current":
         return [json_sig(args[0]), json_sig(args[1])]
     return args
@@ -810,6 +976,8 @@ def outcome(name, args):
         return {"ok": None if result is None else list(result)}
     if name == "stream_base_opts":
         return {"ok": {"keys": list(result), "dict": {k: v for k, v in result.items() if k != "logger"}}}
+    if name == "stream_retry_delays":
+        return {"ok": [[attempt, delay] for attempt, delay in result]}
     return {"ok": result}
 
 
@@ -830,6 +998,7 @@ _PY_NAMES = {
     "download_error_hint": "_download_error_hint",
     "stream_cache_expired_ids": "_cache_expired_ids",
     "stream_cache_cap_evictions": "_cache_cap_evictions",
+    "stream_retry_delays": "_retry_delays",
     "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
     "stream_ydl_publish_verdict": "_ydl_publish_verdict",
 }
@@ -838,9 +1007,10 @@ _PY_NAMES = {
 def _cache_call_args(name, args):
     """The cache rebuilt from the JSON case as the attribute-bearing
     objects the walks read; the cap engine's case also installs its
-    cap first (the caller restores it once the engine has run, so the
-    module constant never leaks); the cookiejar-signature engine's
-    cases are re-packed as the nested tuples the reference builds."""
+    cap first and the retry-delay engine's case its schedule (the
+    caller restores both once the engine has run, so the module
+    constants never leak); the cookiejar-signature engine's cases are
+    re-packed as the nested tuples the reference builds."""
     from ytm_player.services import stream
 
     if name == "stream_cache_expired_ids":
@@ -848,7 +1018,11 @@ def _cache_call_args(name, args):
     if name == "stream_cache_cap_evictions":
         saved = stream._CACHE_MAX_SIZE
         stream._CACHE_MAX_SIZE = args[0]
-        return [{vid: _entry(exp) for vid, exp in args[1].items()}], saved
+        return [{vid: _entry(exp) for vid, exp in args[1].items()}], ("_CACHE_MAX_SIZE", saved)
+    if name == "stream_retry_delays":
+        saved = stream._RETRY_DELAYS
+        stream._RETRY_DELAYS = args[0]
+        return [], ("_RETRY_DELAYS", saved)
     if name == "stream_ydl_cookiejar_current":
         return [_json_sig_case(args[0]), _json_sig_case(args[1])], None
     return args, None
@@ -860,16 +1034,16 @@ def _native_outcomes():
 
     def outcome(name, args):
         fn = getattr(sys.modules["ytm_player.services.stream"], _PY_NAMES[name])
-        call_args, saved_cap = _cache_call_args(name, args)
+        call_args, restore = _cache_call_args(name, args)
         try:
             result = fn(*call_args)
         except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
             return {"error": f"{type(exc).__name__}: {exc}"}
         finally:
-            if saved_cap is not None:
+            if restore is not None:
                 from ytm_player.services import stream
 
-                stream._CACHE_MAX_SIZE = saved_cap
+                setattr(stream, restore[0], restore[1])
         if name == "stream_info_fields":
             return {"ok": None if result is None else list(result)}
         if name == "stream_base_opts":
@@ -879,6 +1053,8 @@ def _native_outcomes():
                     "dict": {k: v for k, v in result.items() if k != "logger"},
                 }
             }
+        if name == "stream_retry_delays":
+            return {"ok": [[attempt, delay] for attempt, delay in result]}
         return {"ok": result}
 
     return {name: [outcome(name, args) for args in cases] for name, cases in _PARITY_CASES.items()}

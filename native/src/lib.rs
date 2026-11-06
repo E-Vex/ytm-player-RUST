@@ -832,9 +832,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // and prune_expired, and the over-cap eviction of the oldest
     // entries by expires_at behind _put_cache's second phase (the cap
     // read through the module's own _CACHE_MAX_SIZE name, a patched
-    // cap included). The YoutubeDL construction, the cookiejar
-    // vouching, the network extraction, the cache state and the
-    // pending-future bookkeeping stay Python-side in the resolver.
+    // cap included) — plus the retry-delay iteration behind
+    // _resolve_sync's retry loop (the (attempt, delay) schedule walk,
+    // the schedule read through the module's own _RETRY_DELAYS name,
+    // a patched schedule included). The YoutubeDL construction, the
+    // cookiejar vouching, the network extraction, the sleeps, the
+    // cache state and the pending-future bookkeeping stay Python-side
+    // in the resolver.
     module.add_function(pyo3::wrap_pyfunction!(is_stale, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(wait_seconds, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(validate_quality, module)?)?;
@@ -843,6 +847,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(download_error_hint, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_cache_expired_ids, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_cache_cap_evictions, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stream_retry_delays, module)?)?;
 
     // Stream yt-dlp instance-gate engines (services/stream.py
     // equivalents): the acquisition loop around the extract_info
@@ -15524,6 +15529,13 @@ fn stream_quality_formats(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     PyModule::import(py, "ytm_player.services.stream")?.getattr("QUALITY_FORMATS")
 }
 
+/// The stream module's retry schedule, read through the module
+/// attribute — the very `_RETRY_DELAYS` list the fallback's own
+/// enumerate walk runs against, a patched schedule included.
+fn stream_retry_schedule(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.services.stream")?.getattr("_RETRY_DELAYS")
+}
+
 /// The stream module's `_CACHE_MAX_SIZE` cap, read through the module
 /// attribute — the very constant the fallback's own over-cap gate and
 /// excess arithmetic run against, a patched cap included.
@@ -15962,6 +15974,35 @@ fn stream_cache_cap_evictions<'py>(
     Ok(evictions
         .downcast_into::<PyList>()
         .expect("a slice of a list is a list"))
+}
+
+/// The retry-delay iteration — `services/stream.py`'s `_retry_delays`,
+/// the `(attempt, delay)` schedule walk behind
+/// `StreamResolver._resolve_sync`'s retry loop.
+///
+/// Mirrors the reference's `list(enumerate(delays))` exactly: the
+/// schedule read through the module's own `_RETRY_DELAYS` attribute
+/// (a patched schedule steers both backends identically), then one
+/// pass over it through the iterator protocol — the schedule's own
+/// objects yielded as they come, each paired with its attempt index
+/// counting from 0 exactly like the interpreter's own `enumerate` —
+/// answering the fresh list of `(attempt, delay)` tuples the resolve
+/// loop walks (and breaks out of early on the first success). The
+/// sleep gate (`> 0`), the `time.sleep` call and the extraction
+/// attempts stay Python-side in the caller.
+#[pyfunction]
+fn stream_retry_delays<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+    let schedule = stream_retry_schedule(py)?;
+    let mut steps: Vec<Bound<'py, PyAny>> = Vec::new();
+    for (attempt, delay) in schedule.try_iter()?.enumerate() {
+        let delay = delay?;
+        let index = attempt
+            .into_pyobject(py)
+            .expect("usize -> int is infallible")
+            .into_any();
+        steps.push(PyTuple::new(py, [index, delay])?.into_any());
+    }
+    Ok(PyList::new(py, steps).expect("list of pairs cannot fail"))
 }
 
 // ── Download service (services/download.py) ──────────────────────────────
