@@ -737,17 +737,6 @@ class TrackTable(DataTable):
 
         from rich.text import Text
 
-        from ytm_player.utils.bidi import render_track_cell
-        from ytm_player.utils.formatting import (
-            extract_artist as _extract_artist,
-        )
-        from ytm_player.utils.formatting import (
-            extract_duration as _extract_duration,
-        )
-        from ytm_player.utils.formatting import (
-            format_duration as _format_duration,
-        )
-
         # Find the new playing index by matching video_id.
         new_index: int | None = None
         if self._playing_video_id is not None:
@@ -763,20 +752,25 @@ class TrackTable(DataTable):
             return
 
         def _plain_cells(track: dict, row_index: int) -> dict[str, Any]:
-            """Restore-cells: original (un-styled) values for a row."""
-            title = track.get("title", "Unknown")
-            artist = _extract_artist(track)
-            album = track.get("album") or ""
-            duration = _extract_duration(track)
-            cells: dict[str, Any] = {}
-            cells["mark"] = self._mark_glyph(track.get("_original_index", row_index))
-            cells["index"] = str(track.get("_original_index", row_index) + 1)
-            cells["title"] = render_track_cell(title)
-            cells["artist"] = render_track_cell(artist)
+            """Restore-cells: original (un-styled) values for a row.
+
+            The assembly runs through the ``_row_values`` engine —
+            one fused call (native when the Rust extension is built,
+            the pure-Python transcription otherwise) instead of the
+            per-field walk, its positional cells mapped back onto the
+            column keys in the table's own column order.
+            """
+            _, cells = _row_values(
+                track, row_index, self._show_index, self._show_album, self._marked
+            )
+            keys = ["mark"]
+            if self._show_index:
+                keys.append("index")
+            keys += ["title", "artist"]
             if self._show_album:
-                cells["album"] = render_track_cell(album)
-            cells["duration"] = _format_duration(duration) if duration else "--:--"
-            return cells
+                keys.append("album")
+            keys.append("duration")
+            return dict(zip(keys, cells))
 
         def _styled_cells(track: dict, row_index: int, style: str) -> dict[str, Any]:
             """Active-cells: same data values wrapped in Rich Text with *style*.
@@ -784,6 +778,9 @@ class TrackTable(DataTable):
             Unlike before, we do NOT overload the # column with a play
             glyph — the playing indicator now lives in Textual's row-label
             column (left of #). The # column keeps its original number.
+            The values themselves come from the ``_row_values`` engine
+            via ``_plain_cells``, so the styled row shows exactly the
+            cells a rebuild would compose for it.
             """
             plain = _plain_cells(track, row_index)
             return {key: Text(value, style=style) for key, value in plain.items()}

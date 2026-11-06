@@ -201,3 +201,73 @@ async def test_queue_entry_keys_is_off_unless_asked_for():
         plain, queue_like = app.query(TrackTable)
         assert plain.queue_entry_keys is False
         assert queue_like.queue_entry_keys is True
+
+
+async def test_playing_highlight_styles_and_restores_through_the_row_engine():
+    """The now-playing row's cells and the restored row's cells come from
+    the ``_row_values`` engine: the styled row wraps the engine's values
+    in bold Rich Text under the ▶ row label, the restored row keeps the
+    engine's plain strings — its live mark glyph included — under a blank
+    label, and clearing the playing track restores the last styled row."""
+
+    from rich.text import Text
+
+    from ytm_player.ui.widgets.track_table import _row_values
+
+    tracks = [
+        {"video_id": "v1", "title": "One", "artist": "A", "album": "Album A", "duration": 61},
+        {"video_id": "v2", "title": "Two", "artist": "B", "album": "Album B", "duration": 120},
+        {"video_id": "v3", "title": "Three", "artist": "C", "album": None, "duration": None},
+    ]
+    keys = ["mark", "index", "title", "artist", "album", "duration"]
+
+    class _WithTable(_Host):
+        def compose(self) -> ComposeResult:
+            yield TrackTable(show_index=True, show_album=True)
+
+    app = _WithTable()
+    async with app.run_test():
+        table = app.query_one(TrackTable)
+        table.load_tracks(tracks)
+        assert table._playing_index is None
+
+        # Play the second track: bold engine cells + the ▶ label.
+        table.set_playing("v2")
+        assert table._playing_index == 1
+        assert str(table.rows[table._row_keys[1]].label) == "▶"
+        _, engine_cells = _row_values(table._tracks[1], 1, True, True, table._marked)
+        for key, value in zip(keys, engine_cells):
+            cell = table.get_cell(table._row_keys[1], key)
+            assert isinstance(cell, Text)
+            assert cell.plain == value
+            assert "bold" in cell.style
+        assert table.get_cell(table._row_keys[1], "duration").plain == "2:00"
+
+        # Mark the playing row, then move on: the restore consults the
+        # live marks set through the engine (the ✓ lands in the mark
+        # cell) and answers plain strings under a blank label.
+        table._set_marks({1})
+        table.set_playing("v3")
+        assert table._playing_index == 2
+        _, restored = _row_values(table._tracks[1], 1, True, True, table._marked)
+        for key, value in zip(keys, restored):
+            cell = table.get_cell(table._row_keys[1], key)
+            assert not isinstance(cell, Text)
+            assert cell == value
+        assert table.get_cell(table._row_keys[1], "mark") == "✓"
+        assert table.get_cell(table._row_keys[1], "index") == "2"
+        assert str(table.rows[table._row_keys[1]].label) == " "
+        assert str(table.rows[table._row_keys[2]].label) == "▶"
+
+        # The None-duration track renders the engine's --:-- placeholder.
+        assert table.get_cell(table._row_keys[2], "duration").plain == "--:--"
+
+        # Clearing the playing track restores the last styled row too.
+        table.set_playing(None)
+        assert table._playing_index is None
+        _, cleared = _row_values(table._tracks[2], 2, True, True, table._marked)
+        for key, value in zip(keys, cleared):
+            cell = table.get_cell(table._row_keys[2], key)
+            assert not isinstance(cell, Text)
+            assert cell == value
+        assert str(table.rows[table._row_keys[2]].label) == " "
