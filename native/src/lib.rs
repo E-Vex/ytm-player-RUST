@@ -209,6 +209,19 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // Track-table view engine (ui/widgets/track_table.py equivalent):
     // the filter + sort pass that computes the visible row order.
     module.add_function(pyo3::wrap_pyfunction!(filter_sort_tracks, module)?)?;
+    // Track-table row-assembly engines (the same module's equivalents):
+    // the per-row (row_key, cells) composition behind _add_track_row —
+    // the mark glyph, the original-position number, the BiDi-isolated
+    // title/artist/album cells and the duration text — and the fused
+    // view engine behind every table rebuild (load_tracks' row walk
+    // and _rebuild_view + _reload_sorted's filter/sort/assembly chain,
+    // folded into one call answering the positions and the composed
+    // rows together), with the add_row calls, the cursor/scroll
+    // preservation and the playing-row highlight staying Python-side
+    // in the widget, and the cached bidi_mode verdict read once per
+    // rebuild Python-side.
+    module.add_function(pyo3::wrap_pyfunction!(track_table_row_values, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_view_rows, module)?)?;
 
     // Session-state validation engine (app/_session.py equivalent):
     // the one-pass validation + coercion of the parsed session.json
@@ -4239,6 +4252,204 @@ fn filter_sort_tracks(
     }
 
     positions
+}
+
+/// One rendered cell — the `render_track_cell` chain (the gated line
+/// reorder, then the FSI...PDI isolate wrap) with the wrapper's falsy
+/// passthrough folded in, so the fused row engines render each text
+/// cell exactly like the per-cell engine the call sites used to reach
+/// for. Only the cached `bidi_mode` verdict stays Python-side,
+/// travelling in as a plain bool.
+fn track_cell(text: &str, reorder_enabled: bool) -> String {
+    if text.is_empty() {
+        text.to_string()
+    } else {
+        isolate_bidi_impl(&gated_reorder(text, reorder_enabled), true)
+    }
+}
+
+/// One composed visible row — the `(row_key, cells)` pair the fused
+/// view engine answers per visible position, converted to a Python
+/// tuple-of-(str, list-of-str) on the way out.
+type TrackRow = (String, Vec<String>);
+
+/// The single-row assembly — one visible row's `(row_key, cells)` pair,
+/// the pure core of `TrackTable._add_track_row` from
+/// `ui/widgets/track_table.py`.
+///
+/// Mirrors the reference's reads in the reference's own order, every
+/// read through the dict's own `.get` method: the `title` (the
+/// `"Unknown"` default), the artist through the `extract_artist`
+/// engine (the artists-list walk with its view-count pseudo-artist
+/// exclusion and the `"Unknown"` fallback), the `album` through the
+/// `or ""` truthiness gate, and the duration through the
+/// `extract_duration` engine. The mark glyph is the `✓` when the
+/// `_original_index` read (the visible *index* as its default) is a
+/// member of *marked* — CPython's own containment, so the set's
+/// hash/eq semantics decide — the `#` cell `str(orig + 1)` through
+/// CPython's own `+` and `str()` (only when *show_index*), the three
+/// text cells through the per-cell render chain with its falsy
+/// passthrough (`title` and `artist` always, `album` only when
+/// *show_album*), the duration cell `format_duration(duration)` when
+/// the duration is truthy else `"--:--"`, and the row key
+/// `f"{video_id}_{index}"` — the `video_id` read (the `"row_{index}"`
+/// default evaluated before the read runs, exactly like the
+/// reference's argument evaluation) rendered through `str()`.
+///
+/// The reference reads `_original_index` twice (once for the glyph,
+/// once for the `#` cell); the engine reads it once — the same value
+/// both times on the plain dicts `load_tracks` builds. Non-dict
+/// tracks raise the downcast's own `TypeError` where the reference's
+/// first `.get` would raise `AttributeError` — `load_tracks` wraps
+/// every track in a fresh `dict`, so the shape is unreachable through
+/// the table's own paths.
+fn track_row_values_impl(
+    py: Python,
+    track: &Bound<'_, PyDict>,
+    index: usize,
+    show_index: bool,
+    show_album: bool,
+    marked: &Bound<'_, PyAny>,
+    reorder_enabled: bool,
+) -> PyResult<(String, Vec<String>)> {
+    // title = track.get("title", "Unknown")
+    let title_obj = track.call_method1("get", ("title", "Unknown"))?;
+    let title: String = title_obj.extract()?;
+    // artist = extract_artist(track)
+    let artist = extract_artist(py, track);
+    // album = track.get("album") or ""
+    let album_raw = track.call_method1("get", ("album",))?;
+    let album: String = if album_raw.is_truthy()? {
+        album_raw.extract()?
+    } else {
+        String::new()
+    };
+    // duration = extract_duration(track)
+    let duration = extract_duration(py, track);
+    // orig = track.get("_original_index", index)
+    let index_obj: usize = index;
+    let orig = track.call_method1("get", ("_original_index", index_obj))?;
+
+    let mut cells: Vec<String> = Vec::with_capacity(6);
+    // _mark_glyph(orig): the containment over the caller's marked set.
+    cells.push(if marked.contains(&orig)? {
+        "✓".to_string()
+    } else {
+        " ".to_string()
+    });
+    if show_index {
+        // str(orig + 1) — CPython's own + then str().
+        let one = 1i64
+            .into_pyobject(py)
+            .expect("int conversion is infallible")
+            .into_any();
+        let bumped = orig.add(&one)?;
+        cells.push(py_str(&bumped)?);
+    }
+    cells.push(track_cell(&title, reorder_enabled));
+    cells.push(track_cell(&artist, reorder_enabled));
+    if show_album {
+        cells.push(track_cell(&album, reorder_enabled));
+    }
+    // format_duration(duration) if duration else "--:--"
+    if duration != 0 {
+        cells.push(format_duration(duration));
+    } else {
+        cells.push("--:--".to_string());
+    }
+
+    // video_id = track.get("video_id", f"row_{index}")
+    let row_default = format!("row_{}", index);
+    let video_id = track.call_method1("get", ("video_id", row_default.as_str()))?;
+    // f"{video_id}_{index}"
+    let key = format!("{}_{}", py_str(&video_id)?, index);
+    Ok((key, cells))
+}
+
+/// The single-row assembly engine — `ui/widgets/track_table.py`'s
+/// `_row_values`, the per-row core behind the append path
+/// (`append_tracks`' unsorted branch) and the fallback composition of
+/// the fused engine below. See `track_row_values_impl` for the
+/// mirrored contract; the answer is the `(row_key, cells)` pair the
+/// caller hands to Textual's `add_row`, with the `add_row` call itself
+/// staying Python-side.
+#[pyfunction]
+#[pyo3(signature = (track, index, show_index, show_album, marked, reorder_enabled))]
+fn track_table_row_values<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+    index: usize,
+    show_index: bool,
+    show_album: bool,
+    marked: &Bound<'py, PyAny>,
+    reorder_enabled: bool,
+) -> PyResult<(String, Vec<String>)> {
+    let dict = track
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+    track_row_values_impl(
+        py,
+        dict,
+        index,
+        show_index,
+        show_album,
+        marked,
+        reorder_enabled,
+    )
+}
+
+/// The fused view-rows engine — `ui/widgets/track_table.py`'s
+/// `_compose_view_rows`, the one native call behind every table
+/// rebuild: `load_tracks`' row walk and `_rebuild_view` +
+/// `_reload_sorted`'s filter/sort/row-assembly chain, folded together.
+///
+/// The visible-row order is the `filter_sort_tracks` engine's own walk
+/// (the filter, then the stable column sort — see its contract above),
+/// and each visible row's `(row_key, cells)` pair the
+/// `track_row_values_impl` assembly over the track at that position,
+/// with the VISIBLE row number as the assembly's *index* (the row-key
+/// suffix, the `_original_index` default and the `row_{index}`
+/// fallback all name the visible slot, exactly like the reference's
+/// `enumerate` walk). The answer is the `(positions, rows)` pair — the
+/// positions the caller slices its track list and `_filtered_map`
+/// from, the rows it hands to `add_row` — with the marks set passed
+/// through as the object it is (the glyph containment runs through
+/// CPython's own protocol) and the cached `bidi_mode` verdict
+/// travelling in as a bool, read once per rebuild instead of once per
+/// cell. The `add_row` calls, the cursor/scroll preservation and the
+/// playing-row highlight stay Python-side in the widget.
+#[allow(clippy::too_many_arguments)] // the view params plus the marks set and the cached bidi verdict
+#[pyfunction]
+#[pyo3(signature = (tracks, query, sort_column, sort_reverse, show_index, show_album, marked, reorder_enabled))]
+fn track_table_view_rows(
+    py: Python,
+    tracks: &Bound<'_, PyList>,
+    query: &str,
+    sort_column: Option<&str>,
+    sort_reverse: bool,
+    show_index: bool,
+    show_album: bool,
+    marked: &Bound<'_, PyAny>,
+    reorder_enabled: bool,
+) -> PyResult<(Vec<usize>, Vec<TrackRow>)> {
+    let positions = filter_sort_tracks(py, tracks, query, sort_column, sort_reverse);
+    let mut rows: Vec<TrackRow> = Vec::with_capacity(positions.len());
+    for (visible, &pos) in positions.iter().enumerate() {
+        let item = tracks.get_item(pos)?;
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+        rows.push(track_row_values_impl(
+            py,
+            dict,
+            visible,
+            show_index,
+            show_album,
+            marked,
+            reorder_enabled,
+        )?);
+    }
+    Ok((positions, rows))
 }
 
 // ---------------------------------------------------------------------------

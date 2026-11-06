@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Callable, Hashable, Iterable, Sequence
-from typing import Any
+from typing import AbstractSet, Any
 
 from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.geometry import Size
@@ -72,6 +72,79 @@ def _filter_sort_positions(
     if key_fn is not None:
         kept.sort(key=lambda i: key_fn(tracks[i]), reverse=sort_reverse)
     return kept
+
+
+def _row_values(
+    track: dict,
+    index: int,
+    show_index: bool,
+    show_album: bool,
+    marked: AbstractSet[int],
+) -> tuple[str, list[str]]:
+    """One visible row's ``(row_key, cells)`` pair.
+
+    The pure core of ``TrackTable._add_track_row``: the mark glyph
+    (``✓`` when the row's ``_original_index`` — the visible *index* as
+    its default — is a member of *marked*), the ``#`` cell
+    ``str(orig + 1)`` (only when *show_index*), the BiDi-isolated
+    title/artist/album cells (the album only when *show_album*, the
+    album itself read through the ``or ""`` truthiness gate), the
+    duration text (``format_duration`` when the duration is truthy,
+    ``"--:--"`` otherwise) and the ``f"{video_id}_{index}"`` row key
+    (the ``video_id`` read with its ``"row_{index}"`` default). The
+    ``add_row`` call stays with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_row_values``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.utils.bidi import render_track_cell
+
+    title = track.get("title", "Unknown")
+    artist = extract_artist(track)
+    album = track.get("album") or ""
+    duration = extract_duration(track)
+    orig = track.get("_original_index", index)
+    cells: list[str] = [_MARK_GLYPH if orig in marked else " "]
+    if show_index:
+        cells.append(str(orig + 1))
+    cells.append(render_track_cell(title))
+    cells.append(render_track_cell(artist))
+    if show_album:
+        cells.append(render_track_cell(album))
+    cells.append(format_duration(duration) if duration else "--:--")
+    video_id = track.get("video_id", f"row_{index}")
+    return f"{video_id}_{index}", cells
+
+
+def _compose_view_rows(
+    tracks: list[dict],
+    query: str,
+    sort_column: str | None,
+    sort_reverse: bool,
+    show_index: bool,
+    show_album: bool,
+    marked: AbstractSet[int],
+) -> tuple[list[int], list[tuple[str, list[str]]]]:
+    """The visible rows' ``(positions, (row_key, cells) pairs)``.
+
+    The fused view engine behind every table rebuild —
+    ``TrackTable.load_tracks``' row walk and ``_rebuild_view`` +
+    ``_reload_sorted``'s chain: the filter + sort order (the
+    ``_filter_sort_positions`` engine) fused with each visible row's
+    cell assembly (the ``_row_values`` engine, the VISIBLE row number
+    as its index). The ``add_row`` calls stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_view_rows``) when it is built;
+    this pure-Python composition is the fallback otherwise.
+    """
+    positions = _filter_sort_positions(tracks, query, sort_column, sort_reverse)
+    rows = [
+        _row_values(tracks[pos], visible, show_index, show_album, marked)
+        for visible, pos in enumerate(positions)
+    ]
+    return positions, rows
 
 
 class TrackTable(DataTable):
@@ -396,9 +469,13 @@ class TrackTable(DataTable):
         self._filter_text = ""
         self._filter_active = False
 
-        for i, track in enumerate(self._tracks):
-            row_key = self._add_track_row(i, track)
-            self._row_keys.append(row_key)
+        # The fresh load's rows — identity order, no marks yet — in one
+        # engine pass (the filter+sort walk runs trivially: an empty
+        # query and no sort keep load order).
+        _, rows = _compose_view_rows(
+            self._all_tracks, "", None, False, self._show_index, self._show_album, self._marked
+        )
+        self._append_rows(rows)
 
         # Reflow the title column now that rows (with row labels) exist
         # — the row-label column eats ~3 cells, so the initial column
@@ -594,35 +671,29 @@ class TrackTable(DataTable):
                 return True
         return False
 
+    def _append_rows(self, rows: Sequence[tuple[str, list[str]]]) -> None:
+        """Add pre-composed ``(row_key, cells)`` rows, tracking their keys.
+
+        The row-label reservation (``label=" "`` on every row so
+        Textual reserves the column once any row has a label —
+        ``_highlight_playing`` mutates the slot to show ▶ on the
+        playing row) lives here, next to the ``add_row`` calls.
+        """
+        for row_key, cells in rows:
+            self._row_keys.append(self.add_row(*cells, key=row_key, label=" "))
+
     def _add_track_row(self, index: int, track: dict) -> RowKey:
-        """Add a single track as a row in the table."""
-        title = track.get("title", "Unknown")
-        artist = extract_artist(track)
-        album = track.get("album") or ""
-        duration = extract_duration(track)
+        """Add a single track as a row in the table.
 
-        # The per-cell render engine fuses the reorder -> isolate chain
-        # each text cell went through into one call (Rust when the
-        # extension is built): FSI...PDI isolation so RTL cells cannot
-        # bleed into adjacent columns.
-        from ytm_player.utils.bidi import render_track_cell
-
-        cells: list[str | int] = [self._mark_glyph(track.get("_original_index", index))]
-        if self._show_index:
-            # Always show original playlist position, not current row number.
-            orig = track.get("_original_index", index)
-            cells.append(str(orig + 1))
-        cells.append(render_track_cell(title))
-        cells.append(render_track_cell(artist))
-        if self._show_album:
-            cells.append(render_track_cell(album))
-        cells.append(format_duration(duration) if duration else "--:--")
-
-        video_id = track.get("video_id", f"row_{index}")
-        # Pass label=" " on every row so Textual reserves the row-label
-        # column once any row has a non-None label. _highlight_playing
-        # mutates this slot to show ▶ on the playing row.
-        return self.add_row(*cells, key=f"{video_id}_{index}", label=" ")
+        The cell assembly — the mark glyph, the position number, the
+        BiDi-isolated text cells and the duration — is resolved by the
+        ``_row_values`` engine (native when the Rust extension is
+        built, the pure-Python transcription otherwise), fused with the
+        FSI...PDI isolation so RTL cells cannot bleed into adjacent
+        columns.
+        """
+        row_key, cells = _row_values(track, index, self._show_index, self._show_album, self._marked)
+        return self.add_row(*cells, key=row_key, label=" ")
 
     # -- Playing state ----------------------------------------------------
 
@@ -1179,16 +1250,24 @@ class TrackTable(DataTable):
 
         One path for filtering, sorting and ``refresh_tracks``, so the
         rows come out the same whichever order the user applied them in
-        — a filter typed on a sorted list keeps the sort. The order itself
-        comes from ``_filter_sort_positions`` — the native Rust engine
-        when the extension is built, the pure-Python reference otherwise.
+        — a filter typed on a sorted list keeps the sort. The order
+        itself — and, through the ``_compose_view_rows`` engine, every
+        visible row's cell assembly — comes from one fused pass
+        (the native Rust engine when the extension is built, the
+        pure-Python composition otherwise).
         """
-        positions = _filter_sort_positions(
-            self._all_tracks, self._filter_text, self._sort_column, self._sort_reverse
+        positions, rows = _compose_view_rows(
+            self._all_tracks,
+            self._filter_text,
+            self._sort_column,
+            self._sort_reverse,
+            self._show_index,
+            self._show_album,
+            self._marked,
         )
         self._tracks = [self._all_tracks[i] for i in positions]
         self._filtered_map = [t["_original_index"] for t in self._tracks]
-        self._reload_sorted()
+        self._reload_sorted(rows)
 
     def show_filter(self) -> None:
         """Signal that filter mode should begin."""
@@ -1245,15 +1324,13 @@ class TrackTable(DataTable):
         except ValueError:
             pass
 
-    def _reload_sorted(self) -> None:
-        """Rebuild table rows from the current _tracks order."""
+    def _reload_sorted(self, rows: Sequence[tuple[str, list[str]]]) -> None:
+        """Rebuild table rows from the pre-composed ``(row_key, cells)`` pairs."""
         saved_scroll_x = self.scroll_x
         self.clear()
         self._row_keys = []
         self._playing_index = None
-        for i, track in enumerate(self._tracks):
-            row_key = self._add_track_row(i, track)
-            self._row_keys.append(row_key)
+        self._append_rows(rows)
         self._highlight_playing()
         self.scroll_x = saved_scroll_x
         self._update_mark_status()
@@ -1328,17 +1405,23 @@ class TrackTable(DataTable):
                     self._place_cursor_on(current)
 
 
-# ── Native (Rust/PyO3) override, if available ──────────────────────────
-# The Rust extension implements the same view engine; this binding
-# overrides the pure-Python reference above when the extension is
-# importable.  The rebinding must happen AFTER the definitions above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statements (the lesson that produced formatting.py's dead
-# native bindings).
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same view engine and the same row
+# assembly; these bindings replace the pure-Python references above when
+# the extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         filter_sort_tracks as _native_filter_sort_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_row_values as _native_row_values,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_view_rows as _native_view_rows,
     )
 except ImportError:
     pass
@@ -1358,3 +1441,54 @@ else:
         reference would raise — ``load_tracks`` never produces them.
         """
         return _native_filter_sort_tracks(tracks, query, sort_column, sort_reverse)
+
+    def _row_values(  # noqa: F811
+        track: dict,
+        index: int,
+        show_index: bool,
+        show_album: bool,
+        marked: AbstractSet[int],
+    ) -> tuple[str, list[str]]:
+        """One visible row's (row_key, cells) pair (native Rust engine).
+
+        Same contract as the pure-Python reference above; the whole
+        per-row assembly — the reads, the glyph containment, the
+        position render, the BiDi cell renders and the row key — runs
+        inside one native call, with only the cached ``bidi_mode``
+        verdict read here.
+        """
+        from ytm_player.utils.bidi import _get_reorder_enabled
+
+        return _native_row_values(
+            track, index, show_index, show_album, marked, _get_reorder_enabled()
+        )
+
+    def _compose_view_rows(  # noqa: F811
+        tracks: list[dict],
+        query: str,
+        sort_column: str | None,
+        sort_reverse: bool,
+        show_index: bool,
+        show_album: bool,
+        marked: AbstractSet[int],
+    ) -> tuple[list[int], list[tuple[str, list[str]]]]:
+        """The visible rows' (positions, rows) (native Rust engine).
+
+        Same contract as the pure-Python composition above: the whole
+        rebuild — the filter, the sort and every visible row's cell
+        assembly — runs inside one native call, with only the cached
+        ``bidi_mode`` verdict read here (once per rebuild instead of
+        once per cell).
+        """
+        from ytm_player.utils.bidi import _get_reorder_enabled
+
+        return _native_view_rows(
+            tracks,
+            query,
+            sort_column,
+            sort_reverse,
+            show_index,
+            show_album,
+            marked,
+            _get_reorder_enabled(),
+        )
