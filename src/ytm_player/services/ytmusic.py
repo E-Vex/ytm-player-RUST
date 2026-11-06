@@ -1,8 +1,13 @@
 """Async wrapper around ytmusicapi providing all YouTube Music functionality.
 
 The service's pure computation is dual-implemented: the
-mutation-failure classifier ``_classify_mutation_failure`` and the
-browse wrappers' cores — the watch-playlist kwargs assembly
+mutation-failure classifier ``_classify_mutation_failure``, the
+retry/renewal bookkeeping — the auth-expiry sniff ``_is_auth_expired``
+behind every expired-session retry, the renewal-cooldown gate
+``_renewal_cooldown_gate`` and stamp ``_renewal_cooldown_stamp``
+behind ``_renewed_client_for``, and the consecutive-failure step
+``_api_failure_step`` behind ``_run``'s except arm — and the browse
+wrappers' cores — the watch-playlist kwargs assembly
 ``_watch_playlist_kwargs``, the result-tracks extraction
 ``_result_tracks``, the playlist-tracks gate ``_playlist_tracks``,
 the radio seed pool ``_radio_seed_pool``, the discovery source
@@ -14,6 +19,10 @@ explore new-releases extraction ``_explore_new_releases`` and the
 playlist sort-order lookup ``_playlist_order_params`` — are
 implemented by the Rust extension
 (``_ytm_player_native.classify_mutation_failure`` /
+``_ytm_player_native.ytm_auth_expired`` /
+``_ytm_player_native.ytm_renewal_cooldown_gate`` /
+``_ytm_player_native.ytm_renewal_cooldown_stamp`` /
+``_ytm_player_native.ytm_api_failure_step`` /
 ``_ytm_player_native.ytm_watch_playlist_kwargs`` /
 ``_ytm_player_native.ytm_result_tracks`` /
 ``_ytm_player_native.ytm_playlist_tracks`` /
@@ -199,6 +208,22 @@ _MUTATION_TOAST_SUFFIX: dict[MutationResult, str] = {
 
 
 def _is_auth_expired(exc: BaseException) -> bool:
+    """The auth-expiry sniff behind every expired-session retry.
+
+    The gate ``_call``'s except arm and ``get_playlist``'s ordered
+    branch consult before renewing: a ``YTMusicServerError`` delegates
+    to the mutation-failure classifier and answers whether it
+    classified ``"auth_expired"``; a ``KeyError`` (ytmusicapi parser
+    drift on a sign-in endpoint where data was expected) renders
+    through ``str()``, lowercases and answers whether the message
+    carries any of the three sign-in markers — ``signinendpoint``,
+    ``sign in to`` or the ``'logged_in', 'value': '0'`` fragment;
+    everything else answers ``False``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_auth_expired``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     if isinstance(exc, YTMusicServerError):
         return _classify_mutation_failure(exc) == "auth_expired"
     if isinstance(exc, KeyError):
@@ -209,6 +234,60 @@ def _is_auth_expired(exc: BaseException) -> bool:
             or ("'logged_in', 'value': '0'" in message)
         )
     return False
+
+
+def _renewal_cooldown_gate(retry_after: float) -> tuple[bool, float]:
+    """The renewal-cooldown gate behind ``_renewed_client_for``.
+
+    The bookkeeping that keeps a failed automatic renewal from being
+    retried (with its browser cookie extraction and account probes)
+    until the cooldown has elapsed: the remaining cooldown —
+    ``retry_after`` minus the module clock's own ``time.monotonic()``
+    read — and the ``> 0`` verdict naming whether the retry is still
+    blocked, the pair the caller logs its ``%.0fs`` line from.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_renewal_cooldown_gate``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    remaining = retry_after - time.monotonic()
+    return (remaining > 0, remaining)
+
+
+def _renewal_cooldown_stamp() -> float:
+    """The cooldown stamp a failed renewal sets.
+
+    The write side of ``_renewed_client_for``'s cooldown bookkeeping:
+    the module clock's own ``time.monotonic()`` plus the module's own
+    ``_RENEWAL_COOLDOWN_SECONDS`` (a patched constant steers both
+    backends identically) — the value the failed-renewal arm assigns
+    so the gate above blocks the retries until it has passed.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_renewal_cooldown_stamp``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return time.monotonic() + _RENEWAL_COOLDOWN_SECONDS
+
+
+def _api_failure_step(consecutive_failures: int) -> tuple[int, bool]:
+    """The consecutive-failure step behind ``_run``'s except arm.
+
+    The retry bookkeeping that counts the expected API failures and
+    re-creates the YTMusic client once a streak of them suggests the
+    session has gone stale: the bumped count and the verdict naming
+    whether the streak has reached the module's own
+    ``_MAX_API_FAILURES_BEFORE_REINIT`` (a patched cap steers both
+    backends identically). The caller assigns the bump, and the reinit
+    branch's own reset to 0 — after the client clear — stays with it,
+    at the reference's own points.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_api_failure_step``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    bumped = consecutive_failures + 1
+    return (bumped, bumped >= _MAX_API_FAILURES_BEFORE_REINIT)
 
 
 def mutation_failure_suffix(kind: MutationResult) -> str:
@@ -590,8 +669,13 @@ class YTMusicService:
             raise error
         async with self._auth_refresh_lock:
             if self._ytm is failed_client or self._ytm is None:
-                remaining = self._renewal_retry_after - time.monotonic()
-                if remaining > 0:
+                # The cooldown gate and the failed-renewal stamp are
+                # resolved by the _renewal_cooldown_gate / stamp
+                # engines (native when the Rust extension is built, the
+                # pure-Python transcriptions otherwise); the lock, the
+                # renewal itself and the raise stay here.
+                blocked, remaining = _renewal_cooldown_gate(self._renewal_retry_after)
+                if blocked:
                     logger.warning(
                         "YouTube Music session expired; the last automatic renewal failed, "
                         "not trying again for another %.0fs",
@@ -605,7 +689,7 @@ class YTMusicService:
                     except Exception:
                         logger.exception("Authentication refresh notification failed")
                 if not await asyncio.to_thread(auth_manager.try_auto_refresh, identity):
-                    self._renewal_retry_after = time.monotonic() + _RENEWAL_COOLDOWN_SECONDS
+                    self._renewal_retry_after = _renewal_cooldown_stamp()
                     logger.warning("Automatic YouTube Music session refresh failed")
                     raise error
                 self._renewal_retry_after = 0.0
@@ -639,11 +723,17 @@ class YTMusicService:
                 getattr(func, "__name__", str(func)),
                 self._consecutive_api_failures + 1,
             )
-            self._consecutive_api_failures += 1
-            if self._consecutive_api_failures >= _MAX_API_FAILURES_BEFORE_REINIT:
+            # The bump and the threshold verdict are resolved by the
+            # _api_failure_step engine (native when the Rust extension
+            # is built, the pure-Python transcription otherwise); the
+            # assignment, the reinit branch and the post-reinit reset
+            # stay here, at the reference's own points.
+            bumped, reinit = _api_failure_step(self._consecutive_api_failures)
+            self._consecutive_api_failures = bumped
+            if reinit:
                 logger.warning(
                     "Re-initializing YTMusic client after %d consecutive API failures",
-                    self._consecutive_api_failures,
+                    bumped,
                 )
                 # Hold the lock while clearing _ytm so a concurrent .client
                 # access doesn't race with the reinit signal.
@@ -1538,6 +1628,12 @@ class YTMusicService:
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_api_failure_step as _native_api_failure_step,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_auth_expired as _native_auth_expired,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_chart_playable_tracks as _native_chart_playable_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -1565,6 +1661,12 @@ try:
         ytm_radio_seed_pool as _native_radio_seed_pool,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_renewal_cooldown_gate as _native_renewal_cooldown_gate,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_renewal_cooldown_stamp as _native_renewal_cooldown_stamp,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_result_tracks as _native_result_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -1573,6 +1675,10 @@ try:
 except ImportError:
     pass
 else:
+    _is_auth_expired = _native_auth_expired  # type: ignore[assignment]
+    _renewal_cooldown_gate = _native_renewal_cooldown_gate  # type: ignore[assignment]
+    _renewal_cooldown_stamp = _native_renewal_cooldown_stamp  # type: ignore[assignment]
+    _api_failure_step = _native_api_failure_step  # type: ignore[assignment]
     _watch_playlist_kwargs = _native_watch_playlist_kwargs  # type: ignore[assignment]
     _result_tracks = _native_result_tracks  # type: ignore[assignment]
     _playlist_tracks = _native_playlist_tracks  # type: ignore[assignment]

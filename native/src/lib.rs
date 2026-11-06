@@ -605,6 +605,24 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // values included) deciding auth_expired from server_error.
     module.add_function(pyo3::wrap_pyfunction!(classify_mutation_failure, module)?)?;
 
+    // YTMusic retry/renewal bookkeeping engines (services/ytmusic.py
+    // equivalents): the auth-expiry sniff behind _is_auth_expired (the
+    // gate every expired-session retry consults before renewing — the
+    // YTMusicServerError arm delegating to the module's own classifier,
+    // the KeyError arm's sign-in marker sniff over the lowered
+    // message), the renewal-cooldown gate and stamp behind
+    // _renewed_client_for (the remaining-cooldown arithmetic and the
+    // failed-renewal stamp, both against the module's own clock and
+    // cooldown constant), and the consecutive-failure step behind
+    // _run's except arm (the counter bump and the reinit threshold
+    // verdict against the module's own cap) — with the locks, the
+    // renewal itself, the client rebuilds and the logging staying
+    // Python-side in the service.
+    module.add_function(pyo3::wrap_pyfunction!(ytm_auth_expired, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_renewal_cooldown_gate, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_renewal_cooldown_stamp, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_api_failure_step, module)?)?;
+
     // YTMusic browse-wrapper engines (services/ytmusic.py equivalents):
     // the read wrappers' pure cores — the watch-playlist kwargs
     // assembly behind get_watch_playlist, the tracks extraction the
@@ -12354,6 +12372,157 @@ fn classify_mutation_failure(py: Python, exc: &Bound<'_, PyAny>) -> PyResult<&'s
     }
     // The reference's unreachable-in-practice safety default.
     Ok("server_error")
+}
+
+/// The ytmusic module's own clock — `time.monotonic()` read through the
+/// module's `time` attribute, exactly like the reference's global
+/// lookup at call time. A test (or any caller) that swaps
+/// `ytm_player.services.ytmusic`'s `time` for a frozen namespace steers
+/// the native engines exactly like the fallback: the clock the
+/// reference would read is the clock the engines read.
+fn ytmusic_module_monotonic(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    let ytmusic = PyModule::import(py, "ytm_player.services.ytmusic")?;
+    let time_module = ytmusic.getattr("time")?;
+    let clock = time_module.getattr("monotonic")?;
+    clock.call0()
+}
+
+/// The auth-expiry sniff behind `services/ytmusic.py`'s
+/// `_is_auth_expired` — the gate every expired-session retry
+/// (`_call`'s except arm and `get_playlist`'s ordered branch)
+/// consults before renewing.
+///
+/// Mirrors the reference's isinstance chain in its exact order: a
+/// `YTMusicServerError` (the class resolved from the running
+/// interpreter, the very module the reference imported at its own
+/// module scope) delegates to the module's own
+/// `_classify_mutation_failure` — resolved through the module
+/// attribute at call time, so whichever classifier the module is
+/// running (the native engine or the pure-Python transcription)
+/// steers this engine identically — and answers whether it classified
+/// "auth_expired" (CPython's own `==`); a `KeyError` renders through
+/// `str()`, lowercases through the str's own `.lower()` method and
+/// answers whether the lowered message contains any of the three
+/// sign-in markers — `signinendpoint`, `sign in to`, or the
+/// `'logged_in', 'value': '0'` fragment — each containment through
+/// CPython's own `in` (the substring protocol on the message object
+/// itself, never a re-encoded copy); everything else answers `False`.
+#[pyfunction]
+#[pyo3(signature = (exc))]
+fn ytm_auth_expired(py: Python, exc: &Bound<'_, PyAny>) -> PyResult<bool> {
+    // isinstance(exc, YTMusicServerError) — the classifier verdict.
+    let ytmusic_exceptions = py.import("ytmusicapi.exceptions")?;
+    let server_error = ytmusic_exceptions.getattr("YTMusicServerError")?;
+    if exc.is_instance(&server_error)? {
+        let classifier = PyModule::import(py, "ytm_player.services.ytmusic")?
+            .getattr("_classify_mutation_failure")?;
+        let kind = classifier.call1((exc,))?;
+        return kind.eq("auth_expired");
+    }
+    // isinstance(exc, KeyError) — the sign-in marker sniff over the
+    // lowered message.
+    let builtins = py.import("builtins")?;
+    let key_error = builtins.getattr("KeyError")?;
+    if exc.is_instance(&key_error)? {
+        let message = exc.str()?.call_method0("lower")?;
+        let marker_1 = PyString::new(py, "signinendpoint").into_any();
+        if message.contains(&marker_1)? {
+            return Ok(true);
+        }
+        let marker_2 = PyString::new(py, "sign in to").into_any();
+        if message.contains(&marker_2)? {
+            return Ok(true);
+        }
+        let marker_3 = PyString::new(py, "'logged_in', 'value': '0'").into_any();
+        return message.contains(&marker_3);
+    }
+    Ok(false)
+}
+
+/// The renewal-cooldown gate — `services/ytmusic.py`'s
+/// `_renewed_client_for` cooldown check, the bookkeeping that keeps a
+/// failed automatic renewal from being retried (with its browser
+/// cookie extraction and account probes) until the cooldown has
+/// elapsed.
+///
+/// Mirrors the reference's two expressions exactly: the clock read
+/// through the module's own `time` name first (see
+/// `ytmusic_module_monotonic`), then `remaining = retry_after - now`
+/// through CPython's own `-` (its `__sub__` protocol — a non-numeric
+/// *retry_after* raises the operator's own `TypeError`), then the
+/// `> 0` verdict through CPython's own comparison. The answer is the
+/// (blocked, remaining) pair — *remaining* the very object the
+/// subtraction produced, for the caller's `%.0fs` log line — with the
+/// lock, the renewal itself and the raise staying Python-side in the
+/// caller.
+#[pyfunction]
+#[pyo3(signature = (retry_after))]
+fn ytm_renewal_cooldown_gate<'py>(
+    py: Python<'py>,
+    retry_after: &Bound<'py, PyAny>,
+) -> PyResult<(bool, Bound<'py, PyAny>)> {
+    let now = ytmusic_module_monotonic(py)?;
+    let remaining = retry_after.sub(&now)?;
+    let zero = 0i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let blocked = remaining.gt(&zero)?;
+    Ok((blocked, remaining))
+}
+
+/// The renewal-cooldown stamp — `services/ytmusic.py`'s
+/// `_renewed_client_for` failure arm, the bookkeeping a failed
+/// automatic renewal writes so the gate above blocks the retries
+/// until the cooldown has elapsed.
+///
+/// Mirrors the reference's single expression exactly: the clock read
+/// through the module's own `time` name, then `now +
+/// _RENEWAL_COOLDOWN_SECONDS` through CPython's own `+`, with the
+/// cooldown constant read through the module's own attribute — the
+/// very constant the fallback's own expression runs against, a
+/// patched constant included. The stamp is whatever object the
+/// addition produced; the assignment stays Python-side in the caller.
+#[pyfunction]
+fn ytm_renewal_cooldown_stamp<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    let now = ytmusic_module_monotonic(py)?;
+    let cooldown = PyModule::import(py, "ytm_player.services.ytmusic")?
+        .getattr("_RENEWAL_COOLDOWN_SECONDS")?;
+    now.add(&cooldown)
+}
+
+/// The consecutive-failure step — `services/ytmusic.py`'s `_run`
+/// except arm, the retry bookkeeping that counts the expected API
+/// failures and re-creates the YTMusic client once a streak of them
+/// suggests the session has gone stale.
+///
+/// Mirrors the reference's two expressions exactly: the bump through
+/// CPython's own `+` (its `__add__` protocol — a non-numeric count
+/// raises the operator's own `TypeError`), then the `>=` verdict
+/// through CPython's own comparison against the module's own
+/// `_MAX_API_FAILURES_BEFORE_REINIT` — read through the module
+/// attribute, so a patched threshold steers both backends
+/// identically. The answer is the (bumped, due) pair — the bumped
+/// count for the caller's own assignment and log line, the verdict
+/// naming whether the reinit branch runs — with the log, the
+/// `_client_init_lock` hold, the client clear and the post-reinit
+/// reset to 0 staying Python-side in the caller, at the reference's
+/// own points.
+#[pyfunction]
+#[pyo3(signature = (consecutive_failures))]
+fn ytm_api_failure_step<'py>(
+    py: Python<'py>,
+    consecutive_failures: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let bumped = consecutive_failures.add(&one)?;
+    let threshold = PyModule::import(py, "ytm_player.services.ytmusic")?
+        .getattr("_MAX_API_FAILURES_BEFORE_REINIT")?;
+    let due = bumped.ge(&threshold)?;
+    Ok((bumped, due))
 }
 
 // ── YTMusic browse-wrapper engines (services/ytmusic.py) ───────────────
