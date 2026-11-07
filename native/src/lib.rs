@@ -682,9 +682,16 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // one-line title/artist/album render — the max(10, width - 30)
     // budget, the min(len, //2) and min(len, //3) fragment widths, and
     // the remainder-minus-separators album width with its max(0, ...)
-    // clamp — with the Rich Text assembly, the BiDi reorder/isolate
-    // calls and the state icon staying Python-side in the widget.
+    // clamp — with the Rich Text assembly and the theme styling
+    // staying Python-side in the widget.
     module.add_function(pyo3::wrap_pyfunction!(track_info_widths, module)?)?;
+    // The fused snippet engine over the same render — the whole
+    // content walk (the state icon, the width split, the three
+    // BiDi-rendered fragments and their em-dash separators, or the
+    // no-track placeholder) folded into one native call that answers
+    // the (kind, text) snippet sequence the widget styles by kind,
+    // with only the cached bidi_mode verdict read Python-side.
+    module.add_function(pyo3::wrap_pyfunction!(track_info_snippets, module)?)?;
 
     // Audio-cache LRU eviction engine (services/cache.py equivalent):
     // the eviction walk behind CacheManager.evict — which entries fall
@@ -901,14 +908,23 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // against the 0.4 window), the seek clamp behind
     // _clamp_seek_target, and the command-supersession gate behind
     // _dispatch's still-current check and _finish_load's acceptance.
-    // The locks, the pending-event buffer, the payload assembly, the
-    // dispatch and the mpv calls stay Python-side in the player.
+    // The event-dispatch arm behind _dispatch's per-callback walk
+    // (which of the six arms — the two context-aware schedules, the two
+    // bare schedules, the no-loop async drop, the inline sync run — a
+    // callback takes) and the mpv log-event level routing behind
+    // _on_mpv_log (the four mpv level strings onto the logging
+    // constants read through the player module's own logging name, any
+    // other string onto DEBUG). The locks, the pending-event buffer,
+    // the payload assembly, the scheduling calls, the callbacks, the
+    // log calls and the mpv calls stay Python-side in the player.
     module.add_function(pyo3::wrap_pyfunction!(player_find_libmpv, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_end_file_verdict, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_clamp_seek, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_clamp_volume, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_position_due, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_command_current, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(player_dispatch_arm, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(player_mpv_log_level, module)?)?;
     Ok(())
 }
 
@@ -13186,12 +13202,20 @@ fn ytm_playlist_order_params<'py>(
 /// gives the album whatever remains, no matter how long it is — so the
 /// engine takes no album; the lens are CPython's `len()` — code points,
 /// computed on the original (pre-reorder, pre-truncation) strings
-/// exactly like the reference computes them. The Rich `Text` assembly,
-/// the BiDi reorder/isolate calls and the state icon stay Python-side
-/// in the widget.
+/// exactly like the reference computes them. The Rich `Text` assembly
+/// and the theme styling stay Python-side in the widget — the fused
+/// snippet engine below now runs this split inside its own walk.
 #[pyfunction]
 #[pyo3(signature = (bar_width, title, artist))]
 fn track_info_widths(bar_width: i64, title: &str, artist: &str) -> (i64, i64, i64) {
+    track_info_widths_impl(bar_width, title, artist)
+}
+
+/// The width-splitting core shared by the `track_info_widths` engine
+/// and the fused snippet assembly below — the plain arithmetic the
+/// public engine answers and the snippet engine runs in-place for its
+/// own fragment widths.
+fn track_info_widths_impl(bar_width: i64, title: &str, artist: &str) -> (i64, i64, i64) {
     // max_w = max(10, self.size.width - 30) — floored at 10.
     let max_w = 10.max(bar_width - 30);
     // len() counts code points.
@@ -13205,6 +13229,102 @@ fn track_info_widths(bar_width: i64, title: &str, artist: &str) -> (i64, i64, i6
     // max(0, album_w) clamp at the truncate call site.
     let album_w = (max_w - title_w - artist_w - 8).max(0);
     (title_w, artist_w, album_w)
+}
+
+/// One playback-bar snippet — the `(kind, text)` pair the widget styles
+/// by kind: the leading state icon (`"playing"` / `"paused"` /
+/// `"stopped"`), the title/artist/album fragments (`"title"` /
+/// `"artist"` / `"album"`), the em-dash `"sep"` separators between
+/// them, and the `"empty"` no-track placeholder.
+type TrackInfoSnippet = (&'static str, String);
+
+/// The em-dash separator the reference appends between the fragments —
+/// `" \u{2014} "` (one space, em dash, one space).
+const TRACK_INFO_SEP: &str = " \u{2014} ";
+
+/// The fused snippet engine behind the playback bar's `_TrackInfo`
+/// render — `ui/playback_bar.py`'s `_track_info_snippets`, the content
+/// walk the render used to assemble snippet by snippet.
+///
+/// Mirrors the reference's walk exactly and in its own order: the
+/// three-way state-icon branch first (`is_playing and not is_paused` →
+/// the play triangle, `elif is_paused` → the pause bars, else the
+/// stopped square — each wrapped in the reference's single spaces),
+/// then the `if title:` fork. A falsy title walks the `"empty"` arm —
+/// the `"No track playing"` placeholder and nothing else, the
+/// artist/album never consulted. A truthy title splits the fragment
+/// widths through the width-splitting engine's own core
+/// (`track_info_widths_impl` — the lens on the ORIGINAL strings, before
+/// any reorder or truncation), renders the title through the
+/// `render_bar_cell` chain (the gated reorder, the truncation of the
+/// REORDERED fragment, the isolate wrap — `width < 1` answering the
+/// empty string), and then, each behind its own truthiness gate, the
+/// artist and the album: the em-dash separator FIRST and the fragment
+/// second, so an absent artist or album skips its separator too. The
+/// kind tags travel with the texts; the Rich `Text` appends and the
+/// theme colours each kind is styled with stay Python-side in the
+/// widget. Only the cached `bidi_mode` verdict stays Python-side as
+/// well, travelling in as a plain bool (read once per render instead
+/// of once per fragment).
+#[pyfunction]
+#[pyo3(signature = (bar_width, title, artist, album, is_playing, is_paused, reorder_enabled))]
+fn track_info_snippets(
+    bar_width: i64,
+    title: &str,
+    artist: &str,
+    album: &str,
+    is_playing: bool,
+    is_paused: bool,
+    reorder_enabled: bool,
+) -> Vec<TrackInfoSnippet> {
+    let mut snippets: Vec<TrackInfoSnippet> = Vec::with_capacity(6);
+    // The state icon — the reference's three-way branch, its own
+    // order: playing wins only while not also paused; a paused flag
+    // alone is enough for the paused icon.
+    if is_playing && !is_paused {
+        snippets.push(("playing", " \u{25b6} ".to_string()));
+    } else if is_paused {
+        snippets.push(("paused", " \u{23f8} ".to_string()));
+    } else {
+        snippets.push(("stopped", " \u{25a0} ".to_string()));
+    }
+    // if title — the truthiness gate over the plain str the reactive
+    // feeds the render.
+    if !title.is_empty() {
+        let (title_w, artist_w, album_w) = track_info_widths_impl(bar_width, title, artist);
+        snippets.push(("title", bar_cell(title, title_w as isize, reorder_enabled)));
+        if !artist.is_empty() {
+            snippets.push(("sep", TRACK_INFO_SEP.to_string()));
+            snippets.push((
+                "artist",
+                bar_cell(artist, artist_w as isize, reorder_enabled),
+            ));
+        }
+        if !album.is_empty() {
+            snippets.push(("sep", TRACK_INFO_SEP.to_string()));
+            snippets.push(("album", bar_cell(album, album_w as isize, reorder_enabled)));
+        }
+    } else {
+        snippets.push(("empty", "No track playing".to_string()));
+    }
+    snippets
+}
+
+/// The `render_bar_cell` chain (the gated line reorder, the truncation
+/// of the reordered fragment, the isolate wrap) with the wrapper's
+/// falsy passthrough folded in, so the fused snippet engine renders
+/// each fragment exactly like the per-cell engine the widget's render
+/// used to reach for. Only the cached `bidi_mode` verdict stays
+/// Python-side, travelling in as a plain bool.
+fn bar_cell(text: &str, width: isize, reorder_enabled: bool) -> String {
+    if text.is_empty() {
+        text.to_string()
+    } else {
+        isolate_bidi_impl(
+            &truncate_str(&gated_reorder(text, reorder_enabled), width),
+            true,
+        )
+    }
 }
 
 // ── Audio-cache LRU eviction engine ────────────────────────────────────
@@ -16433,6 +16553,73 @@ fn player_command_current(
         return Ok(true);
     }
     Ok(command.eq(generation)? && !current_track.is_none())
+}
+
+/// The event-dispatch arm — `services/player.py`'s `_dispatch_arm`, the
+/// branch decision behind `Player._dispatch`'s per-callback walk: which
+/// of the six arms a registered callback takes.
+///
+/// Mirrors the reference's nested branch exactly and in its own order:
+/// a live loop first (`loop is not None and not loop.is_closed()` —
+/// computed Python-side, the loop object's own `is_closed` probe
+/// staying there) — a coroutine callback schedules through
+/// `call_soon_threadsafe` under the captured dispatch context when one
+/// exists (`"async_ctx"`) or bare otherwise (`"async"`), a sync
+/// callback the same pair (`"sync_ctx"` / `"sync"`); a dead loop runs
+/// only sync callbacks — a coroutine is dropped with the warning the
+/// caller logs (`"drop"`), a sync callback runs inline under the
+/// caller's `still_current` gate (`"direct"`). The `call_soon_threadsafe`
+/// calls, the context object, the task bookkeeping, the callbacks
+/// themselves and every log line stay Python-side in the caller.
+#[pyfunction]
+#[pyo3(signature = (loop_live, is_coroutine, has_context))]
+fn player_dispatch_arm(loop_live: bool, is_coroutine: bool, has_context: bool) -> &'static str {
+    if loop_live {
+        if is_coroutine {
+            if has_context {
+                "async_ctx"
+            } else {
+                "async"
+            }
+        } else if has_context {
+            "sync_ctx"
+        } else {
+            "sync"
+        }
+    } else if is_coroutine {
+        "drop"
+    } else {
+        "direct"
+    }
+}
+
+/// The mpv log-event level routing — `services/player.py`'s
+/// `_mpv_log_level`, the level map behind `_on_mpv_log`, the log
+/// handler the mpv instance is constructed with.
+///
+/// Mirrors the reference's per-call dict walk exactly: the four mpv
+/// level strings map onto Python logging's own constants — `fatal` →
+/// `logging.CRITICAL`, `error` → `logging.ERROR`, `warn` →
+/// `logging.WARNING`, `info` → `logging.INFO` — and every other string
+/// answers `logging.DEBUG`. Each constant is read through the player
+/// module's own `logging` name at call time, exactly like the
+/// reference's dict construction reads its globals, so a patched or
+/// customised module attribute steers both backends identically — the
+/// pattern `player_module_clock` established for the module clock. The
+/// `logger.log` call — the `"mpv[%s]: %s"` format with the prefix and
+/// the `message.rstrip()` — stays Python-side in the handler.
+#[pyfunction]
+#[pyo3(signature = (level))]
+fn player_mpv_log_level<'py>(py: Python<'py>, level: &str) -> PyResult<Bound<'py, PyAny>> {
+    let logging = PyModule::import(py, "ytm_player.services.player")?.getattr("logging")?;
+    let name = match level {
+        "fatal" => "CRITICAL",
+        "error" => "ERROR",
+        "warn" => "WARNING",
+        "info" => "INFO",
+        _ => return logging.getattr("DEBUG"),
+    };
+    logging.getattr(name)
 }
 
 // ---------------------------------------------------------------------------

@@ -45,8 +45,8 @@ _ICON_SHUFFLE_ON = "\U0001f500"  # Same, coloured differently
 def _track_info_widths(bar_width: int, title: str, artist: str) -> tuple[int, int, int]:
     """The title/artist/album truncation widths — the width-splitting engine.
 
-    The pure core of ``_TrackInfo.render``: the available budget for the
-    three text fragments and the per-fragment widths the reference
+    The pure core of the ``_TrackInfo`` render: the available budget for
+    the three text fragments and the per-fragment widths the reference
     truncates each through. ``max_w = max(10, bar_width - 30)`` (the
     reserved tail — volume, repeat, shuffle, heart — plus the state
     icon's 3 columns, floored at 10 for the narrowest terminals);
@@ -63,13 +63,65 @@ def _track_info_widths(bar_width: int, title: str, artist: str) -> tuple[int, in
 
     Implemented by the Rust extension
     (``_ytm_player_native.track_info_widths``) when it is built; this
-    pure-Python transcription is the fallback otherwise.
+    pure-Python transcription is the fallback otherwise. The fused
+    snippet engine below runs this split inside its own walk.
     """
     max_w = max(10, bar_width - 30)
     title_w = min(len(title), max_w // 2)
     artist_w = min(len(artist), max_w // 3)
     album_w = max(0, max_w - title_w - artist_w - 8)
     return title_w, artist_w, album_w
+
+
+def _track_info_snippets(
+    bar_width: int,
+    title: str,
+    artist: str,
+    album: str,
+    is_playing: bool,
+    is_paused: bool,
+) -> list[tuple[str, str]]:
+    """The one-line track-info content walk — the snippet engine.
+
+    The pure half of ``_TrackInfo.render``: the ``(kind, text)``
+    snippet sequence the render styles by kind — the state icon
+    (``"playing"`` / ``"paused"`` / ``"stopped"``, the three-way
+    branch in the reference's own order: playing wins only while not
+    also paused), then, when a title is set, the title / artist /
+    album fragments (each truncated through the ``render_bar_cell``
+    chain with the widths the ``_track_info_widths`` engine splits,
+    the em-dash ``"sep"`` separators between them, an absent artist
+    or album skipping its separator too), or the ``"No track playing"``
+    placeholder (``"empty"``) otherwise — a falsy title never consults
+    the artist or the album. The styling — the theme colour each kind
+    is appended with — stays with the widget.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_info_snippets``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.utils.bidi import render_bar_cell
+
+    snippets: list[tuple[str, str]] = []
+    if is_playing and not is_paused:
+        snippets.append(("playing", f" {_ICON_PLAYING} "))
+    elif is_paused:
+        snippets.append(("paused", f" {_ICON_PAUSED} "))
+    else:
+        snippets.append(("stopped", f" {_ICON_STOPPED} "))
+
+    if title:
+        title_w, artist_w, album_w = _track_info_widths(bar_width, title, artist)
+        snippets.append(("title", render_bar_cell(title, title_w)))
+        if artist:
+            snippets.append(("sep", " \u2014 "))
+            snippets.append(("artist", render_bar_cell(artist, artist_w)))
+        if album:
+            snippets.append(("sep", " \u2014 "))
+            snippets.append(("album", render_bar_cell(album, album_w)))
+    else:
+        snippets.append(("empty", "No track playing"))
+    return snippets
 
 
 class _TrackInfo(Widget):
@@ -92,46 +144,29 @@ class _TrackInfo(Widget):
         theme = get_theme()
         result = Text()
 
-        # State icon
-        if self.is_playing and not self.is_paused:
-            result.append(f" {_ICON_PLAYING} ", style=f"bold {theme.primary}")
-        elif self.is_paused:
-            result.append(f" {_ICON_PAUSED} ", style=f"bold {theme.warning}")
-        else:
-            result.append(f" {_ICON_STOPPED} ", style=theme.muted_text)
-
-        if self.title:
-            title_w, artist_w, album_w = _track_info_widths(
-                self.size.width, self.title, self.artist
-            )
-
-            # The per-cell render engine fuses the whole
-            # reorder -> truncate -> isolate chain each fragment went
-            # through into one call (Rust when the extension is built):
-            # FSI...PDI isolates each fragment so RTL titles don't pull
-            # adjacent widgets (volume, repeat, shuffle) into the RTL
-            # BiDi context, applied AFTER truncate (PDI must not be
-            # cut).
-            from ytm_player.utils.bidi import render_bar_cell
-
-            result.append(
-                render_bar_cell(self.title, title_w),
-                style=f"bold {theme.foreground}",
-            )
-            if self.artist:
-                result.append(" \u2014 ", style=theme.muted_text)
-                result.append(
-                    render_bar_cell(self.artist, artist_w),
-                    style=theme.secondary,
-                )
-            if self.album:
-                result.append(" \u2014 ", style=theme.muted_text)
-                result.append(
-                    render_bar_cell(self.album, album_w),
-                    style=theme.muted_text,
-                )
-        else:
-            result.append("No track playing", style=theme.muted_text)
+        # The whole content walk — the state icon, the three fragments
+        # and their separators (or the no-track placeholder) — runs
+        # through the snippet engine (Rust when the extension is built):
+        # one call answering the (kind, text) sequence, styled here by
+        # kind with the theme's colours. FSI...PDI isolates each RTL
+        # fragment so it cannot pull the adjacent widgets (volume,
+        # repeat, shuffle) into the RTL BiDi context — the engine
+        # applies the isolate AFTER truncate (PDI must not be cut).
+        for kind, text in _track_info_snippets(
+            self.size.width, self.title, self.artist, self.album, self.is_playing, self.is_paused
+        ):
+            if kind == "playing":
+                result.append(text, style=f"bold {theme.primary}")
+            elif kind == "paused":
+                result.append(text, style=f"bold {theme.warning}")
+            elif kind == "title":
+                result.append(text, style=f"bold {theme.foreground}")
+            elif kind == "artist":
+                result.append(text, style=theme.secondary)
+            else:
+                # "stopped", "sep", "album" and "empty" all render
+                # in the muted colour.
+                result.append(text, style=theme.muted_text)
 
         return result
 
@@ -587,13 +622,13 @@ class FooterBar(Widget):
                 )
 
 
-# ── Native (Rust/PyO3) override, if available ───────────────────────────
-# The Rust extension implements the same width-splitting engine; this
-# binding overrides the pure-Python definition above when the extension
-# is importable.  The rebinding must happen AFTER the definition above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statement (the lesson that produced formatting.py's dead
-# native bindings).
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same width-splitting and snippet
+# engines; these bindings override the pure-Python definitions above
+# when the extension is importable.  The rebinding must happen AFTER
+# the definitions above — assigning the native functions any earlier
+# would be clobbered by the ``def`` statements (the lesson that
+# produced formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -608,3 +643,34 @@ else:
     ) -> tuple[int, int, int]:
         """The title/artist/album truncation widths (native Rust engine)."""
         return _native_track_info_widths(bar_width, title, artist)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_info_snippets as _native_track_info_snippets,
+    )
+except ImportError:
+    pass
+else:
+
+    def _track_info_snippets(  # noqa: F811
+        bar_width: int,
+        title: str,
+        artist: str,
+        album: str,
+        is_playing: bool,
+        is_paused: bool,
+    ) -> list[tuple[str, str]]:
+        """The one-line track-info snippets (native Rust engine).
+
+        The whole content walk — the state icon, the width split, the
+        three BiDi-rendered fragments and their em-dash separators (or
+        the no-track placeholder) — runs inside one native call, with
+        only the cached ``bidi_mode`` verdict read here (once per
+        render instead of once per fragment).
+        """
+        from ytm_player.utils.bidi import _get_reorder_enabled
+
+        return _native_track_info_snippets(
+            bar_width, title, artist, album, is_playing, is_paused, _get_reorder_enabled()
+        )

@@ -7,22 +7,31 @@ event-matching gate behind ``_end_file_data``), the seek clamp
 ``_clamp_seek`` (the ``[0, duration]`` target clamp behind
 ``_clamp_seek_target``), the volume clamp ``_clamp_volume`` (the
 ``[0, 100]`` level gate behind ``set_volume``), the position throttle
-``_position_due`` (the 0.4 s gate behind ``_on_time_pos_change``) and
-the command gate ``_command_current`` (the supersession predicate
-behind ``_dispatch``'s still-current check and ``_finish_load``'s
-acceptance check). All are implemented by the Rust extension
+``_position_due`` (the 0.4 s gate behind ``_on_time_pos_change``), the
+command gate ``_command_current`` (the supersession predicate behind
+``_dispatch``'s still-current check and ``_finish_load``'s acceptance
+check), the dispatch arm ``_dispatch_arm`` (the six-way branch behind
+``_dispatch``'s per-callback walk — the context-aware and bare
+schedules, the no-loop async drop and the inline sync run) and the
+mpv log-event level routing ``_mpv_log_level`` (the level map behind
+``_on_mpv_log``). All are implemented by the Rust extension
 (``_ytm_player_native.player_find_libmpv`` /
 ``_ytm_player_native.player_end_file_verdict`` /
 ``_ytm_player_native.player_clamp_seek`` /
 ``_ytm_player_native.player_clamp_volume`` /
 ``_ytm_player_native.player_position_due`` /
-``_ytm_player_native.player_command_current``) when it is built and by
+``_ytm_player_native.player_command_current`` /
+``_ytm_player_native.player_dispatch_arm`` /
+``_ytm_player_native.player_mpv_log_level``) when it is built and by
 the pure-Python transcriptions below otherwise; the locks, the
-pending-event buffer, the payload assembly, the dispatch, the mpv
-calls and the LC_NUMERIC dance stay Python-side in the player. The
-clock-reading engine resolves ``time.monotonic()`` through this
-module's own ``time`` name at call time, so a patched or frozen clock
-steers both backends identically.
+pending-event buffer, the payload assembly, the scheduling calls, the
+callbacks, the log calls, the mpv calls and the LC_NUMERIC dance stay
+Python-side in the player. The clock-reading engine resolves
+``time.monotonic()`` through this module's own ``time`` name at call
+time, so a patched or frozen clock steers both backends identically;
+the log-level engine reads the logging constants through the same
+module's own ``logging`` name at call time, so a patched or customised
+attribute steers both backends identically too.
 """
 
 from __future__ import annotations
@@ -313,6 +322,61 @@ def _command_current(command: Any, generation: Any, current_track: Any) -> bool:
     return command == generation and current_track is not None
 
 
+def _dispatch_arm(loop_live: bool, is_coroutine: bool, has_context: bool) -> str:
+    """The event-dispatch arm — the branch engine behind ``_dispatch``.
+
+    The pure half of the per-callback walk: which of the six arms a
+    registered callback takes. A live loop schedules coroutine callbacks
+    through ``call_soon_threadsafe`` under the captured dispatch context
+    when one exists (``"async_ctx"``) or bare otherwise (``"async"``),
+    and sync callbacks the same pair (``"sync_ctx"`` / ``"sync"``); a
+    dead loop runs only sync callbacks — a coroutine is dropped with
+    the warning the caller logs (``"drop"``), a sync callback runs
+    inline under the caller's ``still_current`` gate (``"direct"``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_dispatch_arm``) when it is built; this
+    pure-Python transcription is the fallback otherwise. The scheduling
+    calls, the context object, the task bookkeeping, the callbacks
+    themselves and every log line stay with the caller.
+    """
+    if loop_live:
+        if is_coroutine:
+            return "async_ctx" if has_context else "async"
+        return "sync_ctx" if has_context else "sync"
+    if is_coroutine:
+        return "drop"
+    return "direct"
+
+
+def _mpv_log_level(level: str) -> int:
+    """The mpv log-event level routing — the level map behind ``_on_mpv_log``.
+
+    The pure half of the log handler the mpv instance is constructed
+    with: the four mpv level strings map onto Python logging's own
+    constants — ``fatal`` → ``CRITICAL``, ``error`` → ``ERROR``,
+    ``warn`` → ``WARNING``, ``info`` → ``INFO`` — and every other
+    string answers ``DEBUG``. The constants are read at call time
+    through this module's own ``logging`` name — the same
+    patch-steering the module clock's ``time`` read established — so
+    a patched or customised attribute steers both backends
+    identically.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.player_mpv_log_level``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The
+    ``logger.log`` call — the ``"mpv[%s]: %s"`` format with the prefix
+    and the ``message.rstrip()`` — stays with the handler.
+    """
+    py_level = {
+        "fatal": logging.CRITICAL,
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "info": logging.INFO,
+    }.get(level, logging.DEBUG)
+    return py_level
+
+
 class PlayerEvent(StrEnum):
     """Events emitted by the Player."""
 
@@ -421,14 +485,13 @@ class Player:
 
             python-mpv level strings: fatal / error / warn / info / v / debug / trace.
             We construct with loglevel='warn' so info/debug/trace are filtered
-            out at the C side; this map handles the levels we actually receive.
+            out at the C side; the level map handles the levels we actually
+            receive. The routing itself is resolved by the ``_mpv_log_level``
+            engine (native when the Rust extension is built, the
+            pure-Python transcription otherwise); the ``logger.log`` call
+            and the ``message.rstrip()`` stay here.
             """
-            py_level = {
-                "fatal": logging.CRITICAL,
-                "error": logging.ERROR,
-                "warn": logging.WARNING,
-                "info": logging.INFO,
-            }.get(level, logging.DEBUG)
+            py_level = _mpv_log_level(level)
             logger.log(py_level, "mpv[%s]: %s", prefix, message.rstrip())
 
         instance = mpv.MPV(
@@ -555,7 +618,12 @@ class Player:
         """Dispatch an event to all registered callbacks.
 
         If an asyncio event loop is available, callbacks are scheduled
-        via call_soon_threadsafe to bridge from mpv's thread.
+        via call_soon_threadsafe to bridge from mpv's thread. The
+        per-callback branch — which of the six arms each callback takes
+        — is resolved by the ``_dispatch_arm`` engine (native when the
+        Rust extension is built, the pure-Python transcription
+        otherwise); the scheduling calls, the task bookkeeping, the
+        callbacks themselves and the drop/failure logging stay here.
         """
         loop = self._get_loop()
 
@@ -587,26 +655,26 @@ class Player:
 
         for cb in list(self._callbacks[event]):
             try:
-                if loop is not None and not loop.is_closed():
-                    ctx = self._dispatch_context
-                    if asyncio.iscoroutinefunction(cb):
-                        if ctx is not None:
-                            loop.call_soon_threadsafe(_schedule_async, cb, args, context=ctx)
-                        else:
-                            loop.call_soon_threadsafe(_schedule_async, cb, args)
-                    elif ctx is not None:
-                        loop.call_soon_threadsafe(_safe_sync, cb, args, context=ctx)
-                    else:
-                        loop.call_soon_threadsafe(_safe_sync, cb, args)
-                else:
-                    # No loop: only sync callbacks can run; skip async ones.
-                    if asyncio.iscoroutinefunction(cb):
-                        logger.warning(
-                            "Dropping async %s callback — no event loop available", event
-                        )
-                    else:
-                        if still_current():
-                            cb(*args)
+                loop_live = loop is not None and not loop.is_closed()
+                # The reference reads the dispatch context only on the
+                # live-loop arm — the conditional keeps the read there.
+                ctx = self._dispatch_context if loop_live else None
+                arm = _dispatch_arm(loop_live, asyncio.iscoroutinefunction(cb), ctx is not None)
+                if arm == "async_ctx":
+                    loop.call_soon_threadsafe(_schedule_async, cb, args, context=ctx)
+                elif arm == "async":
+                    loop.call_soon_threadsafe(_schedule_async, cb, args)
+                elif arm == "sync_ctx":
+                    loop.call_soon_threadsafe(_safe_sync, cb, args, context=ctx)
+                elif arm == "sync":
+                    loop.call_soon_threadsafe(_safe_sync, cb, args)
+                elif arm == "drop":
+                    # No loop: async callbacks cannot run — dropped with
+                    # a warning, never silently.
+                    logger.warning("Dropping async %s callback — no event loop available", event)
+                else:  # "direct" — no loop, sync callback: run inline.
+                    if still_current():
+                        cb(*args)
             except Exception:
                 logger.exception("Failed to schedule %s callback", event)
 
@@ -940,7 +1008,13 @@ try:
         player_command_current as _native_player_command_current,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_dispatch_arm as _native_player_dispatch_arm,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         player_end_file_verdict as _native_player_end_file_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        player_mpv_log_level as _native_player_mpv_log_level,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         player_position_due as _native_player_position_due,
@@ -953,3 +1027,5 @@ else:
     _clamp_volume = _native_player_clamp_volume  # type: ignore[assignment]
     _position_due = _native_player_position_due  # type: ignore[assignment]
     _command_current = _native_player_command_current  # type: ignore[assignment]
+    _dispatch_arm = _native_player_dispatch_arm  # type: ignore[assignment]
+    _mpv_log_level = _native_player_mpv_log_level  # type: ignore[assignment]

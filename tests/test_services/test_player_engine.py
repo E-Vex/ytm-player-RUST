@@ -1,22 +1,28 @@
 """Tests for the mpv-wrapper glue engines.
 
-The five pure cores of ``services/player.py`` run with two
+The pure cores of ``services/player.py`` run with two
 interchangeable backends: the pure-Python transcriptions in the module
 and, when the Rust extension is built, the native implementations (the
-tail rebinding for four of them, the import-time binding plus call-time
+tail rebinding for most of them, the import-time binding plus call-time
 check for ``_find_brew_libmpv``). ``_find_brew_libmpv`` is the
 Homebrew-prefix libmpv discovery walk behind the import-time fallback
 find; ``_end_file_verdict`` is the event-matching gate behind
 ``_end_file_data``'s handling of mpv's end-file callbacks;
 ``_clamp_seek`` is the ``[0, duration]`` target clamp behind
 ``_clamp_seek_target``; ``_position_due`` is the 0.4 s throttle behind
-``_on_time_pos_change``'s POSITION_CHANGE dispatches; and
+``_on_time_pos_change``'s POSITION_CHANGE dispatches;
 ``_command_current`` is the supersession predicate behind
 ``_dispatch``'s still-current check and ``_finish_load``'s acceptance
-check. The clock-reading engine resolves ``time.monotonic()`` through
-the module's own ``time`` name at call time — a frozen or patched clock
-steers both backends identically, which the tests below use for
-determinism and the parity class pins as the contract.
+check; ``_dispatch_arm`` is the six-way branch behind ``_dispatch``'s
+per-callback walk; and ``_mpv_log_level`` is the level map behind
+``_on_mpv_log``'s routing of mpv's log events into Python logging. The
+clock-reading engine resolves ``time.monotonic()`` through the module's
+own ``time`` name at call time — a frozen or patched clock steers both
+backends identically, which the tests below use for determinism and
+the parity class pins as the contract; the log-level engine reads the
+logging constants through the player module's own ``logging`` name at
+call time — a patched or customised attribute steers both backends
+identically too.
 
 The unit tests below assert each engine's contract on whichever
 backend is loaded. When the extension is built, the parity tests
@@ -43,8 +49,10 @@ from ytm_player.services.player import (
     _clamp_seek,
     _clamp_volume,
     _command_current,
+    _dispatch_arm,
     _end_file_verdict,
     _find_brew_libmpv,
+    _mpv_log_level,
     _position_due,
 )
 
@@ -335,6 +343,89 @@ class TestCommandCurrent:
         assert _command_current(True, 1, {"t": 1}) is True
 
 
+class TestDispatchArm:
+    """The event-dispatch arm — the six-way branch behind ``_dispatch``'s
+    per-callback walk."""
+
+    def test_the_full_arm_matrix(self):
+        # (loop_live, is_coroutine, has_context) → arm, for every
+        # combination the walk can see.
+        assert _dispatch_arm(True, True, True) == "async_ctx"
+        assert _dispatch_arm(True, True, False) == "async"
+        assert _dispatch_arm(True, False, True) == "sync_ctx"
+        assert _dispatch_arm(True, False, False) == "sync"
+        assert _dispatch_arm(False, True, True) == "drop"
+        assert _dispatch_arm(False, True, False) == "drop"
+        assert _dispatch_arm(False, False, True) == "direct"
+        assert _dispatch_arm(False, False, False) == "direct"
+
+    def test_a_dead_loop_never_schedules(self):
+        # Whatever the coroutine/context shape, a dead loop only drops
+        # async callbacks and runs sync ones inline — the context is
+        # irrelevant without a loop to schedule under.
+        for is_coroutine in (True, False):
+            for has_context in (True, False):
+                arm = _dispatch_arm(False, is_coroutine, has_context)
+                assert arm in ("drop", "direct")
+
+    def test_a_live_loop_schedules_everything(self):
+        for is_coroutine in (True, False):
+            for has_context in (True, False):
+                arm = _dispatch_arm(True, is_coroutine, has_context)
+                assert arm in ("async_ctx", "async", "sync_ctx", "sync")
+
+
+class TestMpvLogLevel:
+    """The mpv log-event level routing — the map behind ``_on_mpv_log``."""
+
+    def test_the_four_mapped_levels(self):
+        import logging
+
+        assert _mpv_log_level("fatal") == logging.CRITICAL
+        assert _mpv_log_level("error") == logging.ERROR
+        assert _mpv_log_level("warn") == logging.WARNING
+        assert _mpv_log_level("info") == logging.INFO
+
+    def test_every_other_string_answers_debug(self):
+        import logging
+
+        # The python-mpv strings filtered out at the C side (v / debug /
+        # trace), the empty string and a case-mismatched spelling — the
+        # reference's dict walk is exact-match only.
+        for level in ("v", "debug", "trace", "", "FATAL", "Warn", "unknown"):
+            assert _mpv_log_level(level) == logging.DEBUG
+
+    def test_the_constants_are_read_at_call_time(self, monkeypatch):
+        # A patched constant on the logging module steers both backends
+        # identically — the engine reads the constant at call time,
+        # never bakes it.
+        import logging
+
+        monkeypatch.setattr(logging, "WARNING", 31)
+        assert _mpv_log_level("warn") == 31
+        # The undo restores the real constant; the engine follows.
+        monkeypatch.undo()
+        assert _mpv_log_level("warn") == logging.WARNING
+
+    def test_the_module_logging_name_is_read_at_call_time(self, monkeypatch):
+        # The engine resolves the constants through the player module's
+        # own ``logging`` name — the same patch-steering the module
+        # clock's ``time`` read established — so swapping the module
+        # attribute for a stub namespace steers both backends
+        # identically.
+        from types import SimpleNamespace
+
+        from ytm_player.services import player as player_module
+
+        fake = SimpleNamespace(CRITICAL=51, ERROR=41, WARNING=31, INFO=21, DEBUG=11)
+        monkeypatch.setattr(player_module, "logging", fake)
+        assert _mpv_log_level("fatal") == 51
+        assert _mpv_log_level("error") == 41
+        assert _mpv_log_level("warn") == 31
+        assert _mpv_log_level("info") == 21
+        assert _mpv_log_level("v") == 11
+
+
 class TestPlayerGlueThroughTheMethods:
     """The engines behind the Player's own methods, on whichever backend
     is loaded — the end-file, seek and dispatch paths the existing
@@ -438,6 +529,29 @@ _PARITY_CASES = {
         [0, 0, None],
         [None, None, None],
     ],
+    "player_dispatch_arm": [
+        # [loop_live, is_coroutine, has_context] — the full matrix.
+        [True, True, True],
+        [True, True, False],
+        [True, False, True],
+        [True, False, False],
+        [False, True, True],
+        [False, True, False],
+        [False, False, True],
+        [False, False, False],
+    ],
+    "player_mpv_log_level": [
+        ["fatal"],
+        ["error"],
+        ["warn"],
+        ["info"],
+        ["v"],
+        ["debug"],
+        ["trace"],
+        [""],
+        ["FATAL"],
+        ["Warn"],
+    ],
     "player_end_file_verdict": [
         # [instance, current_instance, loading, entry_id,
         #  current_entry_id, current_track, reason]
@@ -510,6 +624,8 @@ PY_NAMES = {
     "player_clamp_volume": "_clamp_volume",
     "player_position_due": "_position_due",
     "player_command_current": "_command_current",
+    "player_dispatch_arm": "_dispatch_arm",
+    "player_mpv_log_level": "_mpv_log_level",
 }
 
 
@@ -537,6 +653,8 @@ _PY_NAMES = {
     "player_clamp_volume": "_clamp_volume",
     "player_position_due": "_position_due",
     "player_command_current": "_command_current",
+    "player_dispatch_arm": "_dispatch_arm",
+    "player_mpv_log_level": "_mpv_log_level",
 }
 
 
