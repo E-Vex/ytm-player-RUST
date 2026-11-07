@@ -1,5 +1,13 @@
 name: CI
 
+# Fork note: this repository is a fork, and a fork inherits its
+# workflow registrations from the parent at fork time — push events
+# never started CI here before this file was committed to the fork's
+# own default branch (every recorded run before this commit was a
+# manual workflow_dispatch; scheduled triggers never fired either,
+# which is fork-default). This commit re-registers the push trigger;
+# workflow_dispatch stays below as the always-available manual
+# fallback.
 on:
   workflow_dispatch:
   push:
