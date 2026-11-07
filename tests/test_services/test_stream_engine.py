@@ -1,6 +1,6 @@
 """Tests for the stream resolver-glue engines.
 
-The eleven pure cores of ``services/stream.py`` run with two
+The fourteen pure cores of ``services/stream.py`` run with two
 interchangeable backends: the pure-Python transcriptions in the module
 and, when the Rust extension is built, the native implementations
 bound at the module's tail. ``_is_stale`` is the buffered expiry gate
@@ -22,10 +22,18 @@ cookiejar-signature reuse gate behind ``_get_ydl``'s locked reuse arm
 resolver should be using right now); ``_ydl_publish_verdict`` is the
 mid-build publication verdict behind ``_get_ydl``'s second locked
 section (adopt another thread's instance, retry after a mid-build
-reset, or install the built one); and ``_retry_delays`` is the
+reset, or install the built one); ``_retry_delays`` is the
 ``(attempt, delay)`` schedule walk behind ``_resolve_sync``'s retry
 loop (the schedule read through the module's own ``_RETRY_DELAYS``
-name). The three clock-reading engines resolve ``time.time()``
+name); ``_pending_join_verdict`` is the join gate behind
+``_current_pending`` (the in-flight resolve a same-generation caller
+joins instead of extracting again); ``_pending_drop_verdict`` is the
+identity gate behind ``_resolve``'s finally cleanup (the pending slot
+is dropped only when it still holds this owner's very future); and
+``_pending_publication_gate`` is the unresolved gate behind the
+shared pending future's three publications (``set_result``,
+``set_exception`` and the owner-cancelled ``cancel``). The three
+clock-reading engines resolve ``time.time()``
 through the module's own ``time`` name at call time — a frozen or
 patched clock steers both backends identically, which the tests below
 use for determinism and the parity class pins as the contract.
@@ -40,6 +48,7 @@ shapes included — so the two implementations cannot drift apart.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -55,6 +64,9 @@ from ytm_player.services.stream import (
     _cache_expired_ids,
     _download_error_hint,
     _is_stale,
+    _pending_drop_verdict,
+    _pending_join_verdict,
+    _pending_publication_gate,
     _retry_delays,
     _stream_info_fields,
     _validate_quality,
@@ -764,6 +776,221 @@ class TestResolveSyncRetryWalk:
         assert seen["sleeps"] == []
 
 
+class TestPendingJoinVerdict:
+    """The join gate behind ``_current_pending``."""
+
+    def test_an_empty_slot_answers_no_join(self):
+        assert _pending_join_verdict(None, 3) is None
+
+    def test_a_same_generation_slot_answers_its_future(self):
+        future = object()
+        assert _pending_join_verdict((3, future), 3) is future
+
+    def test_a_slot_from_another_generation_answers_no_join(self):
+        future = object()
+        assert _pending_join_verdict((2, future), 3) is None
+
+    def test_the_generation_comparison_is_cpythons_own_ne(self):
+        # 3 == 3.0 and True == 1 through the interpreter's own !=, so
+        # those spellings join; 3 != "3" does not.
+        future = object()
+        assert _pending_join_verdict((3.0, future), 3) is future
+        assert _pending_join_verdict((1, future), True) is future
+        assert _pending_join_verdict((0, future), False) is future
+        assert _pending_join_verdict((3, future), "3") is None
+
+    def test_a_non_subscriptable_entry_raises_the_subscripts_own_error(self):
+        with pytest.raises(TypeError):
+            _pending_join_verdict(7, 3)
+
+    def test_an_empty_entry_answers_the_index_error(self):
+        with pytest.raises(IndexError):
+            _pending_join_verdict((), 3)
+
+    def test_a_generation_only_entry_answers_the_index_error(self):
+        # entry[0] matched the generation, so the [1] fetch is the one
+        # that raises.
+        with pytest.raises(IndexError):
+            _pending_join_verdict((3,), 3)
+
+    def test_a_mismatched_short_entry_never_touches_the_second_element(self):
+        # "a" != "b" short-circuits before entry[1], so the missing
+        # second element is never fetched — None, not IndexError.
+        assert _pending_join_verdict(("a",), "b") is None
+
+
+class TestPendingDropVerdict:
+    """The identity gate behind ``_resolve``'s finally cleanup."""
+
+    def test_an_empty_slot_is_never_dropped(self):
+        assert _pending_drop_verdict(None, object()) is False
+
+    def test_the_owners_own_slot_is_dropped(self):
+        future = object()
+        assert _pending_drop_verdict((3, future), future) is True
+
+    def test_another_future_never_drops_the_slot(self):
+        assert _pending_drop_verdict((3, object()), object()) is False
+
+    def test_the_comparison_is_identity_never_equality(self):
+        # Two equal-but-distinct futures: the reference drops the slot
+        # only for the very object it installed, so a newer request's
+        # equal-looking entry survives the old owner's cleanup.
+        class EqualFuture:
+            def __eq__(self, other):
+                return isinstance(other, EqualFuture)
+
+        future, twin = EqualFuture(), EqualFuture()
+        assert future == twin
+        assert future is not twin
+        assert _pending_drop_verdict((3, future), twin) is False
+        assert _pending_drop_verdict((3, future), future) is True
+
+    def test_a_none_future_in_the_slot_matches_only_none_itself(self):
+        # (3, None) with the owner's future spelled None — the None
+        # singleton is identical to itself, so the slot drops.
+        assert _pending_drop_verdict((3, None), None) is True
+        assert _pending_drop_verdict((3, None), object()) is False
+
+    def test_a_non_subscriptable_entry_raises_the_subscripts_own_error(self):
+        with pytest.raises(TypeError):
+            _pending_drop_verdict(7, object())
+
+    def test_an_empty_entry_answers_the_index_error(self):
+        with pytest.raises(IndexError):
+            _pending_drop_verdict((), object())
+
+
+class TestPendingPublicationGate:
+    """The unresolved gate behind the shared future's publications."""
+
+    @staticmethod
+    def _stand_in(answer):
+        class StandInFuture:
+            def done(self):
+                return answer
+
+        return StandInFuture()
+
+    def test_an_unresolved_future_may_be_published(self):
+        assert _pending_publication_gate(self._stand_in(False)) is True
+
+    def test_a_resolved_future_may_not(self):
+        assert _pending_publication_gate(self._stand_in(True)) is False
+
+    def test_the_gate_is_the_interpreters_own_not_over_done(self):
+        # done() answering any truthy object blocks the publication and
+        # any falsy one allows it — the truthiness protocol, not a
+        # bool check.
+        for truthy in (5, [1], "x", 0.5, True):
+            assert _pending_publication_gate(self._stand_in(truthy)) is False
+        for falsy in (0, [], "", 0.0, False, None):
+            assert _pending_publication_gate(self._stand_in(falsy)) is True
+
+    def test_a_raising_done_propagates(self):
+        class Raising:
+            def done(self):
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            _pending_publication_gate(Raising())
+
+    def test_a_non_callable_done_answers_the_calls_own_error(self):
+        with pytest.raises(TypeError):
+            _pending_publication_gate(SimpleNamespace(done=3))
+
+    def test_real_futures_in_every_state(self):
+        async def run():
+            loop = asyncio.get_running_loop()
+            pending = loop.create_future()
+            resolved = loop.create_future()
+            resolved.set_result(None)
+            cancelled = loop.create_future()
+            cancelled.cancel()
+            failed = loop.create_future()
+            failed.set_exception(RuntimeError("x"))
+            gates = (
+                _pending_publication_gate(pending),
+                _pending_publication_gate(resolved),
+                _pending_publication_gate(cancelled),
+                _pending_publication_gate(failed),
+            )
+            failed.exception()  # retrieved: no never-retrieved warning
+            return gates
+
+        assert asyncio.run(run()) == (True, False, False, False)
+
+
+class TestPendingEngineWiring:
+    """The resolver's dedup flow consults the module-level engine
+    names, so whichever backend is loaded steers the flow identically —
+    the routing the shielding, takeover and orphan tests in
+    test_stream.py exercise end-to-end on both backends."""
+
+    def test_current_pending_routes_through_the_join_engine(self, monkeypatch):
+        from ytm_player.services import stream
+
+        resolver = StreamResolver()
+        consults = []
+        real = stream._pending_join_verdict
+
+        def spy(entry, generation):
+            consults.append((entry, generation))
+            return real(entry, generation)
+
+        monkeypatch.setattr(stream, "_pending_join_verdict", spy)
+
+        assert resolver._current_pending("v", 3) is None
+        assert consults == [(None, 3)]
+
+        future = object()
+        resolver._pending["v"] = (3, future)
+        assert resolver._current_pending("v", 3) is future
+        assert resolver._current_pending("v", 4) is None
+        assert consults == [(None, 3), ((3, future), 3), ((3, future), 4)]
+
+    async def test_the_resolve_flow_consults_the_engines(self, monkeypatch):
+        from ytm_player.services import stream
+
+        resolver = StreamResolver()
+        gates = []
+        drops = []
+        real_gate = stream._pending_publication_gate
+        real_drop = stream._pending_drop_verdict
+
+        def gate_spy(future):
+            verdict = real_gate(future)
+            gates.append(verdict)
+            return verdict
+
+        def drop_spy(entry, future):
+            verdict = real_drop(entry, future)
+            drops.append(verdict)
+            return verdict
+
+        monkeypatch.setattr(stream, "_pending_publication_gate", gate_spy)
+        monkeypatch.setattr(stream, "_pending_drop_verdict", drop_spy)
+
+        info = StreamInfo(
+            url="https://x",
+            video_id="wiring1",
+            format="opus",
+            bitrate=1,
+            duration=1,
+            expires_at=1e9,
+        )
+        resolver._resolve_sync = lambda video_id: info
+
+        assert await resolver._resolve("wiring1") is info
+        # The set_result publication consulted the gate (True, then
+        # published); the finally cleanup consulted the drop verdict
+        # (True, then deleted) and the cancel gate (False — the future
+        # is resolved, so no cancel).
+        assert gates == [True, False]
+        assert drops == [True]
+        assert "wiring1" not in resolver._pending
+
+
 # Each parity case: the engine's arguments as JSON-round-trippable
 # lists, keyed by the engine's native name (the Python module-level
 # fallback spells the same name with a leading underscore). Both the
@@ -915,6 +1142,62 @@ _PARITY_CASES = {
         [[True, None, 0.0]],
         ["ab"],
     ],
+    # The pending-future engines' cases. The slot entry is carried as
+    # a descriptor both sides rebuild: null for the empty slot,
+    # [generation, future-descriptor] for an occupied one, a
+    # {"nonseq": …} dict for a non-subscriptable stand-in and a
+    # {"short": […]} dict for a too-short tuple. The future is its own
+    # descriptor: the literal its done() answers, or a
+    # {"raise": …} / {"noncallable": …} dict for the protocol's error
+    # shapes. The join outcome names which object came back — "slot"
+    # for the very future the case built, null for no-join — so
+    # identity, not value, is what both sides must agree on; the drop
+    # cases' third flag passes the entry's own future (true) or a
+    # distinct twin built from the same descriptor (false), pinning
+    # the identity comparison on both sides.
+    "stream_pending_join_verdict": [
+        [None, 3],
+        [[3, False], 3],
+        [[3, False], 4],
+        [[3, False], 3.0],
+        [[1, False], True],
+        [[0, False], False],
+        [[3, True], 4],
+        [["a", False], "a"],
+        [["a", False], "b"],
+        [[True, 0.0], 1],
+        [{"nonseq": 7}, 3],
+        [{"short": []}, 3],
+        [{"short": [3]}, 3],
+        [{"short": ["a"]}, "b"],
+    ],
+    "stream_pending_drop_verdict": [
+        [None, False, False],
+        [[3, False], False, True],
+        [[3, False], False, False],
+        [[3, True], True, True],
+        [[3, False], True, False],
+        [[7, None], None, True],
+        [{"short": [3, None]}, None, True],
+        [{"short": [3, None]}, False, False],
+        [{"nonseq": 7}, False, False],
+        [{"short": []}, False, False],
+    ],
+    "stream_pending_publication_gate": [
+        [[False]],
+        [[True]],
+        [[5]],
+        [[0]],
+        [[""]],
+        [["x"]],
+        [[0.5]],
+        [[0.0]],
+        [[None]],
+        [[[1]]],
+        [[[]]],
+        [[{"raise": "boom"}]],
+        [[{"noncallable": 3}]],
+    ],
 }
 
 _CHILD_PROG = """
@@ -940,6 +1223,9 @@ PY_NAMES = {
     "stream_retry_delays": "_retry_delays",
     "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
     "stream_ydl_publish_verdict": "_ydl_publish_verdict",
+    "stream_pending_join_verdict": "_pending_join_verdict",
+    "stream_pending_drop_verdict": "_pending_drop_verdict",
+    "stream_pending_publication_gate": "_pending_publication_gate",
 }
 
 
@@ -950,6 +1236,41 @@ def json_sig(value):
     if isinstance(value, list):
         return tuple(json_sig(item) for item in value)
     return value
+
+
+class StandInFuture:
+    # A future stand-in whose done() answers the descriptor's literal
+    # (or raises / is non-callable) — the object both sides build from
+    # the same JSON case, so identity comparisons are meaningful.
+    # Twins built from the same descriptor compare equal, so the drop
+    # cases' distinct-twin spelling genuinely separates `is` from `==`.
+
+    def __init__(self, desc):
+        self._desc = desc
+
+    def done(self):
+        if isinstance(self._desc, dict) and "raise" in self._desc:
+            raise RuntimeError(self._desc["raise"])
+        return self._desc
+
+    def __eq__(self, other):
+        return isinstance(other, StandInFuture) and self._desc == other._desc
+
+
+def make_future(desc):
+    if isinstance(desc, dict) and "noncallable" in desc:
+        return SimpleNamespace(done=desc["noncallable"])
+    return StandInFuture(desc)
+
+
+def make_entry(desc):
+    if desc is None:
+        return None
+    if isinstance(desc, dict):
+        if "nonseq" in desc:
+            return desc["nonseq"]
+        return tuple(desc["short"])
+    return (desc[0], make_future(desc[1]))
 
 
 def call_args(name, args):
@@ -963,11 +1284,31 @@ def call_args(name, args):
         return []
     if name == "stream_ydl_cookiejar_current":
         return [json_sig(args[0]), json_sig(args[1])]
+    if name == "stream_pending_drop_verdict":
+        entry = make_entry(args[0])
+        if args[2] and isinstance(entry, tuple) and len(entry) == 2:
+            return [entry, entry[1]]
+        return [entry, make_future(args[1])]
+    if name == "stream_pending_publication_gate":
+        return [make_future(args[0])]
     return args
 
 
 def outcome(name, args):
     fn = getattr(stream, PY_NAMES[name])
+    if name == "stream_pending_join_verdict":
+        # Built once here so the identity pin compares against the very
+        # object the engine was handed.
+        entry = make_entry(args[0])
+        try:
+            result = fn(entry, args[1])
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        if result is None:
+            return {"ok": None}
+        if isinstance(entry, tuple) and len(entry) == 2 and result is entry[1]:
+            return {"ok": "slot"}
+        return {"ok": "other"}
     try:
         result = fn(*call_args(name, args))
     except Exception as exc:
@@ -1001,7 +1342,50 @@ _PY_NAMES = {
     "stream_retry_delays": "_retry_delays",
     "stream_ydl_cookiejar_current": "_ydl_cookiejar_current",
     "stream_ydl_publish_verdict": "_ydl_publish_verdict",
+    "stream_pending_join_verdict": "_pending_join_verdict",
+    "stream_pending_drop_verdict": "_pending_drop_verdict",
+    "stream_pending_publication_gate": "_pending_publication_gate",
 }
+
+
+class _StandInFuture:
+    """A future stand-in whose ``done()`` answers the descriptor's
+    literal (or raises / is non-callable) — the object both sides build
+    from the same JSON case, so identity comparisons are meaningful.
+    Twins built from the same descriptor compare equal, so the drop
+    cases' distinct-twin spelling genuinely separates ``is`` from
+    ``==``; the child spells the identical class inside its own
+    program."""
+
+    def __init__(self, desc):
+        self._desc = desc
+
+    def done(self):
+        if isinstance(self._desc, dict) and "raise" in self._desc:
+            raise RuntimeError(self._desc["raise"])
+        return self._desc
+
+    def __eq__(self, other):
+        return isinstance(other, _StandInFuture) and self._desc == other._desc
+
+
+def _make_future(desc):
+    if isinstance(desc, dict) and "noncallable" in desc:
+        return SimpleNamespace(done=desc["noncallable"])
+    return _StandInFuture(desc)
+
+
+def _make_entry(desc):
+    """The pending slot rebuilt from the JSON case: None for the empty
+    slot, a (generation, stand-in-future) pair for an occupied one, a
+    non-subscriptable stand-in, or a too-short tuple."""
+    if desc is None:
+        return None
+    if isinstance(desc, dict):
+        if "nonseq" in desc:
+            return desc["nonseq"]
+        return tuple(desc["short"])
+    return (desc[0], _make_future(desc[1]))
 
 
 def _cache_call_args(name, args):
@@ -1010,7 +1394,10 @@ def _cache_call_args(name, args):
     cap first and the retry-delay engine's case its schedule (the
     caller restores both once the engine has run, so the module
     constants never leak); the cookiejar-signature engine's cases are
-    re-packed as the nested tuples the reference builds."""
+    re-packed as the nested tuples the reference builds; the pending
+    engines' cases are rebuilt as the slot/future stand-ins the
+    verdicts read (the drop case's third flag handing the entry's own
+    future or a distinct twin)."""
     from ytm_player.services import stream
 
     if name == "stream_cache_expired_ids":
@@ -1025,6 +1412,13 @@ def _cache_call_args(name, args):
         return [], ("_RETRY_DELAYS", saved)
     if name == "stream_ydl_cookiejar_current":
         return [_json_sig_case(args[0]), _json_sig_case(args[1])], None
+    if name == "stream_pending_drop_verdict":
+        entry = _make_entry(args[0])
+        if args[2] and isinstance(entry, tuple) and len(entry) == 2:
+            return [entry, entry[1]], None
+        return [entry, _make_future(args[1])], None
+    if name == "stream_pending_publication_gate":
+        return [_make_future(args[0])], None
     return args, None
 
 
@@ -1034,6 +1428,20 @@ def _native_outcomes():
 
     def outcome(name, args):
         fn = getattr(sys.modules["ytm_player.services.stream"], _PY_NAMES[name])
+        if name == "stream_pending_join_verdict":
+            # Built once here so the identity pin compares against the
+            # very object the engine was handed — the same shape the
+            # child's outcome spells.
+            entry = _make_entry(args[0])
+            try:
+                result = fn(entry, args[1])
+            except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+                return {"error": f"{type(exc).__name__}: {exc}"}
+            if result is None:
+                return {"ok": None}
+            if isinstance(entry, tuple) and len(entry) == 2 and result is entry[1]:
+                return {"ok": "slot"}
+            return {"ok": "other"}
         call_args, restore = _cache_call_args(name, args)
         try:
             result = fn(*call_args)

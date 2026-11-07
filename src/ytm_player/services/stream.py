@@ -23,11 +23,21 @@ rewritten jar rebuilds the instance instead of serving stale cookies)
 and the mid-build publication verdict ``_ydl_publish_verdict`` (the
 decision behind ``_get_ydl``'s post-build re-entry — adopt another
 thread's instance, retry after a mid-build reset, or install the built
-one). The resolver's remaining pure core — the retry-delay
+one). The resolver's remaining pure cores — the retry-delay
 iteration ``_retry_delays`` (the ``(attempt, delay)`` schedule walk
-behind ``_resolve_sync``'s retry loop) — answers the attempts the
-resolve makes and the waits between them. All are implemented by the
-Rust extension
+behind ``_resolve_sync``'s retry loop) and the pending-future
+bookkeeping of ``_resolve``'s request dedup: the pending-join verdict
+``_pending_join_verdict`` (the join gate behind ``_current_pending``
+— the in-flight resolve a same-generation caller joins instead of
+extracting again), the pending-drop verdict ``_pending_drop_verdict``
+(the identity gate behind the finally cleanup — the pending slot is
+dropped only when it still holds this owner's very future) and the
+pending publication gate ``_pending_publication_gate`` (the
+unresolved gate behind the shared future's three publications —
+``set_result``, ``set_exception`` and the owner-cancelled
+``cancel``) — answer the attempts the resolve makes, the waits
+between them and the dedup decisions around its shared futures. All
+are implemented by the Rust extension
 (``_ytm_player_native.is_stale`` /
 ``_ytm_player_native.wait_seconds`` /
 ``_ytm_player_native.validate_quality`` /
@@ -38,14 +48,17 @@ Rust extension
 ``_ytm_player_native.stream_cache_cap_evictions`` /
 ``_ytm_player_native.stream_ydl_cookiejar_current`` /
 ``_ytm_player_native.stream_ydl_publish_verdict`` /
-``_ytm_player_native.stream_retry_delays``) when it is built
-and by the pure-Python transcriptions below otherwise; the YoutubeDL
-construction, the cookiejar vouching and its signature probe, the
-network extraction, the sleeps, the cache state and the
-pending-future bookkeeping stay Python-side in the resolver. The
-clock-reading engines resolve ``time.time()`` through this module's
-own ``time`` name at call time, so a patched or frozen clock steers
-both backends identically.
+``_ytm_player_native.stream_retry_delays`` /
+``_ytm_player_native.stream_pending_join_verdict`` /
+``_ytm_player_native.stream_pending_drop_verdict`` /
+``_ytm_player_native.stream_pending_publication_gate``) when it is
+built and by the pure-Python transcriptions below otherwise; the
+YoutubeDL construction, the cookiejar vouching and its signature
+probe, the network extraction, the sleeps, the cache state, the
+pending-future state and its mutations stay Python-side in the
+resolver. The clock-reading engines resolve ``time.time()`` through
+this module's own ``time`` name at call time, so a patched or frozen
+clock steers both backends identically.
 """
 
 from __future__ import annotations
@@ -433,6 +446,66 @@ def _retry_delays() -> list[tuple[int, float]]:
     this pure-Python transcription is the fallback otherwise.
     """
     return list(enumerate(_RETRY_DELAYS))
+
+
+def _pending_join_verdict(entry: Any, generation: Any) -> Any:
+    """The pending-join verdict behind ``StreamResolver._current_pending``.
+
+    The dedup gate both ``_resolve``'s join arm and ``prefetch``'s
+    already-resolving check consult: the in-flight resolve's future
+    when the pending slot holds one that started under the caller's
+    own generation — so the caller awaits it instead of extracting
+    again — and ``None`` otherwise (an empty slot, or one from before
+    a ``clear_cache()`` bumped the generation, whose result comes
+    from the old resolver setup). The generation comparison is
+    CPython's own ``!=``; the slot read (the ``_pending`` dict
+    lookup) and the awaits stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_pending_join_verdict``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if entry is None or entry[0] != generation:
+        return None
+    return entry[1]
+
+
+def _pending_drop_verdict(entry: Any, future: Any) -> bool:
+    """The slot-drop verdict behind ``_resolve``'s finally cleanup.
+
+    True only when the pending slot still holds this owner's very
+    future — the identity comparison, never equality — so the cleanup
+    of a resolve from before a ``clear_cache()`` (whose slot a newer
+    same-video request has taken over) leaves the newer request's
+    entry in place for its own waiters. The ``del`` and the slot
+    state stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_pending_drop_verdict``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return entry is not None and entry[1] is future
+
+
+def _pending_publication_gate(future: Any) -> bool:
+    """The unresolved gate behind the shared pending future's publications.
+
+    ``not future.done()`` — True while the future still wants a
+    resolution, so the owner's ``set_result`` (the try arm),
+    ``set_exception`` (the except arm) or ``cancel`` (the finally
+    arm, for an owner cancelled before the future resolved) may land
+    on it; False once the future is resolved, cancelled or
+    exception-set, so a publication never raises
+    ``InvalidStateError`` over a resolution that already landed. The
+    publications themselves and the future state stay with the
+    caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.stream_pending_publication_gate``) when it
+    is built; this pure-Python transcription is the fallback
+    otherwise.
+    """
+    return not future.done()
 
 
 @dataclass(frozen=True, slots=True)
@@ -837,6 +910,12 @@ class StreamResolver:
         # from before a clear_cache() is not joined: its result comes from
         # the old resolver setup, so this request starts its own and takes
         # over the slot (the old owner's cleanup below checks identity).
+        # The join decision is resolved by the ``_pending_join_verdict``
+        # engine, the publications by the ``_pending_publication_gate``
+        # engine and the cleanup's drop by the ``_pending_drop_verdict``
+        # engine (native when the Rust extension is built, the
+        # pure-Python transcriptions otherwise); the slot state, the
+        # awaits and the mutations stay here.
         generation = self._cache_generation
         pending = self._current_pending(video_id, generation)
         if pending is not None:
@@ -849,18 +928,21 @@ class StreamResolver:
             info = await asyncio.to_thread(self._resolve_sync, video_id)
             if info is not None:
                 self._put_cache(info, generation)
-            if not future.done():
+            if _pending_publication_gate(future):
                 future.set_result(info)
             return info
         except Exception as exc:
-            if not future.done():
+            if _pending_publication_gate(future):
                 future.set_exception(exc)
             raise
         finally:
+            # The drop verdict, the del, then the publication gate — the
+            # reference's statement order, so a raising done() never skips
+            # the del.
             entry = self._pending.get(video_id)
-            if entry is not None and entry[1] is future:
+            if _pending_drop_verdict(entry, future):
                 del self._pending[video_id]
-            if not future.done():
+            if _pending_publication_gate(future):
                 # Owner was cancelled before the future resolved (a BaseException
                 # such as CancelledError bypasses the except above).  Cancel the
                 # shared future so concurrent waiters get CancelledError instead
@@ -870,11 +952,14 @@ class StreamResolver:
     def _current_pending(
         self, video_id: str, generation: int
     ) -> asyncio.Future[StreamInfo | None] | None:
-        """The in-flight resolve for *video_id* if it started under *generation*."""
-        entry = self._pending.get(video_id)
-        if entry is None or entry[0] != generation:
-            return None
-        return entry[1]
+        """The in-flight resolve for *video_id* if it started under *generation*.
+
+        The join verdict is resolved by the ``_pending_join_verdict``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the slot read stays
+        with the caller.
+        """
+        return _pending_join_verdict(self._pending.get(video_id), generation)
 
     async def prefetch(self, video_id: str) -> None:
         """Resolve a video ID in the background without blocking the caller.
@@ -953,6 +1038,15 @@ try:
         stream_info_fields as _native_stream_info_fields,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_pending_drop_verdict as _native_stream_pending_drop_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_pending_join_verdict as _native_stream_pending_join_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        stream_pending_publication_gate as _native_stream_pending_publication_gate,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         stream_retry_delays as _native_stream_retry_delays,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -981,3 +1075,6 @@ else:
     _cache_expired_ids = _native_stream_cache_expired_ids  # type: ignore[assignment]
     _cache_cap_evictions = _native_stream_cache_cap_evictions  # type: ignore[assignment]
     _retry_delays = _native_stream_retry_delays  # type: ignore[assignment]
+    _pending_join_verdict = _native_stream_pending_join_verdict  # type: ignore[assignment]
+    _pending_drop_verdict = _native_stream_pending_drop_verdict  # type: ignore[assignment]
+    _pending_publication_gate = _native_stream_pending_publication_gate  # type: ignore[assignment]

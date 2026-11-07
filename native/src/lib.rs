@@ -869,9 +869,8 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // _resolve_sync's retry loop (the (attempt, delay) schedule walk,
     // the schedule read through the module's own _RETRY_DELAYS name,
     // a patched schedule included). The YoutubeDL construction, the
-    // cookiejar vouching, the network extraction, the sleeps, the
-    // cache state and the pending-future bookkeeping stay Python-side
-    // in the resolver.
+    // cookiejar vouching, the network extraction, the sleeps and the
+    // cache state stay Python-side in the resolver.
     module.add_function(pyo3::wrap_pyfunction!(is_stale, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(wait_seconds, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(validate_quality, module)?)?;
@@ -898,6 +897,27 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         module
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(stream_ydl_publish_verdict, module)?)?;
+
+    // Stream pending-future engines (services/stream.py equivalents):
+    // the request-dedup bookkeeping around _resolve's shared futures
+    // — the join verdict behind _current_pending (the in-flight
+    // resolve a same-generation caller joins instead of extracting
+    // again, the entry's generation compared through CPython's own
+    // !=), the drop verdict behind the finally-block slot cleanup
+    // (the slot dropped only when it still holds this owner's very
+    // future, by identity), and the publication gate behind all
+    // three of the shared future's publications (set_result,
+    // set_exception and the owner-cancelled cancel, gated on not
+    // future.done() through the future's own method protocol and the
+    // interpreter's own truthiness). The _pending dict state, the
+    // awaits, the publications and the slot mutations stay
+    // Python-side in the resolver.
+    module.add_function(pyo3::wrap_pyfunction!(stream_pending_join_verdict, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(stream_pending_drop_verdict, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        stream_pending_publication_gate,
+        module
+    )?)?;
 
     // Download-service engines (services/download.py equivalents): the
     // base yt-dlp options dict behind DownloadService._build_opts (the
@@ -17008,4 +17028,94 @@ fn stream_ydl_publish_verdict(
         return Ok("retry");
     }
     Ok("install")
+}
+
+// ---------------------------------------------------------------------------
+// Pending-future bookkeeping (mirror the resolver's request dedup in
+// ytm_player/services/stream.py)
+// ---------------------------------------------------------------------------
+
+/// The pending-join verdict — `services/stream.py`'s
+/// `_pending_join_verdict`, the join gate behind
+/// `StreamResolver._current_pending` (and through it `_resolve`'s
+/// dedup arm and `prefetch`'s already-resolving check).
+///
+/// Mirrors the reference's slot read-back exactly: the raw
+/// `dict.get` answer it is handed is the None singleton when the
+/// slot is empty — no in-flight resolve to join — and otherwise the
+/// entry's own `(generation, future)` pair, the entry's generation
+/// fetched through CPython's own subscript and compared through
+/// CPython's own `!=`, so a slot registered before a `clear_cache()`
+/// bumped the generation answers no-join (its result comes from the
+/// old resolver setup) while a same-generation slot answers its
+/// future — the very object the entry holds, fetched through the
+/// same subscript — for the caller's `asyncio.shield`. The slot
+/// state (the `_pending` dict and its entries) and the awaits stay
+/// Python-side in the resolver.
+#[pyfunction]
+#[pyo3(signature = (entry, generation))]
+fn stream_pending_join_verdict<'py>(
+    py: Python<'py>,
+    entry: &Bound<'py, PyAny>,
+    generation: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if entry.is_none() {
+        return Ok(py.None().into_bound(py));
+    }
+    let entry_generation = entry.get_item(0)?;
+    if entry_generation.ne(generation)? {
+        return Ok(py.None().into_bound(py));
+    }
+    entry.get_item(1)
+}
+
+/// The pending-drop verdict — `services/stream.py`'s
+/// `_pending_drop_verdict`, the identity gate behind `_resolve`'s
+/// finally-block slot cleanup.
+///
+/// Mirrors the reference's short-circuited identity chain exactly:
+/// `entry is not None and entry[1] is future` — the None check by
+/// identity, the slot's future fetched through CPython's own
+/// subscript and compared to the owner's future by identity, never
+/// equality. An empty slot is never dropped (nothing to remove), and
+/// a slot is dropped only when it still holds this owner's very
+/// future — so a resolve from before a `clear_cache()`, whose slot a
+/// newer same-video request has taken over, leaves the newer
+/// request's entry in place for its own waiters. The `del` itself
+/// and the slot state stay Python-side in the resolver.
+#[pyfunction]
+#[pyo3(signature = (entry, future))]
+fn stream_pending_drop_verdict(
+    entry: &Bound<'_, PyAny>,
+    future: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    if entry.is_none() {
+        return Ok(false);
+    }
+    Ok(entry.get_item(1)?.is(future))
+}
+
+/// The pending publication gate — `services/stream.py`'s
+/// `_pending_publication_gate`, the unresolved gate behind the shared
+/// pending future's three publications.
+///
+/// Mirrors the reference's `not future.done()` exactly: the `done()`
+/// read through the future's own method protocol (a real
+/// `asyncio.Future` answers a bool; a stand-in answers whatever it
+/// answers), then inverted through CPython's own truthiness — the
+/// interpreter's `not` over whatever came back. True while the
+/// future still wants a resolution, so the owner's `set_result` (the
+/// try arm), `set_exception` (the except arm) or `cancel` (the
+/// finally arm, for an owner cancelled before the future resolved —
+/// a bare `BaseException` bypasses the except arm, and without the
+/// cancel concurrent waiters would hang forever on the orphaned
+/// future) may land on it; False once the future is resolved,
+/// cancelled or exception-set, so a publication never raises
+/// `InvalidStateError` over a resolution that already landed. The
+/// publications themselves and the future state stay Python-side in
+/// the resolver.
+#[pyfunction]
+#[pyo3(signature = (future))]
+fn stream_pending_publication_gate(future: &Bound<'_, PyAny>) -> PyResult<bool> {
+    Ok(!future.call_method0("done")?.is_truthy()?)
 }
