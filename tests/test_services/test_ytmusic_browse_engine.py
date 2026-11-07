@@ -357,11 +357,14 @@ class TestChartShelfIndex:
 
     def test_zero_count_raises_the_modulos_own_error(self):
         # CPython's own wording for the message differs across the
-        # supported range (3.10 and 3.15 spell it "integer division or
-        # modulo by zero", 3.12 "integer modulo by zero"); the contract
-        # is the modulo's own ZeroDivisionError surfacing verbatim, so
-        # both historical spellings match.
-        with pytest.raises(ZeroDivisionError, match=r"integer (?:division or )?modulo by zero"):
+        # supported range (3.10 spells it "integer division or modulo
+        # by zero", 3.12 "integer modulo by zero", 3.15 the plain
+        # "division by zero"); the contract is the modulo's own
+        # ZeroDivisionError surfacing verbatim, so every observed
+        # spelling matches.
+        with pytest.raises(
+            ZeroDivisionError, match=r"(?:integer )?(?:division or )?(?:modulo|division) by zero"
+        ):
             _chart_shelf_index(2, 0)
 
     def test_floats_and_bools_steer_through_the_operators(self):
