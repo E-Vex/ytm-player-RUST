@@ -660,21 +660,28 @@ class Player:
                 # live-loop arm — the conditional keeps the read there.
                 ctx = self._dispatch_context if loop_live else None
                 arm = _dispatch_arm(loop_live, asyncio.iscoroutinefunction(cb), ctx is not None)
-                if arm == "async_ctx":
-                    loop.call_soon_threadsafe(_schedule_async, cb, args, context=ctx)
-                elif arm == "async":
-                    loop.call_soon_threadsafe(_schedule_async, cb, args)
-                elif arm == "sync_ctx":
-                    loop.call_soon_threadsafe(_safe_sync, cb, args, context=ctx)
-                elif arm == "sync":
-                    loop.call_soon_threadsafe(_safe_sync, cb, args)
-                elif arm == "drop":
+                if arm == "drop":
                     # No loop: async callbacks cannot run — dropped with
                     # a warning, never silently.
                     logger.warning("Dropping async %s callback — no event loop available", event)
-                else:  # "direct" — no loop, sync callback: run inline.
+                elif arm == "direct":
+                    # No loop, sync callback: run inline.
                     if still_current():
                         cb(*args)
+                else:
+                    # The four scheduling arms imply a live loop — the
+                    # engine answers them only when loop_live; pyright
+                    # cannot infer that from the arm string, so narrow
+                    # it once here for all four.
+                    assert loop is not None
+                    if arm == "async_ctx":
+                        loop.call_soon_threadsafe(_schedule_async, cb, args, context=ctx)
+                    elif arm == "async":
+                        loop.call_soon_threadsafe(_schedule_async, cb, args)
+                    elif arm == "sync_ctx":
+                        loop.call_soon_threadsafe(_safe_sync, cb, args, context=ctx)
+                    else:  # "sync"
+                        loop.call_soon_threadsafe(_safe_sync, cb, args)
             except Exception:
                 logger.exception("Failed to schedule %s callback", event)
 
