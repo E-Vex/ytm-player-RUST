@@ -6,8 +6,11 @@ retry/renewal bookkeeping — the auth-expiry sniff ``_is_auth_expired``
 behind every expired-session retry, the renewal-cooldown gate
 ``_renewal_cooldown_gate`` and stamp ``_renewal_cooldown_stamp``
 behind ``_renewed_client_for``, and the consecutive-failure step
-``_api_failure_step`` behind ``_run``'s except arm — and the browse
-wrappers' cores — the watch-playlist kwargs assembly
+``_api_failure_step`` behind ``_run``'s except arm — the patch-window
+in-flight bookkeeping — the admission step ``_patch_window_enter``
+behind ``_call``'s gate arm and the release step
+``_patch_window_exit`` behind its finally arm — the browse wrappers'
+cores — the watch-playlist kwargs assembly
 ``_watch_playlist_kwargs``, the result-tracks extraction
 ``_result_tracks``, the playlist-tracks gate ``_playlist_tracks``,
 the radio seed pool ``_radio_seed_pool``, the discovery source
@@ -16,28 +19,39 @@ rotation ``_discovery_source_order``, the chart-shelf assembly
 ``_chart_shelf_index``, the playable filters
 ``_discovery_playable_tracks`` / ``_chart_playable_tracks``, the
 explore new-releases extraction ``_explore_new_releases`` and the
-playlist sort-order lookup ``_playlist_order_params`` — are
-implemented by the Rust extension
+playlist sort-order lookup ``_playlist_order_params`` — and the
+RNG-driven selection cores — the radio mix's multi-seed shuffle and
+limit trim ``_radio_mix`` behind ``get_radio``'s result assembly, the
+three-track seed sample ``_sample_seeds`` behind every discovery mix
+source and the random artist pick ``_pick_artist`` behind the artist
+mix, the RNG itself flowing through the ``random`` module so seeded
+sequences steer both backends identically — are implemented by the
+Rust extension
 (``_ytm_player_native.classify_mutation_failure`` /
 ``_ytm_player_native.ytm_auth_expired`` /
 ``_ytm_player_native.ytm_renewal_cooldown_gate`` /
 ``_ytm_player_native.ytm_renewal_cooldown_stamp`` /
 ``_ytm_player_native.ytm_api_failure_step`` /
+``_ytm_player_native.ytm_patch_window_enter`` /
+``_ytm_player_native.ytm_patch_window_exit`` /
 ``_ytm_player_native.ytm_watch_playlist_kwargs`` /
 ``_ytm_player_native.ytm_result_tracks`` /
 ``_ytm_player_native.ytm_playlist_tracks`` /
 ``_ytm_player_native.ytm_radio_seed_pool`` /
+``_ytm_player_native.ytm_radio_mix`` /
 ``_ytm_player_native.ytm_discovery_source_order`` /
 ``_ytm_player_native.ytm_chart_shelves`` /
 ``_ytm_player_native.ytm_chart_shelf_index`` /
 ``_ytm_player_native.ytm_discovery_playable_tracks`` /
 ``_ytm_player_native.ytm_chart_playable_tracks`` /
+``_ytm_player_native.ytm_sample_seeds`` /
+``_ytm_player_native.ytm_pick_artist`` /
 ``_ytm_player_native.ytm_explore_new_releases`` /
 ``_ytm_player_native.ytm_playlist_order_params``) when it is built
 and by the pure-Python transcriptions below otherwise; the client
 construction and renewal, the ``asyncio.to_thread`` dispatch, the
-patch-window gate and the RNG-driven shuffle/sample stay Python-side
-in the service.
+patch-window gate and the track normalisation stay Python-side in
+the service.
 """
 
 from __future__ import annotations
@@ -422,8 +436,8 @@ def _radio_seed_pool(results: Any) -> list[Any]:
     hash-then-identity-or-``==`` membership and add deciding, an
     unhashable id raising the containment protocol's own
     ``TypeError``. Kept tracks pass through as the objects they are,
-    in first-sight order; the shuffle, the limit trim and the
-    normalisation stay in the wrapper, next to the RNG state.
+    in first-sight order; the shuffle and the limit trim run in the
+    mix engine below, and the normalisation stays in the wrapper.
 
     Implemented by the Rust extension
     (``_ytm_player_native.ytm_radio_seed_pool``) when it is built;
@@ -438,6 +452,31 @@ def _radio_seed_pool(results: Any) -> list[Any]:
                 seen_ids.add(vid)
                 pool.append(track)
     return pool
+
+
+def _radio_mix(pool: Any, seed_count: Any, limit: Any) -> list[Any]:
+    """The shuffled, trimmed mix ``get_radio`` returns.
+
+    The pure core of ``get_radio``'s result assembly: the multi-seed
+    shuffle gate — ``seed_count > 1``, the comparison through
+    CPython's own ``>`` (single-seed callers expect the seed track to
+    lead, so their pool keeps its first-sight order) — under which
+    the pool is shuffled in place through the ``random`` module's own
+    ``shuffle``, and the ``pool[:limit]`` trim — the slice through
+    CPython's own protocol — that caps the mix at ``limit`` tracks.
+    The RNG state is the ``random`` module's own, so a
+    ``random.seed(...)`` before the call steers both backends
+    identically; the normalisation stays in the wrapper.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_radio_mix``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    import random
+
+    if seed_count > 1:
+        random.shuffle(pool)
+    return pool[:limit]
 
 
 def _discovery_source_order(last_source: Any) -> list[Any]:
@@ -529,6 +568,49 @@ def _chart_playable_tracks(tracks: Any) -> list[Any]:
     built; this pure-Python transcription is the fallback otherwise.
     """
     return [t for t in tracks if isinstance(t, dict) and (t.get("videoId") or t.get("video_id"))]
+
+
+def _sample_seeds(pool: Any) -> list[Any]:
+    """The three-track seed sample a discovery mix draws.
+
+    The pure core of the sampling step every discovery mix source
+    shares (the charts, trending, home, liked-songs, artist and
+    history mixes): ``random.sample(pool, min(3, len(pool)))`` — the
+    length through CPython's own sequence protocol, the ``min``
+    capping the draw at three and at the pool's own length (so a
+    short pool answers every track it has), and the sample itself
+    through the ``random`` module's own ``sample``. The RNG state is
+    the ``random`` module's own, so a ``random.seed(...)`` before the
+    call steers both backends identically; the tracks pass through as
+    the objects they are.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_sample_seeds``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    import random
+
+    return random.sample(pool, min(3, len(pool)))
+
+
+def _pick_artist(artists: Any) -> Any:
+    """The random artist pick behind the artist mix's seed selection.
+
+    The pure core of the artist discovery mix's first draw:
+    ``random.choice(artists)`` — through the ``random`` module's own
+    ``choice``, so a ``random.seed(...)`` before the call steers both
+    backends identically — the artist object passing through as it
+    is; the empty-artists guard stays in the wrapper (the reference's
+    ``random.choice`` would raise its own ``IndexError`` on an empty
+    sequence, which the guard keeps unreachable).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.ytm_pick_artist``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    import random
+
+    return random.choice(artists)
 
 
 def _explore_new_releases(result: Any) -> list[Any]:
@@ -1164,8 +1246,6 @@ class YTMusicService:
         *limit* is also forwarded to each seed's ``get_watch_playlist``
         call; ``None`` is not supported there (ytmusicapi subtracts from it).
         """
-        import random
-
         from ytm_player.utils.formatting import normalize_tracks
 
         if isinstance(video_ids, str):
@@ -1188,10 +1268,11 @@ class YTMusicService:
         pool = _radio_seed_pool(results)
 
         # Single-seed callers (e.g., "Start Radio on this track") expect the seed
-        # track to lead. Only shuffle when there are multiple seeds (refill, discovery).
-        if len(video_ids) > 1:
-            random.shuffle(pool)
-        return normalize_tracks(pool[:limit])
+        # track to lead. Only shuffle when there are multiple seeds (refill,
+        # discovery) — the mix engine's own gate, the RNG flowing through the
+        # random module so seeded sequences steer both backends identically.
+        mix = _radio_mix(pool, len(video_ids), limit)
+        return normalize_tracks(mix)
 
     async def get_discovery_mix(self) -> tuple[list[dict], str]:
         """Select seed tracks from one of six sources for discovery playback.
@@ -1200,8 +1281,6 @@ class YTMusicService:
         next source.  On failure, skips to the next in sequence.
         Returns (seed_tracks, label).  Returns ([], "") if all fail.
         """
-        import random
-
         sources = _discovery_source_order(self._last_discovery_source)
 
         async def _charts_mix() -> tuple[list[dict], str]:
@@ -1225,7 +1304,7 @@ class YTMusicService:
             playable = _chart_playable_tracks(tracks)
             if not playable:
                 return [], ""
-            sampled = random.sample(playable, min(3, len(playable)))
+            sampled = _sample_seeds(playable)
             return sampled, f"{region} {shelf_title}"
 
         async def _trending_mix() -> tuple[list[dict], str]:
@@ -1240,7 +1319,7 @@ class YTMusicService:
             playable = _discovery_playable_tracks(items)
             if not playable:
                 return [], ""
-            sampled = random.sample(playable, min(3, len(playable)))
+            sampled = _sample_seeds(playable)
             return sampled, "Trending"
 
         async def _home_mix() -> tuple[list[dict], str]:
@@ -1251,7 +1330,7 @@ class YTMusicService:
                 all_playable.extend(_discovery_playable_tracks(items))
             if not all_playable:
                 return [], ""
-            sampled = random.sample(all_playable, min(3, len(all_playable)))
+            sampled = _sample_seeds(all_playable)
             return sampled, "For You"
 
         async def _liked_songs_mix() -> tuple[list[dict], str]:
@@ -1260,14 +1339,14 @@ class YTMusicService:
             playable = _discovery_playable_tracks(items)
             if not playable:
                 return [], ""
-            sampled = random.sample(playable, min(3, len(playable)))
+            sampled = _sample_seeds(playable)
             return sampled, "Your Liked Songs"
 
         async def _artist_mix() -> tuple[list[dict], str]:
             artists = await self._call(self.client.get_library_artists, limit=25)
             if not artists:
                 return [], ""
-            artist = random.choice(artists)
+            artist = _pick_artist(artists)
             channel_id = artist.get("browseId", "")
             if not channel_id:
                 return [], ""
@@ -1277,7 +1356,7 @@ class YTMusicService:
             playable = _discovery_playable_tracks(results)
             if not playable:
                 return [], ""
-            sampled = random.sample(playable, min(3, len(playable)))
+            sampled = _sample_seeds(playable)
             artist_name = artist.get("artist", "Artist")
             return sampled, f"Artist: {artist_name}"
 
@@ -1289,7 +1368,7 @@ class YTMusicService:
             if not playable:
                 return [], ""
             recent = playable[:20]
-            sampled = random.sample(recent, min(3, len(recent)))
+            sampled = _sample_seeds(recent)
             return sampled, "Recently Played"
 
         _source_fns: dict[int, Any] = {
@@ -1699,10 +1778,16 @@ try:
         ytm_patch_window_exit as _native_patch_window_exit,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_pick_artist as _native_pick_artist,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_playlist_order_params as _native_playlist_order_params,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_playlist_tracks as _native_playlist_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_radio_mix as _native_radio_mix,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_radio_seed_pool as _native_radio_seed_pool,
@@ -1715,6 +1800,9 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_result_tracks as _native_result_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        ytm_sample_seeds as _native_sample_seeds,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         ytm_watch_playlist_kwargs as _native_watch_playlist_kwargs,
@@ -1731,11 +1819,14 @@ else:
     _watch_playlist_kwargs = _native_watch_playlist_kwargs  # type: ignore[assignment]
     _result_tracks = _native_result_tracks  # type: ignore[assignment]
     _playlist_tracks = _native_playlist_tracks  # type: ignore[assignment]
+    _radio_mix = _native_radio_mix  # type: ignore[assignment]
     _radio_seed_pool = _native_radio_seed_pool  # type: ignore[assignment]
     _discovery_source_order = _native_discovery_source_order  # type: ignore[assignment]
     _chart_shelves = _native_chart_shelves  # type: ignore[assignment]
     _chart_shelf_index = _native_chart_shelf_index  # type: ignore[assignment]
     _discovery_playable_tracks = _native_discovery_playable_tracks  # type: ignore[assignment]
     _chart_playable_tracks = _native_chart_playable_tracks  # type: ignore[assignment]
+    _sample_seeds = _native_sample_seeds  # type: ignore[assignment]
+    _pick_artist = _native_pick_artist  # type: ignore[assignment]
     _explore_new_releases = _native_explore_new_releases  # type: ignore[assignment]
     _playlist_order_params = _native_playlist_order_params  # type: ignore[assignment]

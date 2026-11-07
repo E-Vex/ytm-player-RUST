@@ -661,8 +661,8 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // behind the discovery mixes, the explore new-releases extraction
     // behind get_new_releases, and the sort-order params lookup
     // behind get_playlist — with the client calls, the patch-window
-    // gate, the renewal machinery and the RNG-driven shuffle/sample
-    // staying Python-side in the service.
+    // gate and the renewal machinery staying Python-side in the
+    // service.
     module.add_function(pyo3::wrap_pyfunction!(ytm_watch_playlist_kwargs, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(ytm_result_tracks, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(ytm_playlist_tracks, module)?)?;
@@ -677,6 +677,19 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(ytm_chart_playable_tracks, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(ytm_explore_new_releases, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(ytm_playlist_order_params, module)?)?;
+
+    // YTMusic RNG-driven selection engines (services/ytmusic.py
+    // equivalents): the radio mix's multi-seed shuffle and limit trim
+    // behind get_radio's result assembly, the three-track seed sample
+    // every discovery mix source draws, and the artist mix's random
+    // pick — the RNG itself always flowing through the Python
+    // `random` module (the QueueCore engines' own rule), so seeded
+    // sequences and monkeypatched draw functions steer both backends
+    // identically — with the client calls, the gather and the
+    // normalisation staying Python-side in the service.
+    module.add_function(pyo3::wrap_pyfunction!(ytm_radio_mix, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_sample_seeds, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(ytm_pick_artist, module)?)?;
 
     // Playback-bar track-info width engine (ui/playback_bar.py
     // equivalent): the halves-and-thirds width split behind the
@@ -13286,6 +13299,97 @@ fn ytm_playlist_order_params<'py>(
         PyString::new(py, "").into_any()
     };
     table.getattr("get")?.call1((key,))
+}
+
+// ── YTMusic RNG-driven selection engines (services/ytmusic.py) ────────
+
+/// The shuffled, trimmed mix behind `YTMusicService.get_radio` — the
+/// pure core of the wrapper's result assembly from
+/// `services/ytmusic.py`, the RNG-driven half the seed-pool engine's
+/// own contract left with the wrapper.
+///
+/// Mirrors the pure-Python reference (`_radio_mix`): the multi-seed
+/// gate `seed_count > 1` through CPython's own `>` (single-seed
+/// callers expect the seed track to lead, so their pool keeps its
+/// first-sight order), the `random.shuffle(pool)` under it — routed
+/// through the Python `random` module exactly like the QueueCore
+/// engines route theirs, so `random.seed(...)` before the call and a
+/// monkeypatched `random.shuffle` steer the native engine identically
+/// to the fallback — shuffling the caller's pool in place, and the
+/// `pool[:limit]` trim through CPython's own slice protocol. The
+/// answer is the slice the reference passes on; the normalisation
+/// stays Python-side in the wrapper.
+#[pyfunction]
+#[pyo3(signature = (pool, seed_count, limit))]
+fn ytm_radio_mix<'py>(
+    py: Python<'py>,
+    pool: &Bound<'py, PyAny>,
+    seed_count: &Bound<'py, PyAny>,
+    limit: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let one = 1i64
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    if seed_count.gt(&one)? {
+        let random = PyModule::import(py, "random")?;
+        random.call_method1("shuffle", (pool.clone(),))?;
+    }
+    // pool[:limit] — the slice through CPython's own protocols, the
+    // None/limit/None window the reference's spelling compiles to, a
+    // non-int limit raising the slice's own TypeError exactly like
+    // the reference.
+    let slice_type = PyModule::import(py, "builtins")?.getattr("slice")?;
+    let window = slice_type.call1((py.None(), limit.clone(), py.None()))?;
+    pool.get_item(&window)
+}
+
+/// The three-track seed sample a discovery mix draws — the pure core
+/// of the sampling step every `YTMusicService.get_discovery_mix`
+/// source shares (the charts, trending, home, liked-songs, artist and
+/// history mixes), from `services/ytmusic.py`.
+///
+/// Mirrors the pure-Python reference (`_sample_seeds`): the draw size
+/// `min(3, len(pool))` — the length through CPython's own sequence
+/// protocol, so a lengthless pool raises the reference's own `len`
+/// `TypeError`, capped at three and at the pool's own length — then
+/// `random.sample(pool, k)` routed through the Python `random`
+/// module, so `random.seed(...)` before the call and a monkeypatched
+/// `random.sample` steer the native engine identically to the
+/// fallback. The answer is the sample the module's own `sample`
+/// produced, the tracks passing through as the objects they are.
+#[pyfunction]
+#[pyo3(signature = (pool))]
+fn ytm_sample_seeds<'py>(py: Python<'py>, pool: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let random = PyModule::import(py, "random")?;
+    let len = pool.len()?;
+    let k = len.min(3);
+    random.call_method1("sample", (pool.clone(), k))
+}
+
+/// The random artist pick behind the artist discovery mix's seed
+/// selection — the pure core of the first draw in
+/// `YTMusicService.get_discovery_mix`'s artist source, from
+/// `services/ytmusic.py`.
+///
+/// Mirrors the pure-Python reference (`_pick_artist`):
+/// `random.choice(artists)` routed through the Python `random`
+/// module, so `random.seed(...)` before the call and a monkeypatched
+/// `random.choice` steer the native engine identically to the
+/// fallback. The artist passes through as the object it is; the
+/// empty-artists guard stays Python-side in the wrapper (the
+/// reference's `random.choice` would raise its own `IndexError`
+/// on an empty sequence, which the guard keeps unreachable).
+#[pyfunction]
+#[pyo3(signature = (artists))]
+fn ytm_pick_artist<'py>(
+    py: Python<'py>,
+    artists: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let random = PyModule::import(py, "random")?;
+    Ok(random
+        .call_method1("choice", (artists.clone(),))?
+        .into_any())
 }
 
 // ── Playback-bar track-info width engine ───────────────────────────────
