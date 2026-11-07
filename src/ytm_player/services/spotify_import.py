@@ -1,4 +1,22 @@
-"""Spotify playlist import — extract tracks, match on YouTube Music, create playlist."""
+"""Spotify playlist import — extract tracks, match on YouTube Music, create playlist.
+
+The matching pipeline's pure cores are dual-implemented: the URL/item
+parse (``_extract_playlist_id`` / ``_parse_spotipy_item``), the weighted
+fuzzy score (``_fuzzy_score``), the score-sort-threshold classification
+(``_match_classification``), the per-page item walk (``_page_items``),
+the scraper fallback's track-row walk (``_scraper_track_rows``), the
+candidate display row (``_display_candidate``), the confirmed/video-ids/
+skipped accounting (``_summarize_results``) and the match-type bucket
+walk (``_bucket_results``). Each is implemented by the Rust extension
+(``_ytm_player_native.extract_playlist_id`` / ``parse_spotipy_item`` /
+``spotify_fuzzy_score`` / ``spotify_match_classification`` /
+``spotify_page_items`` / ``spotify_scraper_track_rows`` /
+``spotify_display_candidate`` / ``spotify_summarize_results`` /
+``spotify_bucket_results``) when it is built and by the pure-Python
+transcriptions below otherwise; the spotipy/scraper network calls, the
+thread-pool fan-out, the interactive prompts and the playlist creation
+stay Python-side in this module.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +26,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import click
 from ytmusicapi import YTMusic
@@ -124,6 +143,30 @@ def _parse_spotipy_item(item: dict) -> dict:
     }
 
 
+def _page_items(results: dict) -> list[dict]:
+    """One page's parsed track rows.
+
+    The pure core of ``extract_spotify_tracks_spotipy``'s pagination
+    walk: the page's ``items`` member read through the mapping's own
+    ``get`` with a fresh empty list default (a missing key answers no
+    items), each item normalised through the ``_parse_spotipy_item``
+    engine, and each falsy parse — the empty dict the normaliser
+    answers for an episode entry or a region-locked track — dropped by
+    the ``if parsed:`` truthiness gate. The ``while results`` loop, the
+    ``sp.next`` fetch and the ``next`` member gate stay in the wrapper.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_page_items``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    tracks: list[dict] = []
+    for item in results.get("items", []):
+        parsed = _parse_spotipy_item(item)
+        if parsed:
+            tracks.append(parsed)
+    return tracks
+
+
 def extract_spotify_tracks_spotipy(url: str) -> tuple[str, list[dict]]:
     """Extract ALL tracks using the Spotify Web API (with pagination).
 
@@ -166,10 +209,7 @@ def extract_spotify_tracks_spotipy(url: str) -> tuple[str, list[dict]]:
 
     tracks: list[dict] = []
     while results:
-        for item in results.get("items", []):
-            parsed = _parse_spotipy_item(item)
-            if parsed:
-                tracks.append(parsed)
+        tracks.extend(_page_items(results))
         # Follow pagination.
         if results.get("next"):
             results = sp.next(results)
@@ -177,6 +217,42 @@ def extract_spotify_tracks_spotipy(url: str) -> tuple[str, list[dict]]:
             break
 
     return playlist_name, tracks
+
+
+def _scraper_track_rows(playlist: Any) -> list[dict]:
+    """The scraper fallback's track rows.
+
+    The pure core of ``extract_spotify_tracks``'s scraper walk: the
+    playlist's ``tracks`` walked item by item, each item's ``track``
+    read through its attribute, the artist as the ``", "``-joined
+    ``name``s of ``track.artists`` with the ``or "Unknown"`` truthiness
+    gate behind it (no artists, or a join that answers an empty
+    string, reads as ``Unknown``), the album name read only through a
+    truthy ``track.album`` (a falsy album answers ``""``), and
+    ``name``/``duration_ms`` passing through as the objects they are,
+    into a fresh four-key dict per row. The playlist name and
+    total-count reads, and the short-pagination warning, stay in the
+    wrapper.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_scraper_track_rows``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    tracks: list[dict] = []
+    for item in playlist.tracks:
+        track = item.track
+        artist_name = ", ".join(a.name for a in track.artists) or "Unknown"
+        album_name = track.album.name if track.album else ""
+
+        tracks.append(
+            {
+                "name": track.name,
+                "artist": artist_name,
+                "album": album_name,
+                "duration_ms": track.duration_ms,
+            }
+        )
+    return tracks
 
 
 def extract_spotify_tracks(url: str) -> tuple[str, list[dict]]:
@@ -202,21 +278,7 @@ def extract_spotify_tracks(url: str) -> tuple[str, list[dict]]:
 
         playlist_name = playlist.name or "Imported Playlist"
         track_count = playlist.total_tracks or 0
-        tracks = []
-
-        for item in playlist.tracks:
-            track = item.track
-            artist_name = ", ".join(a.name for a in track.artists) or "Unknown"
-            album_name = track.album.name if track.album else ""
-
-            tracks.append(
-                {
-                    "name": track.name,
-                    "artist": artist_name,
-                    "album": album_name,
-                    "duration_ms": track.duration_ms,
-                }
-            )
+        tracks = _scraper_track_rows(playlist)
 
         # Flag the rare case where the scraper's own pagination came up short.
         if track_count and track_count > len(tracks):
@@ -233,17 +295,30 @@ def extract_spotify_tracks(url: str) -> tuple[str, list[dict]]:
 
 
 def _fuzzy_score(spotify_track: dict, ytm_track: dict) -> int:
-    """Compute a fuzzy match score between a Spotify track and a YTM result."""
+    """Compute a fuzzy match score between a Spotify track and a YTM result.
+
+    The pure core of the import matcher's candidate ranking: both sides
+    lowercased (the YTM title through the ``or ""`` truthiness gate, the
+    YTM artist through the formatting module's ``extract_artist``),
+    both ratios through the ``fuzz`` the [spotify] extra provides, and
+    the weighted sum — ``int(title_score * TITLE_MATCH_WEIGHT +
+    artist_score * ARTIST_MATCH_WEIGHT)`` — with the module's own
+    weights, so patched weights steer both backends identically.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_fuzzy_score``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    # fuzz / Console / Progress / etc. are conditionally imported under
+    # _HAS_SPOTIFY_DEPS at module top. Callers gate on _HAS_SPOTIFY_DEPS
+    # before reaching this code path; Pyright can't narrow through that
+    # so we suppress the possibly-unbound warning on each usage site.
     sp_title = spotify_track.get("name", "").lower()
     sp_artist = spotify_track.get("artist", "").lower()
 
     ytm_title = (ytm_track.get("title", "") or "").lower()
     ytm_artist = extract_artist(ytm_track).lower()
 
-    # fuzz / Console / Progress / etc. are conditionally imported under
-    # _HAS_SPOTIFY_DEPS at module top. Callers gate on _HAS_SPOTIFY_DEPS
-    # before reaching this code path; Pyright can't narrow through that
-    # so we suppress the possibly-unbound warning on each usage site.
     title_score = fuzz.ratio(sp_title, ytm_title)  # type: ignore[possibly-unbound]
     artist_score = fuzz.ratio(sp_artist, ytm_artist)  # type: ignore[possibly-unbound]
 
@@ -254,12 +329,61 @@ def _fuzzy_score(spotify_track: dict, ytm_track: dict) -> int:
 _MATCH_MAX_WORKERS = 5
 
 
+def _match_classification(spotify_track: dict, search_results: list[dict]) -> MatchResult:
+    """The score-sort-threshold verdict for one Spotify track's search.
+
+    The pure core of ``_search_and_score``'s post-search walk: the
+    empty-results gate first (answering a ``MatchType.NONE`` result
+    with the dataclass's own default ``candidates``/``selected``),
+    then every candidate scored through the ``_fuzzy_score`` engine,
+    the ``(score, candidate)`` pairs sorted best-first — stable, so
+    equal scores keep the search's own order — and the leading pair
+    gating the verdict: ``best_score >= AUTO_MATCH_THRESHOLD`` answers
+    a ``MatchType.EXACT`` result whose ``selected`` is the very
+    best-candidate object and whose ``candidates`` is the best-first
+    list, every other score a ``MatchType.MULTIPLE`` result over the
+    same list. The ``ytmusic.search`` call, the query build and the
+    exception arm that answers empty results for a failed search stay
+    in the wrapper.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_match_classification``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if not search_results:
+        return MatchResult(
+            spotify_track=spotify_track,
+            match_type=MatchType.NONE,
+        )
+
+    scored = [(_fuzzy_score(spotify_track, c), c) for c in search_results]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_candidate = scored[0]
+
+    if best_score >= AUTO_MATCH_THRESHOLD:
+        return MatchResult(
+            spotify_track=spotify_track,
+            match_type=MatchType.EXACT,
+            candidates=[c for _, c in scored],
+            selected=best_candidate,
+        )
+
+    return MatchResult(
+        spotify_track=spotify_track,
+        match_type=MatchType.MULTIPLE,
+        candidates=[c for _, c in scored],
+    )
+
+
 def _search_and_score(ytmusic: YTMusic, sp_track: dict, index: int) -> tuple[int, MatchResult]:
     """Search YTM for a single Spotify track and return (original_index, result).
 
     Designed to run inside a thread pool.  All data it touches is either
     thread-local (search_results, scored) or read-only (sp_track), so no
-    locking is needed.
+    locking is needed.  The match verdict itself is resolved by the
+    ``_match_classification`` engine (native when the Rust extension is
+    built, the pure-Python transcription otherwise); this wrapper owns
+    the query build, the search call and the failed-search arm.
     """
     query = f"{sp_track['name']} {sp_track['artist']}"
     try:
@@ -267,29 +391,7 @@ def _search_and_score(ytmusic: YTMusic, sp_track: dict, index: int) -> tuple[int
     except Exception:
         search_results = []
 
-    if not search_results:
-        return index, MatchResult(
-            spotify_track=sp_track,
-            match_type=MatchType.NONE,
-        )
-
-    scored = [(_fuzzy_score(sp_track, c), c) for c in search_results]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_candidate = scored[0]
-
-    if best_score >= AUTO_MATCH_THRESHOLD:
-        return index, MatchResult(
-            spotify_track=sp_track,
-            match_type=MatchType.EXACT,
-            candidates=[c for _, c in scored],
-            selected=best_candidate,
-        )
-
-    return index, MatchResult(
-        spotify_track=sp_track,
-        match_type=MatchType.MULTIPLE,
-        candidates=[c for _, c in scored],
-    )
+    return index, _match_classification(sp_track, search_results)
 
 
 def match_tracks(
@@ -328,7 +430,21 @@ def match_tracks(
 
 
 def _display_candidate(idx: int, candidate: dict) -> str:
-    """Format a single YTM candidate for display."""
+    """Format a single YTM candidate for display.
+
+    The pure core of the import prompt's candidate line: the title read
+    through the mapping's own ``get`` with the ``"?"`` default, the
+    artist and duration through the formatting module's
+    ``extract_artist``/``extract_duration`` engines (the duration
+    rendering through ``format_duration`` only for a truthy read), the
+    ``resultType`` read gating the `` [type]`` suffix (only a truthy
+    type that is not ``"song"`` earns it), and the whole line composed
+    through the reference's f-string shape.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_display_candidate``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
     title = candidate.get("title", "?")
     artist_str = extract_artist(candidate)
     dur_sec = extract_duration(candidate)
@@ -350,12 +466,36 @@ def _summarize_results(
     may be smaller than the confirmed count.
 
     Returns ``(confirmed_results, video_ids, skipped)``.
+
+    The confirmed/video-ids/skipped accounting itself — the ``is not None``
+    identity gate behind the confirmed walk, the ``len(results) -
+    len(confirmed)`` difference, and the truthy-selected ``get_video_id``
+    reads with the empty-id drop — is implemented by the Rust extension
+    (``_ytm_player_native.spotify_summarize_results``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
     confirmed = [r for r in results if r.selected is not None]
     skipped = len(results) - len(confirmed)
     video_ids = [get_video_id(r.selected) for r in confirmed if r.selected]
     video_ids = [vid for vid in video_ids if vid]  # Filter empty.
     return confirmed, video_ids, skipped
+
+
+def _bucket_results(results: list[MatchResult], match_type: MatchType) -> list[MatchResult]:
+    """The results whose match type equals *match_type*.
+
+    The pure core of the import flow's result categorisation: the
+    exact/multiple/none splits behind ``run_import``'s summary counts,
+    its interactive resolution steps and its still-none re-walk — each
+    a walk keeping every result whose ``match_type`` compares equal to
+    the given member, the results passing through as the very objects
+    they are, in the results' own order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_bucket_results``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return [r for r in results if r.match_type == match_type]
 
 
 def run_import(spotify_url: str, auth_file: Path) -> None:
@@ -399,9 +539,9 @@ def run_import(spotify_url: str, auth_file: Path) -> None:
     # Step 3: Search & match.
     results = match_tracks(ytmusic, spotify_tracks, console)
 
-    exact = [r for r in results if r.match_type == MatchType.EXACT]
-    multiple = [r for r in results if r.match_type == MatchType.MULTIPLE]
-    none_found = [r for r in results if r.match_type == MatchType.NONE]
+    exact = _bucket_results(results, MatchType.EXACT)
+    multiple = _bucket_results(results, MatchType.MULTIPLE)
+    none_found = _bucket_results(results, MatchType.NONE)
 
     console.print()
     console.print("Results:")
@@ -437,7 +577,7 @@ def run_import(spotify_url: str, auth_file: Path) -> None:
         console.print()
 
     # Step 5: Resolve "not found" tracks.
-    still_none = [r for r in results if r.match_type == MatchType.NONE]
+    still_none = _bucket_results(results, MatchType.NONE)
     for result in still_none:
         sp = result.spotify_track
         console.print(f'── [bold]"{sp["name"]}"[/bold] by {sp["artist"]} ──')
@@ -531,8 +671,36 @@ try:
     from ytm_player.utils._ytm_player_native import (
         parse_spotipy_item as _native_parse_spotipy_item,
     )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_bucket_results as _native_spotify_bucket_results,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_display_candidate as _native_spotify_display_candidate,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_fuzzy_score as _native_spotify_fuzzy_score,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_match_classification as _native_spotify_match_classification,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_page_items as _native_spotify_page_items,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_scraper_track_rows as _native_spotify_scraper_track_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_summarize_results as _native_spotify_summarize_results,
+    )
 except ImportError:
     pass
 else:
     _extract_playlist_id = _native_extract_playlist_id  # type: ignore[assignment]
     _parse_spotipy_item = _native_parse_spotipy_item  # type: ignore[assignment]
+    _fuzzy_score = _native_spotify_fuzzy_score  # type: ignore[assignment]
+    _match_classification = _native_spotify_match_classification  # type: ignore[assignment]
+    _page_items = _native_spotify_page_items  # type: ignore[assignment]
+    _scraper_track_rows = _native_spotify_scraper_track_rows  # type: ignore[assignment]
+    _display_candidate = _native_spotify_display_candidate  # type: ignore[assignment]
+    _summarize_results = _native_spotify_summarize_results  # type: ignore[assignment]
+    _bucket_results = _native_spotify_bucket_results  # type: ignore[assignment]

@@ -223,6 +223,26 @@ class TestFuzzyScore:
         score = si._fuzzy_score(_sp_track("X", "Y"), {"title": None, "artists": []})
         assert isinstance(score, int)
 
+    def test_the_fuzz_engine_is_read_at_call_time(self, monkeypatch):
+        # A patched fuzz steers whichever backend is loaded — the module
+        # attribute is the routing point both engines read.
+        class _Table:
+            @staticmethod
+            def ratio(a: str, b: str) -> int:
+                return 7 if a and b else 3
+
+        monkeypatch.setattr(si, "fuzz", _Table)
+        # Both ratios 7 → int(7 * 0.6 + 7 * 0.4) == 7.
+        assert si._fuzzy_score(_sp_track("A", "B"), _ytm_candidate("C", "D")) == 7
+
+    def test_the_weights_are_read_at_call_time(self, monkeypatch):
+        # Patched weights steer whichever backend is loaded identically.
+        monkeypatch.setattr(si, "TITLE_MATCH_WEIGHT", 1.0)
+        monkeypatch.setattr(si, "ARTIST_MATCH_WEIGHT", 0.0)
+        sp = _sp_track("Same", "Irrelevant")
+        # Title ratio 100 (identical), artist ratio whatever → 100.
+        assert si._fuzzy_score(sp, _ytm_candidate("Same", "zzzz")) == 100
+
 
 # ── _search_and_score ─────────────────────────────────────────────────
 
@@ -275,6 +295,87 @@ class TestSearchAndScore:
         si._search_and_score(ytm, _sp_track("My Song", "My Artist"), 0)
         called_query = ytm.search.call_args[0][0]
         assert "My Song" in called_query and "My Artist" in called_query
+
+
+# ── _match_classification (the post-search verdict) ───────────────────
+
+
+class TestMatchClassification:
+    """The classification engine behind _search_and_score's walk, on
+    whichever backend is loaded. The scripted _fuzzy_score patches below
+    steer both backends: the engine (and the fallback) resolve the
+    scorer through the module's own attribute at call time."""
+
+    def _script_scores(self, monkeypatch, table: dict[str, int]):
+        def fake_score(_sp, candidate):
+            return table[candidate["videoId"]]
+
+        monkeypatch.setattr(si, "_fuzzy_score", fake_score)
+
+    def test_empty_results_answer_none(self):
+        result = si._match_classification(_sp_track(), [])
+        assert result.match_type is si.MatchType.NONE
+        assert result.candidates == []
+        assert result.selected is None
+
+    def test_falsy_results_answer_none(self):
+        # The gate is truthiness: an empty mapping answers NONE too.
+        result = si._match_classification(_sp_track(), {})
+        assert result.match_type is si.MatchType.NONE
+
+    def test_best_first_exact_with_identity_selection(self, monkeypatch):
+        good = _ytm_candidate("Song A", "Artist A", video_id="good")
+        bad = _ytm_candidate("nope", "nope", video_id="bad")
+        self._script_scores(monkeypatch, {"good": 100, "bad": 10})
+        result = si._match_classification(_sp_track(), [bad, good])
+        assert result.match_type is si.MatchType.EXACT
+        assert result.selected is good  # the very object, not a copy
+        assert result.candidates[0] is good
+        assert result.candidates[1] is bad
+
+    def test_threshold_is_inclusive(self, monkeypatch):
+        cand = _ytm_candidate("Edge", "Case", video_id="e")
+        self._script_scores(monkeypatch, {"e": si.AUTO_MATCH_THRESHOLD})
+        result = si._match_classification(_sp_track(), [cand])
+        assert result.match_type is si.MatchType.EXACT
+
+    def test_below_threshold_answers_multiple(self, monkeypatch):
+        cand = _ytm_candidate("Edge", "Case", video_id="e")
+        self._script_scores(monkeypatch, {"e": si.AUTO_MATCH_THRESHOLD - 1})
+        result = si._match_classification(_sp_track(), [cand])
+        assert result.match_type is si.MatchType.MULTIPLE
+        assert result.selected is None
+        assert result.candidates == [cand]
+
+    def test_equal_scores_keep_first_seen_order(self, monkeypatch):
+        first = _ytm_candidate("Twin", "A", video_id="first")
+        second = _ytm_candidate("Twin", "B", video_id="second")
+        self._script_scores(monkeypatch, {"first": 90, "second": 90})
+        result = si._match_classification(_sp_track(), [first, second])
+        # list.sort(key=..., reverse=True) is stable: ties keep input order.
+        assert result.candidates[0] is first
+        assert result.candidates[1] is second
+
+    def test_spotify_track_passes_through_by_identity(self, monkeypatch):
+        sp = _sp_track("Identity", "Check")
+        self._script_scores(monkeypatch, {})
+        result = si._match_classification(sp, [])
+        assert result.spotify_track is sp
+
+    def test_the_scorer_is_read_at_call_time(self, monkeypatch):
+        # Patching si._fuzzy_score steers the classification on whichever
+        # backend is loaded — the routing point both engines share.
+        calls: list[dict] = []
+
+        def fake_score(sp, candidate):
+            calls.append(candidate)
+            return 100
+
+        monkeypatch.setattr(si, "_fuzzy_score", fake_score)
+        candidates = [_ytm_candidate(video_id="x"), _ytm_candidate(video_id="y")]
+        result = si._match_classification(_sp_track(), candidates)
+        assert result.match_type is si.MatchType.EXACT
+        assert calls == candidates
 
 
 # ── match_tracks (aggregation + ordering) ─────────────────────────────
@@ -352,6 +453,16 @@ class TestDisplayCandidate:
         line = si._display_candidate(1, _ytm_candidate(result_type="song"))
         assert "[song]" not in line
 
+    def test_the_line_shape_is_pinned_exactly(self):
+        # The reference's f-string: two leading spaces, "<idx>. ", the
+        # em dash around the artist, the duration in parens.
+        line = si._display_candidate(3, _ytm_candidate("T", "A", duration=65))
+        assert line == "  3. T — A (1:05)"
+
+    def test_a_missing_title_reads_the_question_mark_default(self):
+        line = si._display_candidate(1, {"artists": [{"name": "A"}]})
+        assert line.startswith("  1. ? — A (")
+
 
 # ── _summarize_results (accounting — off-by-99 / partial-failure) ─────
 
@@ -405,6 +516,83 @@ class TestSummarizeResults:
         ]
         _, video_ids, _ = si._summarize_results(results)
         assert video_ids == ["camel", "snake"]
+
+    def test_confirmed_results_pass_through_by_identity(self):
+        # The very objects, not copies — run_import mutates them later.
+        results = [
+            _make_result({"videoId": "a"}),
+            _make_result(None, si.MatchType.NONE),
+            _make_result({"videoId": "b"}),
+        ]
+        confirmed, _, _ = si._summarize_results(results)
+        assert confirmed[0] is results[0]
+        assert confirmed[1] is results[2]
+
+    def test_a_selected_without_a_dict_shape_raises_like_the_reference(self):
+        # A truthy non-dict selection is outside the ported contract; the
+        # native engine answers its TypeError where the fallback answers
+        # the duck-typed AttributeError — both refuse it.
+        result = _make_result("not-a-dict")
+        with pytest.raises((TypeError, AttributeError)):
+            si._summarize_results([result])
+
+
+# ── _bucket_results (the match-type bucket walk) ─────────────────────
+
+
+class TestBucketResults:
+    def test_buckets_split_by_match_type(self):
+        exact = _make_result({"videoId": "a"})
+        multiple = _make_result(None, si.MatchType.MULTIPLE)
+        none_ = _make_result(None, si.MatchType.NONE)
+        results = [exact, none_, multiple]
+        assert si._bucket_results(results, si.MatchType.EXACT) == [exact]
+        assert si._bucket_results(results, si.MatchType.MULTIPLE) == [multiple]
+        assert si._bucket_results(results, si.MatchType.NONE) == [none_]
+
+    def test_results_pass_through_by_identity_in_order(self):
+        first = _make_result(None, si.MatchType.NONE)
+        second = _make_result(None, si.MatchType.NONE)
+        interloper = _make_result({"videoId": "x"})
+        bucket = si._bucket_results([first, interloper, second], si.MatchType.NONE)
+        assert bucket == [first, second]
+        assert bucket[0] is first and bucket[1] is second
+
+    def test_empty_results_answer_empty(self):
+        assert si._bucket_results([], si.MatchType.EXACT) == []
+
+
+# ── _page_items (one page of the spotipy pagination walk) ────────────
+
+
+class TestPageItems:
+    def test_parses_one_pages_items(self):
+        page = {"items": [{"track": _item("A", "X")}, {"track": _item("B", "Y")}]}
+        rows = si._page_items(page)
+        assert [r["name"] for r in rows] == ["A", "B"]
+
+    def test_falsy_parses_are_dropped(self):
+        page = {"items": [{"track": None}, {"track": {}}, {"track": _item("V", "A")}]}
+        rows = si._page_items(page)
+        assert [r["name"] for r in rows] == ["V"]
+
+    def test_a_missing_items_key_answers_no_rows(self):
+        assert si._page_items({}) == []
+        assert si._page_items({"next": "url"}) == []
+
+    def test_an_empty_items_list_answers_no_rows(self):
+        assert si._page_items({"items": []}) == []
+
+    def test_a_non_iterable_items_member_raises_the_iteration_error(self):
+        with pytest.raises(TypeError):
+            si._page_items({"items": 5})
+
+    def test_the_parse_engine_is_read_at_call_time(self, monkeypatch):
+        # Patching _parse_spotipy_item steers the walk on whichever
+        # backend is loaded — the routing point both engines share.
+        monkeypatch.setattr(si, "_parse_spotipy_item", lambda item: {"name": "patched"})
+        rows = si._page_items({"items": [{"track": _item("A", "X")}]})
+        assert rows == [{"name": "patched"}]
 
 
 # ── extract_spotify_tracks_spotipy (Web API path) ─────────────────────
@@ -525,6 +713,85 @@ def _install_fake_scraper(monkeypatch, playlist):
     mod.SpotifyClient = MagicMock(return_value=client)  # type: ignore[attr-defined]
     monkeypatch.setitem(__import__("sys").modules, "spotify_scraper", mod)
     return client
+
+
+class TestScraperTrackRows:
+    def test_rows_carry_the_four_keys_in_order(self):
+        playlist = _scraper_playlist("PL", 1, [_scraper_item("S", "A")])
+        rows = si._scraper_track_rows(playlist)
+        assert rows == [{"name": "S", "artist": "A", "album": "Al", "duration_ms": 1000}]
+        assert list(rows[0]) == ["name", "artist", "album", "duration_ms"]
+
+    def test_multiple_artists_join_with_comma_space(self):
+        track = types.SimpleNamespace(
+            name="Collab",
+            duration_ms=1000,
+            artists=(
+                types.SimpleNamespace(name="First"),
+                types.SimpleNamespace(name="Second"),
+            ),
+            album=types.SimpleNamespace(name="Album"),
+        )
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        assert si._scraper_track_rows(playlist)[0]["artist"] == "First, Second"
+
+    def test_no_artists_answer_unknown(self):
+        track = types.SimpleNamespace(name="Solo", duration_ms=1000, artists=(), album=None)
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        rows = si._scraper_track_rows(playlist)
+        assert rows[0]["artist"] == "Unknown"
+        assert rows[0]["album"] == ""
+
+    def test_a_falsy_album_answers_the_empty_string(self):
+        # A present-but-falsy album (not just None) reads as "".
+        track = types.SimpleNamespace(
+            name="N", duration_ms=1, artists=(types.SimpleNamespace(name="A"),), album=[]
+        )
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        assert si._scraper_track_rows(playlist)[0]["album"] == ""
+
+    def test_a_truthy_album_without_a_name_raises(self):
+        track = types.SimpleNamespace(
+            name="N",
+            duration_ms=1,
+            artists=(types.SimpleNamespace(name="A"),),
+            album=types.SimpleNamespace(poster="x"),
+        )
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        with pytest.raises(AttributeError):
+            si._scraper_track_rows(playlist)
+
+    def test_a_non_string_artist_name_raises_the_joins_own_error(self):
+        track = types.SimpleNamespace(
+            name="N", duration_ms=1, artists=(types.SimpleNamespace(name=5),), album=None
+        )
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        with pytest.raises(TypeError):
+            si._scraper_track_rows(playlist)
+
+    def test_values_pass_through_as_the_objects_they_are(self):
+        track = types.SimpleNamespace(
+            name="N",
+            duration_ms=180_000,
+            artists=(types.SimpleNamespace(name="A"),),
+            album=types.SimpleNamespace(name="Al"),
+        )
+        playlist = types.SimpleNamespace(
+            name="PL", total_tracks=1, tracks=(types.SimpleNamespace(track=track),)
+        )
+        rows = si._scraper_track_rows(playlist)
+        assert rows[0]["name"] is track.name
+        assert rows[0]["duration_ms"] is track.duration_ms
 
 
 class TestExtractDispatcher:
@@ -735,10 +1002,24 @@ class TestMatchingCoresNativeParity:
         from ytm_player.utils._ytm_player_native import (
             extract_playlist_id,
             parse_spotipy_item,
+            spotify_bucket_results,
+            spotify_display_candidate,
+            spotify_fuzzy_score,
+            spotify_match_classification,
+            spotify_page_items,
+            spotify_scraper_track_rows,
+            spotify_summarize_results,
         )
 
         assert si._extract_playlist_id is extract_playlist_id
         assert si._parse_spotipy_item is parse_spotipy_item
+        assert si._fuzzy_score is spotify_fuzzy_score
+        assert si._match_classification is spotify_match_classification
+        assert si._page_items is spotify_page_items
+        assert si._scraper_track_rows is spotify_scraper_track_rows
+        assert si._display_candidate is spotify_display_candidate
+        assert si._summarize_results is spotify_summarize_results
+        assert si._bucket_results is spotify_bucket_results
 
     def test_url_zoo_contracts(self):
         """Pin the shared contract on whichever backend is loaded."""
@@ -786,3 +1067,501 @@ class TestMatchingCoresNativeParity:
         # name passes through, a non-dict album is "".
         assert si._parse_spotipy_item({"track": {"name": "N", "album": {}}})["album"] == ""
         assert si._parse_spotipy_item({"track": {"name": "N", "album": "S"}})["album"] == ""
+
+
+# ── native vs fallback parity: the matching pipeline ──────────────────
+
+# The pipeline parity cases, JSON-round-trippable, keyed by engine. The
+# child interpreter runs the pure-Python transcriptions with the
+# extension import blocked (and the same deterministic fuzz stand-in the
+# autouse fixture installs here); the parent runs the native engines the
+# module's tail bound. Cases that raise pin the error shape too.
+_PIPELINE_CASES = {
+    "fuzzy": [
+        # (spotify_track, ytm_candidate) pairs.
+        [
+            {"name": "Song A", "artist": "Artist A"},
+            {"title": "Song A", "artists": [{"name": "Artist A"}]},
+        ],
+        [
+            {"name": "Hypnotize", "artist": "The Notorious B.I.G."},
+            {"title": "Hypnotize", "artists": [{"name": "Notorious B.I.G."}]},
+        ],
+        [
+            {"name": "Ünïcode Şong", "artist": "Årtist"},
+            {"title": "üNÏCODE şONG", "artists": [{"name": "åRTIST"}]},
+        ],
+        # The .get("") defaults for a keyless Spotify track.
+        [{}, {"title": "Whatever", "artists": [{"name": "X"}]}],
+        # The or-"" gate over a present-None title, and extract_artist's
+        # no-artists "Unknown".
+        [{"name": "X", "artist": "Y"}, {"title": None, "artists": []}],
+        # The direct-artist spelling.
+        [{"name": "Direct", "artist": "Solo"}, {"title": "Direct", "artist": "Solo"}],
+        # extract_artist's view-count pseudo-artist exclusion.
+        [
+            {"name": "T", "artist": "Real"},
+            {
+                "title": "T",
+                "artists": [{"name": "358K views"}, {"name": "Real"}],
+                "views": "358K views",
+            },
+        ],
+        # A non-string title reaches .lower() and raises on both sides.
+        [{"name": "N", "artist": "A"}, {"title": 123, "artists": []}],
+    ],
+    "classification": [
+        # (spotify_track, search_results) pairs.
+        [{"name": "Song A", "artist": "Artist A"}, []],
+        [
+            {"name": "Song A", "artist": "Artist A"},
+            [{"title": "Song A", "artists": [{"name": "Artist A"}], "videoId": "a"}],
+        ],
+        [
+            {"name": "Song A", "artist": "Artist A"},
+            [{"title": "nothing alike", "artists": [{"name": "different"}], "videoId": "b"}],
+        ],
+        # Best-first ordering with a mixed-quality field.
+        [
+            {"name": "Song A", "artist": "Artist A"},
+            [
+                {"title": "nothing alike", "artists": [{"name": "different"}], "videoId": "bad"},
+                {"title": "Song A", "artists": [{"name": "Artist A"}], "videoId": "good"},
+            ],
+        ],
+        # Unicode on both sides.
+        [
+            {"name": "Ünïcode Şong", "artist": "Årtist"},
+            [
+                {"title": "üNÏCODE şONG", "artists": [{"name": "åRTIST"}], "videoId": "u"},
+                {"title": "other", "artists": [{"name": "other"}], "videoId": "o"},
+            ],
+        ],
+        # A non-dict candidate reaches the scorer's .get and raises.
+        [{"name": "N", "artist": "A"}, ["not-a-dict"]],
+    ],
+    "page": [
+        # One page dict per case.
+        {"items": [{"track": {"name": "A", "artists": [{"name": "X"}], "duration_ms": 1000}}]},
+        {"items": []},
+        {},
+        {
+            "items": [
+                {"track": None},
+                {"track": {}},
+                {"track": {"name": "V", "artists": []}},
+            ]
+        },
+        {"items": 5},
+        {
+            "items": [
+                {
+                    "track": {
+                        "name": "Ünïcode Şong",
+                        "artists": [{"name": "Å"}],
+                        "duration_ms": None,
+                    }
+                }
+            ]
+        },
+    ],
+    "scraper": [
+        # Playlist descriptors: a list of track descriptors each carrying
+        # name / artists (a list of names) / album (name or null) /
+        # duration_ms. The child and the parent build the same
+        # SimpleNamespace stand-ins from them.
+        {
+            "tracks": [
+                {
+                    "name": "S",
+                    "artists": ["A"],
+                    "album": {"name": "Al"},
+                    "duration_ms": 1000,
+                }
+            ]
+        },
+        {
+            "tracks": [
+                {
+                    "name": "Collab",
+                    "artists": ["First", "Second"],
+                    "album": {"name": "Album"},
+                    "duration_ms": 180_000,
+                }
+            ]
+        },
+        {"tracks": [{"name": "Solo", "artists": [], "album": None, "duration_ms": 5}]},
+        {
+            "tracks": [
+                {"name": "One", "artists": ["A"], "album": {"name": "Al"}, "duration_ms": 1},
+                {"name": "Two", "artists": ["B"], "album": None, "duration_ms": 2},
+            ]
+        },
+        # A non-string artist name reaches the join and raises on both
+        # sides.
+        {"tracks": [{"name": "N", "artists": [5], "album": None, "duration_ms": 1}]},
+    ],
+    "display": [
+        # (idx, candidate) pairs.
+        [1, {"title": "Track", "artists": [{"name": "Band"}], "duration_seconds": 125}],
+        [2, {"title": "T", "artists": [{"name": "A"}]}],
+        [
+            3,
+            {
+                "title": "T",
+                "artists": [{"name": "A"}],
+                "duration_seconds": 65,
+                "resultType": "video",
+            },
+        ],
+        [
+            0,
+            {
+                "title": "T",
+                "artists": [{"name": "A"}],
+                "duration_seconds": 65,
+                "resultType": "song",
+            },
+        ],
+        # A non-int idx just interpolates; an hours-long duration renders
+        # the H:MM:SS shape.
+        ["x", {"title": "T", "artists": [{"name": "A"}], "duration_seconds": 3725}],
+        [1, {"artists": [{"name": "A"}]}],
+        [1, {"title": "Ünïcode", "artists": [{"name": "Årtist"}], "duration_seconds": 5}],
+    ],
+    "summarize": [
+        # One list of MatchResult descriptors per case.
+        [],
+        [
+            {
+                "spotify_track": {"name": "A", "artist": "X"},
+                "match_type": "exact",
+                "selected": {"videoId": "v0"},
+                "candidates": [],
+            },
+            {
+                "spotify_track": {"name": "B", "artist": "Y"},
+                "match_type": "exact",
+                "selected": {"videoId": "v1"},
+                "candidates": [],
+            },
+        ],
+        [
+            {
+                "spotify_track": {"name": "A", "artist": "X"},
+                "match_type": "exact",
+                "selected": {"videoId": "keep"},
+                "candidates": [],
+            },
+            {
+                "spotify_track": {"name": "B", "artist": "Y"},
+                "match_type": "none",
+                "selected": None,
+                "candidates": [],
+            },
+        ],
+        # A confirmed-but-empty video ID drops out without counting as a
+        # skip.
+        [
+            {
+                "spotify_track": {"name": "A", "artist": "X"},
+                "match_type": "exact",
+                "selected": {"videoId": ""},
+                "candidates": [],
+            }
+        ],
+        # Both key conventions.
+        [
+            {
+                "spotify_track": {"name": "A", "artist": "X"},
+                "match_type": "exact",
+                "selected": {"video_id": "snake"},
+                "candidates": [],
+            }
+        ],
+    ],
+    "bucket": [
+        # (list of MatchResult descriptors, match-type name) pairs.
+        [
+            [
+                {
+                    "spotify_track": {"name": "A", "artist": "X"},
+                    "match_type": "exact",
+                    "selected": {"videoId": "a"},
+                    "candidates": [],
+                },
+                {
+                    "spotify_track": {"name": "B", "artist": "Y"},
+                    "match_type": "none",
+                    "selected": None,
+                    "candidates": [],
+                },
+                {
+                    "spotify_track": {"name": "C", "artist": "Z"},
+                    "match_type": "multiple",
+                    "selected": None,
+                    "candidates": [{"title": "c"}],
+                },
+            ],
+            "exact",
+        ],
+        [
+            [
+                {
+                    "spotify_track": {"name": "A", "artist": "X"},
+                    "match_type": "exact",
+                    "selected": {"videoId": "a"},
+                    "candidates": [],
+                },
+                {
+                    "spotify_track": {"name": "B", "artist": "Y"},
+                    "match_type": "none",
+                    "selected": None,
+                    "candidates": [],
+                },
+            ],
+            "none",
+        ],
+        [[], "multiple"],
+    ],
+}
+
+_PIPELINE_CHILD_PROG = """
+import json
+import sys
+import types
+from difflib import SequenceMatcher
+
+sys.modules['ytm_player.utils._ytm_player_native'] = None
+
+from ytm_player.services import spotify_import as si
+
+
+class _Fuzz:
+    @staticmethod
+    def ratio(a, b):
+        return int(round(SequenceMatcher(None, a, b).ratio() * 100))
+
+
+si.fuzz = _Fuzz
+
+
+def _result_from_desc(d):
+    return si.MatchResult(
+        spotify_track=d["spotify_track"],
+        match_type=getattr(si.MatchType, d["match_type"].upper()),
+        candidates=d.get("candidates", []),
+        selected=d.get("selected"),
+    )
+
+
+def _desc_result(r):
+    return {
+        "spotify_track": r.spotify_track,
+        "match_type": r.match_type.value,
+        "candidates": r.candidates,
+        "selected": r.selected,
+    }
+
+
+def _playlist_from_desc(d):
+    def _track_from(t):
+        return types.SimpleNamespace(track=types.SimpleNamespace(
+            name=t["name"],
+            artists=tuple(types.SimpleNamespace(name=a) for a in t["artists"]),
+            album=types.SimpleNamespace(name=t["album"]["name"]) if t["album"] else None,
+            duration_ms=t["duration_ms"],
+        ))
+
+    return types.SimpleNamespace(tracks=tuple(_track_from(t) for t in d["tracks"]))
+
+
+def _outcome(fn, *args):
+    try:
+        result = fn(*args)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+payload = json.load(sys.stdin)
+out = {
+    "fuzzy": [_outcome(si._fuzzy_score, sp, ytm) for sp, ytm in payload["fuzzy"]],
+    "classification": [],
+    "page": [_outcome(si._page_items, page) for page in payload["page"]],
+    "scraper": [
+        _outcome(si._scraper_track_rows, _playlist_from_desc(p)) for p in payload["scraper"]
+    ],
+    "display": [_outcome(si._display_candidate, idx, c) for idx, c in payload["display"]],
+    "summarize": [],
+    "bucket": [],
+}
+for sp, candidates in payload["classification"]:
+    r = _outcome(si._match_classification, sp, candidates)
+    if "ok" in r:
+        r = {"ok": _desc_result(r["ok"])}
+    out["classification"].append(r)
+for results in payload["summarize"]:
+    r = _outcome(si._summarize_results, [_result_from_desc(d) for d in results])
+    if "ok" in r:
+        confirmed, video_ids, skipped = r["ok"]
+        r = {
+            "ok": {
+                "confirmed": [_desc_result(c) for c in confirmed],
+                "video_ids": video_ids,
+                "skipped": skipped,
+            }
+        }
+    out["summarize"].append(r)
+for results, match_type in payload["bucket"]:
+    r = _outcome(
+        si._bucket_results,
+        [_result_from_desc(d) for d in results],
+        getattr(si.MatchType, match_type.upper()),
+    )
+    if "ok" in r:
+        r = {"ok": [_desc_result(x) for x in r["ok"]]}
+    out["bucket"].append(r)
+json.dump(out, sys.stdout)
+"""
+
+
+def _pipeline_result_from_desc(d: dict) -> si.MatchResult:
+    return si.MatchResult(
+        spotify_track=d["spotify_track"],
+        match_type=getattr(si.MatchType, d["match_type"].upper()),
+        candidates=d.get("candidates", []),
+        selected=d.get("selected"),
+    )
+
+
+def _pipeline_desc_result(r: si.MatchResult) -> dict:
+    return {
+        "spotify_track": r.spotify_track,
+        "match_type": r.match_type.value,
+        "candidates": r.candidates,
+        "selected": r.selected,
+    }
+
+
+def _pipeline_playlist_from_desc(d: dict):
+    def _track_from(t):
+        return types.SimpleNamespace(
+            track=types.SimpleNamespace(
+                name=t["name"],
+                artists=tuple(types.SimpleNamespace(name=a) for a in t["artists"]),
+                album=types.SimpleNamespace(name=t["album"]["name"]) if t["album"] else None,
+                duration_ms=t["duration_ms"],
+            )
+        )
+
+    return types.SimpleNamespace(tracks=tuple(_track_from(t) for t in d["tracks"]))
+
+
+def _pipeline_outcome(fn, *args):
+    try:
+        result = fn(*args)
+    except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def _native_pipeline_outcomes() -> dict:
+    cases = _PIPELINE_CASES
+    out = {
+        "fuzzy": [_pipeline_outcome(si._fuzzy_score, sp, ytm) for sp, ytm in cases["fuzzy"]],
+        "classification": [],
+        "page": [_pipeline_outcome(si._page_items, page) for page in cases["page"]],
+        "scraper": [
+            _pipeline_outcome(si._scraper_track_rows, _pipeline_playlist_from_desc(p))
+            for p in cases["scraper"]
+        ],
+        "display": [
+            _pipeline_outcome(si._display_candidate, idx, c) for idx, c in cases["display"]
+        ],
+        "summarize": [],
+        "bucket": [],
+    }
+    for sp, candidates in cases["classification"]:
+        r = _pipeline_outcome(si._match_classification, sp, candidates)
+        if "ok" in r:
+            r = {"ok": _pipeline_desc_result(r["ok"])}
+        out["classification"].append(r)
+    for results in cases["summarize"]:
+        r = _pipeline_outcome(
+            si._summarize_results, [_pipeline_result_from_desc(d) for d in results]
+        )
+        if "ok" in r:
+            confirmed, video_ids, skipped = r["ok"]
+            r = {
+                "ok": {
+                    "confirmed": [_pipeline_desc_result(c) for c in confirmed],
+                    "video_ids": video_ids,
+                    "skipped": skipped,
+                }
+            }
+        out["summarize"].append(r)
+    for results, match_type in cases["bucket"]:
+        r = _pipeline_outcome(
+            si._bucket_results,
+            [_pipeline_result_from_desc(d) for d in results],
+            getattr(si.MatchType, match_type.upper()),
+        )
+        if "ok" in r:
+            r = {"ok": [_pipeline_desc_result(x) for x in r["ok"]]}
+        out["bucket"].append(r)
+    return out
+
+
+class TestMatchingPipelineNativeParity:
+    """The matching-pipeline engines, on the child-interpreter pattern
+    the other parity tests use: the fallback runs with the extension
+    import blocked (and the same deterministic fuzz stand-in), so both
+    implementations are compared directly instead of trusting whichever
+    one the test process loaded — verdicts, orders, descriptors and
+    error shapes included.
+    """
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_pipeline_engines_match_fallback(self):
+        result = subprocess.run(
+            [sys.executable, "-c", _PIPELINE_CHILD_PROG],
+            input=json.dumps(_PIPELINE_CASES),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fallback = json.loads(result.stdout)
+        native = _native_pipeline_outcomes()
+        assert set(native) == set(fallback) == set(_PIPELINE_CASES)
+        for engine, cases in _PIPELINE_CASES.items():
+            assert len(native[engine]) == len(fallback[engine]) == len(cases)
+            for case, n, f in zip(cases, native[engine], fallback[engine]):
+                assert n == f, (
+                    f"native and fallback {engine} differ for {case!r}:\n"
+                    f"native:   {n!r}\n"
+                    f"fallback: {f!r}"
+                )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_classification_sort_is_cpythons_own(self, monkeypatch):
+        """The sort the classification engine runs is CPython's own
+        stable reverse ordering: ties keep the search's order even when
+        the scores come from a patched scorer (routed through the module
+        attribute both engines read)."""
+        order: list[str] = []
+
+        def fake_score(_sp, candidate):
+            order.append(candidate["videoId"])
+            return 90
+
+        monkeypatch.setattr(si, "_fuzzy_score", fake_score)
+        candidates = [
+            _ytm_candidate("T", "A", video_id="first"),
+            _ytm_candidate("T", "A", video_id="second"),
+            _ytm_candidate("T", "A", video_id="third"),
+        ]
+        result = si._match_classification(_sp_track(), candidates)
+        assert [c["videoId"] for c in result.candidates] == ["first", "second", "third"]
+        # Every candidate was scored, in the search's own order.
+        assert order == ["first", "second", "third"]
