@@ -705,11 +705,15 @@ class TestWritePrefsFile:
         # The engine drives read/write through the path object's own
         # methods, so a recording Path subclass steers both backends
         # identically — the same contract the cache walk engines keep.
+        # Subclass the CONCRETE flavour class (what tmp_path already is):
+        # 3.10's pathlib instantiates subclasses of the flavour-agnostic
+        # Path through the class's own _flavour attribute, which the
+        # dispatcher base never defines — only PosixPath/WindowsPath do.
         from pathlib import Path
 
         calls: list[str] = []
 
-        class RecordingPath(Path):
+        class RecordingPath(type(tmp_path)):
             def read_text(self, encoding=None, **kwargs):
                 calls.append("read_text")
                 return Path.read_text(self, encoding=encoding, **kwargs)

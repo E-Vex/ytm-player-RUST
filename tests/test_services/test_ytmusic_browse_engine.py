@@ -356,7 +356,12 @@ class TestChartShelfIndex:
         assert _chart_shelf_index(2, 1) == 0
 
     def test_zero_count_raises_the_modulos_own_error(self):
-        with pytest.raises(ZeroDivisionError, match="integer modulo by zero"):
+        # CPython's own wording for the message differs across the
+        # supported range (3.10 and 3.15 spell it "integer division or
+        # modulo by zero", 3.12 "integer modulo by zero"); the contract
+        # is the modulo's own ZeroDivisionError surfacing verbatim, so
+        # both historical spellings match.
+        with pytest.raises(ZeroDivisionError, match=r"integer (?:division or )?modulo by zero"):
             _chart_shelf_index(2, 0)
 
     def test_floats_and_bools_steer_through_the_operators(self):

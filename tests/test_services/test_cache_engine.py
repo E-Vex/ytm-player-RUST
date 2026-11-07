@@ -470,12 +470,14 @@ class TestStatusSummary:
     """The four-key usage summary behind ``get_status``."""
 
     def test_the_payload_in_insertion_order(self):
+        # The dir renders through the platform's own str(Path) — a
+        # POSIX-literal "/cache" would only hold on POSIX runners.
         summary = _status_summary(500, 3, 2, Path("/cache"))
         assert summary == {
             "total_size": 500,
             "file_count": 3,
             "max_size": 2 * 1024 * 1024,
-            "cache_dir": "/cache",
+            "cache_dir": str(Path("/cache")),
         }
         assert list(summary) == ["total_size", "file_count", "max_size", "cache_dir"]
 
@@ -529,7 +531,7 @@ class TestIndexInsertStatement:
         sql, params = _index_insert_statement(video_id, path, file_size, fmt)
         assert len(params) == 4
         assert params[0] is video_id
-        assert params[1] == "/cache/v.opus"
+        assert params[1] == str(Path("/cache/v.opus"))
         assert params[2] is file_size
         assert params[3] is fmt
 
@@ -553,7 +555,8 @@ class TestIndexInsertStatement:
 
     def test_prepare_and_bind_round_trip(self):
         # The exact (sql, params) pair binds against the real schema'd
-        # index — the same table init's executescript builds.
+        # index — the same table init's executescript builds. The bound
+        # file path is the platform's own str(Path) spelling.
         conn = sqlite3.connect(":memory:")
         conn.executescript(_cache_schema())
         sql, params = _index_insert_statement("vid", Path("/c/vid.opus"), 12, "opus")
@@ -561,7 +564,7 @@ class TestIndexInsertStatement:
         row = conn.execute(
             "SELECT video_id, file_path, file_size, format FROM cache_index"
         ).fetchone()
-        assert tuple(row) == ("vid", "/c/vid.opus", 12, "opus")
+        assert tuple(row) == ("vid", str(Path("/c/vid.opus")), 12, "opus")
         conn.close()
 
 

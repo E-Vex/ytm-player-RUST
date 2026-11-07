@@ -98,7 +98,11 @@ class TestFindBrewLibmpv:
         brew_dirs((tmp_path / "missing",))
         assert _find_brew_libmpv() is None
 
-    def test_finds_linux_so(self, brew_dirs, tmp_path):
+    def test_finds_linux_so(self, monkeypatch, brew_dirs, tmp_path):
+        # The .so pattern pair is the non-darwin arm; pin the platform
+        # so the test holds on macOS runners too (the dylib test pins
+        # "darwin" the same way for the other arm).
+        monkeypatch.setattr(sys, "platform", "linux")
         lib = tmp_path / "libmpv.so.2"
         lib.touch()
         brew_dirs((tmp_path,))
@@ -111,7 +115,8 @@ class TestFindBrewLibmpv:
         brew_dirs((tmp_path,))
         assert _find_brew_libmpv() == str(lib)
 
-    def test_prefers_the_unversioned_name(self, brew_dirs, tmp_path):
+    def test_prefers_the_unversioned_name(self, monkeypatch, brew_dirs, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
         # The pattern order decides — libmpv.so before libmpv.so.*.
         (tmp_path / "libmpv.so.2").touch()
         plain = tmp_path / "libmpv.so"
@@ -125,7 +130,8 @@ class TestFindBrewLibmpv:
         brew_dirs((tmp_path,))
         assert _find_brew_libmpv() is None
 
-    def test_skips_non_dir_entries(self, brew_dirs, tmp_path):
+    def test_skips_non_dir_entries(self, monkeypatch, brew_dirs, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
         a_file = tmp_path / "afile"
         a_file.touch()
         real = tmp_path / "real"
@@ -134,7 +140,8 @@ class TestFindBrewLibmpv:
         brew_dirs((a_file, real))
         assert _find_brew_libmpv() == str(real / "libmpv.so")
 
-    def test_the_first_prefix_with_a_hit_wins(self, brew_dirs, tmp_path):
+    def test_the_first_prefix_with_a_hit_wins(self, monkeypatch, brew_dirs, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
         first = tmp_path / "first"
         second = tmp_path / "second"
         first.mkdir()
@@ -144,7 +151,9 @@ class TestFindBrewLibmpv:
         brew_dirs((second, first))
         assert _find_brew_libmpv() == str(second / "libmpv.so")
 
-    def test_an_oserror_from_a_prefix_continues_to_the_next(self, brew_dirs, tmp_path):
+    def test_an_oserror_from_a_prefix_continues_to_the_next(self, monkeypatch, brew_dirs, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
+
         def _raising_glob(_pattern):
             raise OSError("probe failed")
 

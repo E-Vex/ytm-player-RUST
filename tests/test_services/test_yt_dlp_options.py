@@ -349,7 +349,11 @@ class TestApplyConfiguredWrapper:
         with caplog.at_level(logging.WARNING):
             opts = apply_configured_yt_dlp_options({"quiet": True}, settings)
         assert opts["compat_opts"] == {"no-certifi"}
-        assert caplog.text.count("ca_bundle does not exist: /nonexistent/ca.pem") == 1
+        # The warned path is the configured bundle after the settings'
+        # own normalization (str(Path) — backslash-separated on Windows
+        # runners), so the expected message renders the same way.
+        missing = str(Path("/nonexistent/ca.pem").expanduser())
+        assert caplog.text.count(f"ca_bundle does not exist: {missing}") == 1
 
 
 # ── native vs fallback parity ────────────────────────────────────────
