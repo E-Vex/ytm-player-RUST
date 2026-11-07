@@ -1,13 +1,16 @@
 name: CI
 
-# Fork note: this repository is a fork, and a fork inherits its
-# workflow registrations from the parent at fork time — push events
-# never started CI here before this file was committed to the fork's
-# own default branch (every recorded run before this commit was a
-# manual workflow_dispatch; scheduled triggers never fired either,
-# which is fork-default). This commit re-registers the push trigger;
-# workflow_dispatch stays below as the always-available manual
-# fallback.
+# Fork note (verified 2026-11-07): the branch filters below were never
+# broken — the "aster, dev]" reading is a terminal display artifact
+# (the `[m` pair renders as an ANSI reset and gets swallowed by cat /
+# git log -p output). What IS true: push events have never started CI
+# on this fork (every recorded run is a manual workflow_dispatch),
+# while the same workflow triggers fine on the parent repo, and the
+# suppression survives a valid filter, an active workflow state, an
+# explicit enable call, and committing this file to the default
+# branch — a server-side fork state, not a file problem. Until it is
+# resolved (delete-all-runs + the fork's green "enable" button, or
+# GitHub Support), workflow_dispatch below is the reliable trigger.
 on:
   workflow_dispatch:
   push:
