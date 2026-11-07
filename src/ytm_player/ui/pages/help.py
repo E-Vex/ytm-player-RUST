@@ -1,4 +1,13 @@
-"""Searchable keybinding reference page."""
+"""Searchable keybinding reference page.
+
+The page's row engines — the all-rows list (the keymap walk, the
+description lookups and the row formatting, fused into one call) and
+the filtered walk — are implemented by the Rust extension
+(``_ytm_player_native``) when it is built and by the pure-Python
+transcriptions in this module otherwise; the bottom-of-module seam
+rebinds the engines to the native functions when the extension is
+importable. The methods below only do I/O and rendering.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +19,7 @@ from textual.reactive import reactive
 from textual.widget import Widget
 from textual.widgets import DataTable, Input, Label
 
-from ytm_player.config.keymap import Action, get_keymap
+from ytm_player.config.keymap import Action, KeyMap, get_keymap
 
 logger = logging.getLogger(__name__)
 
@@ -174,21 +183,24 @@ def _format_action_name(action: Action) -> str:
 def _rows_from_spec(
     spec: list[tuple[str, str, str, list[str]]],
 ) -> list[tuple[str, str, str, str]]:
-    """The all-rows list — the ``_build_rows`` engine.
+    """The all-rows list — the row-formatting half of the row assembly.
 
     The pure half of the help page's row assembly: each spec entry
     ``(category, action_value, description, key_strs)`` becomes the row
     ``(category, name, keys_str, description)`` — the name through the
     ``replace("_", " ").title()`` pipeline, the keys as the ``" / "``
-    join of the formatted key strings, or ``"(unbound)"`` when the
-    action has no binding. The keymap walk that produces the spec (the
-    ``get_keys_for_action``/``format_key`` calls over
-    ``ACTION_CATEGORIES`` and ``ACTION_DESCRIPTIONS``) stays Python-side
-    next to the objects it reads.
+    join of the formatted key strings, or ``(unbound)`` when the
+    action has no binding. The keymap walk that produces the spec —
+    the ``get_keys_for_action``/``format_key`` calls over
+    ``ACTION_CATEGORIES`` and ``ACTION_DESCRIPTIONS`` — used to stay
+    Python-side next to the objects it reads; it now lives in the
+    fused engine (:func:`_rows_for_keymap` below). This engine
+    remains the composable primitive: the form the fused engine's
+    fallback composes, and the spec shape the row contract tests pin.
 
     Implemented by the Rust extension
-    (``_ytm_player_native.help_page_rows``) when it is built; this
-    pure-Python transcription is the fallback otherwise.
+    (``_ytm_player_native.help_page_rows``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
     rows: list[tuple[str, str, str, str]] = []
     for category, action_value, description, key_strs in spec:
@@ -196,6 +208,37 @@ def _rows_from_spec(
         keys_str = " / ".join(key_strs) if key_strs else "(unbound)"
         rows.append((category, name, keys_str, description))
     return rows
+
+
+def _rows_for_keymap(
+    keymap: KeyMap,
+    categories: dict[str, list[Action]],
+    descriptions: dict[Action, str],
+) -> list[tuple[str, str, str, str]]:
+    """The all-rows list — the ``_build_rows`` engine, fused.
+
+    The whole row assembly the reference walked in Python: the
+    category walk over *categories* in insertion order, each action's
+    description from *descriptions* (``""`` for an undocumented
+    action, the reference's ``.get(action, "")``), its bound
+    sequences from *keymap* — ``get_keys_for_action``'s
+    binding-table scan in insertion order — each formatted through
+    ``format_key``'s ``" ".join(seq)``, and the spec the reference's
+    ``_build_rows`` assembled by hand built and consumed through
+    :func:`_rows_from_spec` in one call: the name pipeline, the
+    ``" / "`` join, the ``(unbound)`` placeholder.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.help_page_rows_for_keymap``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    spec: list[tuple[str, str, str, list[str]]] = []
+    for category, actions in categories.items():
+        for action in actions:
+            description = descriptions.get(action, "")
+            key_strs = [keymap.format_key(seq) for seq in keymap.get_keys_for_action(action)]
+            spec.append((category, action.value, description, key_strs))
+    return _rows_from_spec(spec)
 
 
 def _visible_rows(
@@ -308,18 +351,14 @@ class HelpPage(Widget):
         table.focus()
 
     def _build_rows(self) -> None:
-        """Generate the full row list from the keymap, grouped by category."""
-        keymap = get_keymap()
-        spec: list[tuple[str, str, str, list[str]]] = []
+        """Generate the full row list from the keymap, grouped by category.
 
-        for category, actions in ACTION_CATEGORIES.items():
-            for action in actions:
-                description = ACTION_DESCRIPTIONS.get(action, "")
-                key_seqs = keymap.get_keys_for_action(action)
-                key_strs = [keymap.format_key(seq) for seq in key_seqs]
-                spec.append((category, action.value, description, key_strs))
-
-        self._all_rows = _rows_from_spec(spec)
+        The whole assembly — the category walk, the description
+        lookups, the binding-table scan and the row formatting — runs
+        inside the (native-backed) fused engine; only the keymap
+        acquisition stays here.
+        """
+        self._all_rows = _rows_for_keymap(get_keymap(), ACTION_CATEGORIES, ACTION_DESCRIPTIONS)
 
     def _populate_table(self, filter_text: str = "") -> None:
         """Fill the DataTable, optionally filtering rows."""
@@ -426,6 +465,9 @@ try:
         help_page_rows as _native_help_page_rows,
     )
     from ytm_player.utils._ytm_player_native import (
+        help_page_rows_for_keymap as _native_help_page_rows_for_keymap,
+    )
+    from ytm_player.utils._ytm_player_native import (
         help_page_visible_rows as _native_help_page_visible_rows,
     )
 except ImportError:
@@ -437,6 +479,14 @@ else:
     ) -> list[tuple[str, str, str, str]]:
         """The all-rows list (native Rust engine)."""
         return _native_help_page_rows(spec)
+
+    def _rows_for_keymap(  # noqa: F811
+        keymap: KeyMap,
+        categories: dict[str, list[Action]],
+        descriptions: dict[Action, str],
+    ) -> list[tuple[str, str, str, str]]:
+        """The all-rows list (native Rust engine), fused."""
+        return _native_help_page_rows_for_keymap(keymap.bindings, categories, descriptions)
 
     def _visible_rows(  # noqa: F811
         all_rows: list[tuple[str, str, str, str]],

@@ -536,6 +536,7 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // category-header insertion) behind the searchable help table.
     module.add_function(pyo3::wrap_pyfunction!(help_page_rows, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(help_page_visible_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(help_page_rows_for_keymap, module)?)?;
 
     // Playlist-picker view model (ui/popups/playlist_picker.py
     // equivalents): the recent-list move-to-front bookkeeping behind
@@ -11314,34 +11315,139 @@ fn py_title(s: &str) -> String {
     out
 }
 
-/// The all-rows list behind `HelpPage._build_rows` — the pure core of
-/// the help page's row assembly.
+/// The per-row formatting core shared by the help-page row engines —
+/// the `help_page_rows` body, factored out so the spec engine and the
+/// fused keymap-walk engine below cannot drift.
+///
+/// The name through the `action_value.replace("_", " ").title()`
+/// pipeline (`py_title`, the `_format_action_name` body), the keys as
+/// the `" / "` join of the formatted key strings, or `"(unbound)"` when
+/// the action has no binding.
+fn help_row_from_parts(
+    category: &str,
+    action_value: &str,
+    description: &str,
+    key_strs: &[String],
+) -> (String, String, String, String) {
+    let name = py_title(&action_value.replace('_', " "));
+    let keys_str = if key_strs.is_empty() {
+        "(unbound)".to_string()
+    } else {
+        key_strs.join(" / ")
+    };
+    (
+        category.to_string(),
+        name,
+        keys_str,
+        description.to_string(),
+    )
+}
+
+/// The all-rows list — the row-formatting half of the help page's row
+/// assembly, the `HelpPage._build_rows` spec form.
 ///
 /// Mirrors the pure-Python reference: each spec entry
 /// `(category, action_value, description, key_strs)` becomes the row
-/// `(category, name, keys_str, description)` — the name through the
-/// `action_value.replace("_", " ").title()` pipeline (`py_title`, the
-/// `_format_action_name` body), the keys as the `" / "` join of the
-/// formatted key strings, or `"(unbound)"` when the action has no
-/// binding. The keymap walk that produces the spec (the
+/// `(category, name, keys_str, description)` through the shared
+/// formatting core (`help_row_from_parts`). The description arrives
+/// already defaulted (`""` for an undocumented action), exactly as the
+/// reference's `ACTION_DESCRIPTIONS.get(action, "")` produced it; the
+/// key strings arrive already formatted, exactly as the reference's
+/// `format_key` calls produced them.
+///
+/// The keymap walk that produces the spec — the
 /// `get_keys_for_action`/`format_key` calls over `ACTION_CATEGORIES`
-/// and `ACTION_DESCRIPTIONS`) stays on the Python side next to the
-/// objects it reads; the description arrives already defaulted (`""`
-/// for an undocumented action), exactly as the reference's
-/// `ACTION_DESCRIPTIONS.get(action, "")` produced it.
+/// and `ACTION_DESCRIPTIONS` — used to stay on the Python side next to
+/// the objects it reads; it now lives in the fused engine
+/// (`help_page_rows_for_keymap` below). This engine remains the
+/// composable primitive: the form the fused engine's pure-Python
+/// fallback composes, and the spec shape the row contract tests pin.
 #[pyfunction]
 fn help_page_rows(spec: &Bound<'_, PyList>) -> PyResult<Vec<(String, String, String, String)>> {
     let mut rows: Vec<(String, String, String, String)> = Vec::with_capacity(spec.len());
     for entry in spec.iter() {
         let (category, action_value, description, key_strs): (String, String, String, Vec<String>) =
             entry.extract()?;
-        let name = py_title(&action_value.replace('_', " "));
-        let keys_str = if key_strs.is_empty() {
-            "(unbound)".to_string()
-        } else {
-            key_strs.join(" / ")
-        };
-        rows.push((category, name, keys_str, description));
+        rows.push(help_row_from_parts(
+            &category,
+            &action_value,
+            &description,
+            &key_strs,
+        ));
+    }
+    Ok(rows)
+}
+
+/// The fused all-rows engine behind `HelpPage._build_rows` — the whole
+/// row assembly in one call: the keymap walk that used to stay on the
+/// Python side next to the objects it reads now runs here.
+///
+/// Mirrors the pure-Python reference walk over the help page's own
+/// objects: the category walk over *categories* in dict insertion
+/// order, each action's description from *descriptions* through the
+/// interpreter's own `.get(action, "")` (`""` for an undocumented
+/// action), and its bound sequences from *bindings* — the
+/// `get_keys_for_action` scan: one pass over the binding table here,
+/// each bound sequence grouped under its action's value string so a
+/// per-action lookup answers exactly the sequences the scan would, in
+/// the binding table's own order — each formatted through
+/// `format_key`'s `" ".join(seq)`. Every row then goes through the
+/// same formatting core as the spec engine (`help_row_from_parts`),
+/// so the fused engine and the composable primitive cannot drift.
+///
+/// *bindings* is the `KeyMap.bindings` dict (sequence tuples → `Action`
+/// members — the str-enum values extract as their value strings, the
+/// `KeyMatcher` convention); *categories* is `ACTION_CATEGORIES`
+/// (category str → list of `Action` members — a non-list value raises
+/// the downcast's own TypeError, a shape the literal dict of lists
+/// never produces); *descriptions* is `ACTION_DESCRIPTIONS` (`Action`
+/// member → description str). The keymap acquisition (`get_keymap()`)
+/// stays at the Python call site; the walk, the keymap reads and the
+/// row assembly all happen here.
+#[pyfunction]
+#[pyo3(signature = (bindings, categories, descriptions))]
+fn help_page_rows_for_keymap(
+    bindings: &Bound<'_, PyDict>,
+    categories: &Bound<'_, PyDict>,
+    descriptions: &Bound<'_, PyDict>,
+) -> PyResult<Vec<(String, String, String, String)>> {
+    // One pass over the binding table: each sequence grouped under its
+    // action's value string, the groups keeping the dict's own order —
+    // `get_keys_for_action`'s per-action scan answered in advance.
+    let mut by_action: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    for (seq_obj, action_obj) in bindings.iter() {
+        let seq: Vec<String> = seq_obj.extract()?;
+        let action: String = action_obj.extract()?;
+        by_action.entry(action).or_default().push(seq);
+    }
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for (category_obj, actions_obj) in categories.iter() {
+        let category: String = category_obj.extract()?;
+        let actions = actions_obj.downcast::<PyList>()?;
+        for action_obj in actions.iter() {
+            // The str-enum member extracts as its value string —
+            // `action.value` in the reference's spec.
+            let action_value: String = action_obj.extract()?;
+            // `ACTION_DESCRIPTIONS.get(action, "")` — the interpreter's
+            // own dict lookup, `""` when the action is undocumented.
+            let description = match descriptions.get_item(action_obj)? {
+                Some(desc) => desc.extract()?,
+                None => String::new(),
+            };
+            // `get_keys_for_action(action)` + `format_key(seq)` — the
+            // grouped scan in binding-table order, each sequence
+            // formatted `" ".join(seq)`.
+            let key_strs: Vec<String> = by_action
+                .get(&action_value)
+                .map(|seqs| seqs.iter().map(|seq| seq.join(" ")).collect())
+                .unwrap_or_default();
+            rows.push(help_row_from_parts(
+                &category,
+                &action_value,
+                &description,
+                &key_strs,
+            ));
+        }
     }
     Ok(rows)
 }

@@ -1,12 +1,15 @@
 """Tests for the help-page rows engines.
 
-The engines behind ``HelpPage``: the all-rows list (``_rows_from_spec``,
-the ``_build_rows`` core — the action-value title-casing, the key-sequence
-join, the ``(unbound)`` placeholder) and the filtered walk
-(``_visible_rows``, the ``_populate_table`` core — the lowercased-then-
-stripped needle, the haystack containment, the category-header
-insertion). The pure-Python references live in ``ui/pages/help.py``; when
-the Rust extension is built the same engines run natively
+The engines behind ``HelpPage``: the all-rows list — both halves: the
+row-formatting spec engine (``_rows_from_spec``, the action-value
+title-casing, the key-sequence join, the ``(unbound)`` placeholder) and
+the fused keymap walk (``_rows_for_keymap``, the ``_build_rows`` engine
+— the category walk, the description lookups and the binding-table
+scan folded in) — and the filtered walk (``_visible_rows``, the
+``_populate_table`` core — the lowercased-then-stripped needle, the
+haystack containment, the category-header insertion). The pure-Python
+references live in ``ui/pages/help.py``; when the Rust extension is
+built the same engines run natively
 (``_ytm_player_native.help_page_rows`` & co).
 
 The unit tests below assert the engines' contract on whichever backend
@@ -34,9 +37,17 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import DataTable
 
-from ytm_player.config.keymap import KeyMap
+from ytm_player.config.keymap import (
+    DEFAULT_BINDINGS,
+    Action,
+    KeyMap,
+    parse_key_sequence,
+)
 from ytm_player.ui.pages.help import (
+    ACTION_CATEGORIES,
+    ACTION_DESCRIPTIONS,
     HelpPage,
+    _rows_for_keymap,
     _rows_from_spec,
     _title_case_action_value,
     _visible_rows,
@@ -297,6 +308,126 @@ class TestVisibleRows:
         assert _visible_rows([], "filter") == []
 
 
+# ── _rows_for_keymap (the fused ``_build_rows`` engine) ────────────────────
+
+
+class TestRowsForKeymap:
+    """The fused all-rows engine: the keymap walk (the binding-table
+    scan, the description lookups, the category walk) and the row
+    formatting folded into one call — pinned on whichever backend is
+    loaded.
+    """
+
+    @staticmethod
+    def _keymap(pairs):
+        return KeyMap(bindings={tuple(seq): Action(value) for seq, value in pairs})
+
+    def test_basic_walk(self):
+        keymap = self._keymap(
+            [
+                (("space",), "play_pause"),
+                (("j",), "move_down"),
+                (("down",), "move_down"),
+            ]
+        )
+        categories = {
+            "Playback": [Action.PLAY_PAUSE],
+            "Navigation": [Action.MOVE_DOWN, Action.TOGGLE_SEARCH_MODE],
+        }
+        descriptions = {
+            Action.PLAY_PAUSE: "Toggle play/pause",
+            Action.MOVE_DOWN: "Move cursor down",
+        }
+        rows = _rows_for_keymap(keymap, categories, descriptions)
+        assert rows == [
+            ("Playback", "Play Pause", "space", "Toggle play/pause"),
+            ("Navigation", "Move Down", "j / down", "Move cursor down"),
+            ("Navigation", "Toggle Search Mode", "(unbound)", ""),
+        ]
+
+    def test_keys_follow_binding_table_order(self):
+        """``get_keys_for_action`` answers in binding-table insertion
+        order — the join keeps that order whatever the sequences."""
+        keymap = self._keymap(
+            [
+                (("down",), "move_down"),  # bound FIRST
+                (("j",), "move_down"),
+                (("C-n",), "move_down"),
+            ]
+        )
+        rows = _rows_for_keymap(keymap, {"N": [Action.MOVE_DOWN]}, {})
+        assert rows[0][2] == "down / j / C-n"
+
+    def test_multi_key_sequence_is_space_joined(self):
+        """``format_key`` is ``" ".join(seq)`` — a two-key sequence
+        keeps its inner space, distinct from the ``" / "`` join."""
+        keymap = self._keymap(
+            [
+                (("C-w", "h"), "focus_pane_left"),
+                (("g", "space"), "current_context"),
+            ]
+        )
+        rows = _rows_for_keymap(keymap, {"N": [Action.FOCUS_PANE_LEFT, Action.CURRENT_CONTEXT]}, {})
+        assert rows[0][2] == "C-w h"
+        assert rows[1][2] == "g space"
+
+    def test_unbound_and_undocumented(self):
+        rows = _rows_for_keymap(self._keymap([]), {"A": [Action.QUIT]}, {})
+        assert rows == [("A", "Quit", "(unbound)", "")]
+
+    def test_empty_categories_yield_no_rows(self):
+        assert _rows_for_keymap(self._keymap([(("space",), "play_pause")]), {}, {}) == []
+
+    def test_description_for_uncategorised_action_is_never_read(self):
+        """A description for an action no category lists is unread —
+        no row, nothing observable through the output."""
+        keymap = self._keymap([(("space",), "play_pause")])
+        rows = _rows_for_keymap(keymap, {"A": [Action.PLAY_PAUSE]}, {Action.HELP: "Show help"})
+        assert rows == [("A", "Play Pause", "space", "")]
+
+    def test_binding_for_uncategorised_action_is_never_read(self):
+        keymap = self._keymap(
+            [
+                (("space",), "play_pause"),
+                (("?",), "help"),
+            ]
+        )
+        rows = _rows_for_keymap(keymap, {"A": [Action.PLAY_PAUSE]}, {})
+        assert rows == [("A", "Play Pause", "space", "")]
+
+    def test_repeated_action_earns_two_rows(self):
+        """The reference walk emits one row per category-list occurrence
+        — both read the same binding group."""
+        keymap = self._keymap([(("space",), "play_pause")])
+        rows = _rows_for_keymap(keymap, {"A": [Action.PLAY_PAUSE], "B": [Action.PLAY_PAUSE]}, {})
+        assert rows == [
+            ("A", "Play Pause", "space", ""),
+            ("B", "Play Pause", "space", ""),
+        ]
+
+    def test_fused_equals_the_reference_composition(self):
+        """The fused engine must answer exactly what the reference chain
+        did: the hand-rolled spec walk, then the spec engine — on the
+        compiled defaults, the production shape."""
+        keymap = self._keymap(_default_keymap_pairs())
+        spec = []
+        for category, actions in ACTION_CATEGORIES.items():
+            for action in actions:
+                description = ACTION_DESCRIPTIONS.get(action, "")
+                key_strs = [keymap.format_key(seq) for seq in keymap.get_keys_for_action(action)]
+                spec.append((category, action.value, description, key_strs))
+        expected = _rows_from_spec(spec)
+        rows = _rows_for_keymap(keymap, ACTION_CATEGORIES, ACTION_DESCRIPTIONS)
+        assert rows == expected
+        assert ("Playback", "Play Pause", "space", "Toggle play/pause") in rows
+        assert (
+            "Navigation",
+            "Focus Pane Left",
+            "C-w h",
+            "Focus the Playlists sidebar (vim window: left)",
+        ) in rows
+
+
 # ── Native / fallback parity ─────────────────────────────────────────
 
 _ROW_SPECS = [
@@ -333,6 +464,61 @@ _FILTER_TEXTS = [
     "play pause",
 ]
 
+
+def _default_keymap_pairs():
+    """(sequence, action value) pairs in the compiled defaults' own
+    order — the insertion order ``_load_defaults`` binds them in."""
+    return [
+        (parse_key_sequence(seq), value) for value, seqs in DEFAULT_BINDINGS.items() for seq in seqs
+    ]
+
+
+_KEYMAP_CASES = [
+    # The compiled defaults over the real categories and descriptions
+    # — the production shape, end to end.
+    {
+        "bindings": [[list(seq), value] for seq, value in _default_keymap_pairs()],
+        "categories": [
+            [category, [a.value for a in actions]]
+            for category, actions in ACTION_CATEGORIES.items()
+        ],
+        "descriptions": [[a.value, d] for a, d in ACTION_DESCRIPTIONS.items()],
+    },
+    # The hand-built shapes: binding-table order, the multi-key join,
+    # unbound + undocumented, the unread extras, the repeated action.
+    {
+        "bindings": [
+            [["down"], "move_down"],
+            [["C-w", "h"], "focus_pane_left"],
+            [["j"], "move_down"],
+            [["?"], "help"],
+            [["g", "space"], "current_context"],
+        ],
+        "categories": [
+            ["Playback", ["play_pause"]],
+            ["Navigation", ["move_down", "focus_pane_left", "toggle_search_mode"]],
+            ["Pages", ["help", "current_context", "play_pause"]],
+        ],
+        "descriptions": [
+            ["play_pause", "Toggle play/pause"],
+            ["move_down", "Move cursor down"],
+            ["focus_pane_left", "Focus the Playlists sidebar (vim window: left)"],
+        ],
+    },
+    # An empty binding table: every row unbound.
+    {
+        "bindings": [],
+        "categories": [["Pages", ["help", "queue"]]],
+        "descriptions": [["help", "Show this help page"]],
+    },
+    # No categories at all: no rows, whatever the table holds.
+    {
+        "bindings": [[["space"], "play_pause"]],
+        "categories": [],
+        "descriptions": [],
+    },
+]
+
 # The child interpreter runs this program with the case lists on stdin
 # and prints the reference engines' results as JSON.
 _CHILD_PROG = """
@@ -341,15 +527,25 @@ import sys
 
 sys.modules['ytm_player.utils._ytm_player_native'] = None
 
-from ytm_player.ui.pages.help import _rows_from_spec, _visible_rows
+from ytm_player.config.keymap import Action, KeyMap
+from ytm_player.ui.pages.help import _rows_for_keymap, _rows_from_spec, _visible_rows
 
 payload = json.load(sys.stdin)
+
+
+def _keymap_case(case):
+    keymap = KeyMap(bindings={tuple(seq): Action(value) for seq, value in case["bindings"]})
+    categories = {category: [Action(v) for v in actions] for category, actions in case["categories"]}
+    descriptions = {Action(v): d for v, d in case["descriptions"]}
+    return _rows_for_keymap(keymap, categories, descriptions)
+
 
 out = {
     "rows": [_rows_from_spec(spec) for spec in payload["specs"]],
     "visible": [
         _visible_rows(payload["all_rows"], text) for text in payload["filter_texts"]
     ],
+    "fused": [_keymap_case(case) for case in payload["keymap_cases"]],
 }
 json.dump(out, sys.stdout)
 """
@@ -358,9 +554,18 @@ json.dump(out, sys.stdout)
 def _native_results(payload: dict) -> dict:
     """Run whichever engines the module loaded (native when built) over
     the payload."""
+    from ytm_player.config.keymap import Action, KeyMap
+
+    def _keymap_case(case):
+        keymap = KeyMap(bindings={tuple(seq): Action(value) for seq, value in case["bindings"]})
+        categories = {category: [Action(v) for v in acts] for category, acts in case["categories"]}
+        descriptions = {Action(v): d for v, d in case["descriptions"]}
+        return _rows_for_keymap(keymap, categories, descriptions)
+
     return {
         "rows": [_rows_from_spec(spec) for spec in payload["specs"]],
         "visible": [_visible_rows(payload["all_rows"], text) for text in payload["filter_texts"]],
+        "fused": [_keymap_case(case) for case in payload["keymap_cases"]],
     }
 
 
@@ -389,6 +594,7 @@ class TestNativeParity:
             "specs": [_ROW_SPECS, _ROW_SPECS[:2], []],
             "all_rows": _ALL_ROWS,
             "filter_texts": _FILTER_TEXTS,
+            "keymap_cases": _KEYMAP_CASES,
         }
         native = json.loads(json.dumps(_native_results(payload)))
         fallback = _fallback_results(payload)
@@ -399,6 +605,10 @@ class TestNativeParity:
         for i, text in enumerate(_FILTER_TEXTS):
             assert native["visible"][i] == fallback["visible"][i], (
                 f"native and fallback visible walks differ for filter {text!r}"
+            )
+        for i, case in enumerate(payload["keymap_cases"]):
+            assert native["fused"][i] == fallback["fused"][i], (
+                f"native and fallback fused walks differ for keymap case {i}: {case}"
             )
 
 
