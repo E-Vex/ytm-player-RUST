@@ -2,6 +2,16 @@
 
 Shows the currently playing track in the user's Discord status.
 Requires the optional `pypresence` package.
+
+The presence-kwargs assembly ``_presence_kwargs`` (the seven-key dict
+behind ``update``'s ``rpc.update(**kwargs)`` — the fallback-text
+arms, the 128 cuts, the ``int`` timestamp casts and the end gate) is
+implemented by the Rust extension
+(``_ytm_player_native.discord_presence_kwargs``) when it is built
+and by the pure-Python transcription below otherwise; the clock
+read and the ``_start_time`` state write, the pypresence imports,
+the reconnect loop and the RPC calls stay Python-side in the
+service.
 """
 
 from __future__ import annotations
@@ -18,6 +28,47 @@ logger = logging.getLogger(__name__)
 # Default Discord application ID — the bundled "YouTube Music" Rich Presence
 # app. Users can point at their own app via [discord] client_id in config.
 DEFAULT_DISCORD_CLIENT_ID = "1517429270115258490"
+
+
+def _presence_kwargs(
+    title: Any,
+    artist: Any,
+    album: Any,
+    duration: Any,
+    thumbnail_url: Any,
+    start_time: Any,
+    activity_type: Any,
+) -> dict:
+    """The presence-kwargs assembly behind ``update``.
+
+    The dict handed to ``rpc.update(**kwargs)``: the fallback-text
+    arms (a falsy title/artist/album answers ``Unknown Track`` /
+    ``Unknown Artist`` / ``YouTube Music``), the 128-char cuts on the
+    three text fields (``large_image`` passes through unsliced), the
+    ``int(start_time)`` timestamp, and — only when ``duration > 0`` —
+    the ``int(start_time + duration)`` end edge. Every truthiness
+    gate, slice, comparison, addition and ``int()`` cast is
+    CPython's own, so the error shapes and the bool spellings stay
+    the interpreter's; the dict carries the reference's own key
+    order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.discord_presence_kwargs``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    kwargs: dict = {
+        "activity_type": activity_type,
+        "details": (title or "Unknown Track")[:128],
+        "state": (artist or "Unknown Artist")[:128],
+        "large_image": thumbnail_url or "ytm_icon",
+        "large_text": (album or "YouTube Music")[:128],
+        "start": int(start_time),
+    }
+
+    if duration > 0:
+        kwargs["end"] = int(start_time + duration)
+
+    return kwargs
 
 
 class DiscordRPC:
@@ -114,7 +165,14 @@ class DiscordRPC:
         position: float = 0,
         thumbnail_url: str = "",
     ) -> None:
-        """Update the Discord presence with current track info."""
+        """Update the Discord presence with current track info.
+
+        The kwargs handed to the RPC are resolved by the
+        ``_presence_kwargs`` engine (native when the Rust extension is
+        built, the pure-Python transcription otherwise); this method
+        reads the clock, keeps the start-time state and owns the
+        pypresence import.
+        """
         self._start_time = time.time() - position
 
         try:
@@ -124,17 +182,9 @@ class DiscordRPC:
         except (ImportError, AttributeError):
             activity_type = None
 
-        kwargs: dict = {
-            "activity_type": activity_type,
-            "details": (title or "Unknown Track")[:128],
-            "state": (artist or "Unknown Artist")[:128],
-            "large_image": thumbnail_url or "ytm_icon",
-            "large_text": (album or "YouTube Music")[:128],
-            "start": int(self._start_time),
-        }
-
-        if duration > 0:
-            kwargs["end"] = int(self._start_time + duration)
+        kwargs = _presence_kwargs(
+            title, artist, album, duration, thumbnail_url, self._start_time, activity_type
+        )
 
         async def _update(rpc: object) -> Any:
             return await rpc.update(**kwargs)  # type: ignore[attr-defined]
@@ -152,3 +202,20 @@ class DiscordRPC:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same presence-kwargs assembly; this
+# binding replaces the pure-Python transcription above when the extension
+# is importable.  The rebinding must happen AFTER the definition above —
+# assigning the native function any earlier would be clobbered by the
+# ``def`` statement.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        discord_presence_kwargs as _native_discord_presence_kwargs,
+    )
+except ImportError:
+    pass
+else:
+    _presence_kwargs = _native_discord_presence_kwargs  # type: ignore[assignment]

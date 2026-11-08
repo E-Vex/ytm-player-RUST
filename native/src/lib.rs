@@ -975,6 +975,38 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(player_command_current, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_dispatch_arm, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(player_mpv_log_level, module)?)?;
+
+    // Last.fm scrobble engine (services/lastfm.py equivalent): the
+    // scrobble-threshold gate behind check_scrobble's periodic poll —
+    // whether the playback position has crossed the Last.fm spec's
+    // threshold (50% of the track or 4 minutes, whichever is less):
+    // the no-duration gate `duration <= 0` answering the bare cap,
+    // otherwise min(duration * percent, cap) walked like CPython's own
+    // min (the tie answering the product, the reference's first
+    // argument), then the `position >= threshold` verdict — every
+    // comparison and the product through CPython's own protocols, and
+    // both constants read through the lastfm module's own names at
+    // call time so patched values steer both backends identically. The
+    // connection/current-track/scrobbled state, the duration read out
+    // of the current track and the scrobble submission stay
+    // Python-side in the service.
+    module.add_function(pyo3::wrap_pyfunction!(lastfm_scrobble_due, module)?)?;
+
+    // Discord presence engine (services/discord_rpc.py equivalent):
+    // the presence-kwargs assembly behind update's rpc.update(**kwargs)
+    // — the seven-key dict in the reference's own key order:
+    // activity_type passed through as the very object handed in (the
+    // ActivityType.LISTENING member or None, the pypresence import
+    // gate staying Python-side), details/state/large_text the
+    // `(x or "…")[:128]` arms through the truthiness gate and the
+    // value's own __getitem__, large_image the bare unsliced `or`
+    // arm, start the interpreter's own int(start_time), and end —
+    // appended only when `duration > 0` through CPython's own `>` —
+    // the interpreter's own int(start_time + duration). The clock
+    // read and the _start_time state write, the pypresence import,
+    // the reconnect loop and the RPC call stay Python-side in the
+    // service.
+    module.add_function(pyo3::wrap_pyfunction!(discord_presence_kwargs, module)?)?;
     Ok(())
 }
 
@@ -17530,4 +17562,193 @@ fn stream_pending_drop_verdict(
 #[pyo3(signature = (future))]
 fn stream_pending_publication_gate(future: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(!future.call_method0("done")?.is_truthy()?)
+}
+
+// ---------------------------------------------------------------------------
+// Last.fm scrobble-threshold gate (mirrors ytm_player/services/lastfm.py)
+// ---------------------------------------------------------------------------
+
+/// The lastfm module's `_SCROBBLE_PERCENT`, read through the module
+/// attribute — the very constant the fallback's own product runs
+/// against, a patched value included.
+fn lastfm_scrobble_percent(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.services.lastfm")?.getattr("_SCROBBLE_PERCENT")
+}
+
+/// The lastfm module's `_SCROBBLE_MAX_SECONDS` cap, read through the
+/// module attribute — the very constant the fallback's own threshold
+/// arms run against, a patched value included.
+fn lastfm_scrobble_max_seconds(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    PyModule::import(py, "ytm_player.services.lastfm")?.getattr("_SCROBBLE_MAX_SECONDS")
+}
+
+/// The scrobble-threshold gate — `services/lastfm.py`'s
+/// `check_scrobble` threshold walk, the decision behind every
+/// periodic scrobble poll: whether the playback position has crossed
+/// the Last.fm spec's threshold (50% of the track or 4 minutes,
+/// whichever is less).
+///
+/// Mirrors the reference's two arms exactly: the no-duration gate
+/// `duration <= 0` through CPython's own `<=` (so a non-numeric
+/// duration raises the comparison's own `TypeError`, and the bool
+/// spellings — `False <= 0` is True, `True <= 0` is False — stay
+/// CPython's) answers the bare cap `_SCROBBLE_MAX_SECONDS` read
+/// through the module's own name exactly like the reference's global
+/// lookup, a patched cap included; otherwise the threshold is
+/// `min(duration * _SCROBBLE_PERCENT, _SCROBBLE_MAX_SECONDS)` — the
+/// percent read through the module's own name too, the product and
+/// the cap compared through CPython's own `*` and min walk (the cap
+/// takes over only when it compares strictly less, so the tie at an
+/// eight-minute track answers the product — the reference's first
+/// argument — and a non-numeric cap raises the comparison's own
+/// `TypeError`). The verdict itself is `position >= threshold`
+/// through CPython's own `>=`, the boundary included: a position
+/// exactly at the threshold is due. The connection/current-track/
+/// scrobbled state, the `duration` read out of the current track and
+/// the scrobble submission stay Python-side in the service.
+#[pyfunction]
+#[pyo3(signature = (position, duration))]
+fn lastfm_scrobble_due(
+    py: Python<'_>,
+    position: &Bound<'_, PyAny>,
+    duration: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    // duration <= 0 — CPython's own <=, the reference's own
+    // no-duration gate.
+    let zero: Bound<'_, PyAny> = 0i64.into_pyobject(py)?.into_any();
+    let threshold = if duration.le(&zero)? {
+        // threshold = _SCROBBLE_MAX_SECONDS — the cap read through
+        // the module's own name, the reference's global lookup.
+        lastfm_scrobble_max_seconds(py)?
+    } else {
+        // duration * _SCROBBLE_PERCENT — CPython's own *, the
+        // percent read through the module's own name.
+        let percent = lastfm_scrobble_percent(py)?;
+        let product = duration.mul(&percent)?;
+        // min(product, _SCROBBLE_MAX_SECONDS) — CPython's min walk:
+        // the cap takes over only when it compares strictly less
+        // than the product, so the tie answers the product (the
+        // reference's first argument).
+        let cap = lastfm_scrobble_max_seconds(py)?;
+        if cap.lt(&product)? {
+            cap
+        } else {
+            product
+        }
+    };
+    // position >= threshold — CPython's own >=, the due verdict.
+    position.ge(&threshold)
+}
+
+// ---------------------------------------------------------------------------
+// Discord presence assembly (mirrors ytm_player/services/discord_rpc.py)
+// ---------------------------------------------------------------------------
+
+/// `(value or fallback)[:128]` — the presence text arm: the
+/// truthiness gate then the 128 cut, both through CPython's own
+/// protocols, so a falsy value (the empty string, `None`, `0`) answers
+/// the fallback, a truthy value is sliced through its own
+/// `__getitem__` over the very slice object the reference's `[:128]`
+/// compiles to (a str answers its 128-head, a non-subscriptable
+/// object raises its own `TypeError`), and a truthiness error
+/// propagates.
+fn discord_or_slice_128<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+    fallback: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    let chosen = if value.is_truthy()? {
+        value.clone()
+    } else {
+        fallback.into_pyobject(py)?.into_any()
+    };
+    // chosen[:128] — the getitem protocol over the slice object.
+    let slice_type = py.import("builtins")?.getattr("slice")?;
+    let window = slice_type.call1((py.None(), 128i64, py.None()))?;
+    chosen.get_item(&window)
+}
+
+/// The presence-kwargs assembly — `services/discord_rpc.py`'s `update`
+/// kwargs build, the seven-key dict handed to pypresence's
+/// `update(**kwargs)` on every presence refresh.
+///
+/// Mirrors the reference's dict literal exactly, in its own key order
+/// and with each value's own error surfacing first: `activity_type`
+/// the very object handed in (the `ActivityType.LISTENING` member
+/// where pypresence provides the enum, `None` where it does not — the
+/// import gate stays Python-side in the caller), `details`/`state`/
+/// `large_text` the `(x or "…")[:128]` arms — the truthiness gate
+/// through CPython's own `bool` protocol, the 128 cut through the
+/// value's own `__getitem__` — `large_image` the bare `or` arm
+/// (`thumbnail_url or "ytm_icon"`, unsliced: a truthy thumbnail
+/// passes through whole), and `start` the interpreter's own
+/// `int(start_time)`. Once the six-key dict is complete, the end gate
+/// `duration > 0` through CPython's own `>` appends `end` as
+/// `int(start_time + duration)` — the addition through CPython's own
+/// `+`, the cut through the interpreter's own `int()` — so a positive
+/// duration spells the countdown's far edge, a zero or negative one
+/// leaves the key absent, and a non-numeric duration or start time
+/// raises the comparison's, addition's or `int()`'s own error. The
+/// clock read and the `_start_time` state write, the pypresence
+/// import, the reconnect loop and the RPC call stay Python-side in
+/// the service.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)] // the presence's seven inputs — one parameter per field the reference's kwargs read
+#[pyo3(signature = (title, artist, album, duration, thumbnail_url, start_time, activity_type))]
+fn discord_presence_kwargs<'py>(
+    py: Python<'py>,
+    title: &Bound<'py, PyAny>,
+    artist: &Bound<'py, PyAny>,
+    album: &Bound<'py, PyAny>,
+    duration: &Bound<'py, PyAny>,
+    thumbnail_url: &Bound<'py, PyAny>,
+    start_time: &Bound<'py, PyAny>,
+    activity_type: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let kwargs = PyDict::new(py);
+    // "activity_type" — the very object handed in.
+    kwargs
+        .set_item("activity_type", activity_type)
+        .expect("dict insertion with a str key cannot fail");
+    // "details" — (title or "Unknown Track")[:128].
+    let details = discord_or_slice_128(py, title, "Unknown Track")?;
+    kwargs
+        .set_item("details", details)
+        .expect("dict insertion with a str key cannot fail");
+    // "state" — (artist or "Unknown Artist")[:128].
+    let state = discord_or_slice_128(py, artist, "Unknown Artist")?;
+    kwargs
+        .set_item("state", state)
+        .expect("dict insertion with a str key cannot fail");
+    // "large_image" — thumbnail_url or "ytm_icon", unsliced.
+    let large_image = if thumbnail_url.is_truthy()? {
+        thumbnail_url.clone()
+    } else {
+        "ytm_icon".into_pyobject(py)?.into_any()
+    };
+    kwargs
+        .set_item("large_image", large_image)
+        .expect("dict insertion with a str key cannot fail");
+    // "large_text" — (album or "YouTube Music")[:128].
+    let large_text = discord_or_slice_128(py, album, "YouTube Music")?;
+    kwargs
+        .set_item("large_text", large_text)
+        .expect("dict insertion with a str key cannot fail");
+    // "start" — int(start_time), the interpreter's own int().
+    let start = builtin_int(py, start_time)?;
+    kwargs
+        .set_item("start", start)
+        .expect("dict insertion with a str key cannot fail");
+    // if duration > 0 — CPython's own >, the end gate, consulted only
+    // once the six-key dict is complete.
+    let zero: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+    if duration.gt(&zero)? {
+        // int(start_time + duration) — the addition through CPython's
+        // own +, then the interpreter's own int().
+        let end = builtin_int(py, &start_time.add(duration)?)?;
+        kwargs
+            .set_item("end", end)
+            .expect("dict insertion with a str key cannot fail");
+    }
+    Ok(kwargs)
 }
