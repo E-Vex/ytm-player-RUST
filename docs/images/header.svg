@@ -20,8 +20,9 @@
       <animate attributeName="opacity" values="0.4;1;0.4" dur="2.6s" repeatCount="indefinite"/>
     </polygon>
     <polygon points="0,12 56,42 0,72" fill="#B7410E"/>
-    <text class="wordmark" x="80" y="65" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="56" font-weight="600" letter-spacing="-1" textLength="260" lengthAdjust="spacingAndGlyphs" filter="url(#ytm-wordmark-shadow)">ytm-player-</text>
-    <text class="rust" x="340" y="65" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="56" font-weight="600" letter-spacing="-1" textLength="120" lengthAdjust="spacingAndGlyphs" filter="url(#ytm-wordmark-shadow)">RUST</text>
+    <text class="wordmark" x="80" y="65" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="56" font-weight="600" letter-spacing="-1" filter="url(#ytm-wordmark-shadow)">
+      ytm-player-<tspan class="rust">RUST</tspan>
+    </text>
   </g>
   <text x="360" y="148" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="18" fill="#9ca3af">YouTube Music in your terminal — synced lyrics, vim keys, mpv backend.</text>
   <text x="360" y="190" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#6b7280">Linux · macOS · Windows · Free-tier supported</text>
