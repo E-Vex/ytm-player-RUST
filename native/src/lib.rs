@@ -154,6 +154,13 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // native call instead of two-to-four per line (the cached settings
     // read stays Python-side, passed in as a bool).
     module.add_function(pyo3::wrap_pyfunction!(lyrics_view_rows, module)?)?;
+    // The YTM timed-lyrics line conversion feeding the synced view —
+    // the LyricLine-object walk behind _process_lyrics' synced arm
+    // (the hasattr gate, the / 1000.0 seconds through the
+    // interpreter's own true division, the text default), in one
+    // native call for the whole list; the hasTimestamps gate and the
+    // isinstance narrowing stay Python-side in the sidebar.
+    module.add_function(pyo3::wrap_pyfunction!(convert_lyric_lines, module)?)?;
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
@@ -2179,6 +2186,70 @@ fn lyrics_view_rows(
         rows.push((display, is_rtl, translit));
     }
     Ok(rows)
+}
+
+/// The YTM timed-lyrics line conversion — `lyrics_sidebar`'s
+/// `_convert_lyric_lines`, the LyricLine-object walk behind
+/// `_process_lyrics`'s synced arm. ytmusicapi's `timestamps=True` shape
+/// (`hasTimestamps` plus a `lyrics` list of `LyricLine` dataclass
+/// objects — `start_time` in milliseconds, `text`) becomes the
+/// `(timestamp_seconds, text)` list the synced view consumes.
+///
+/// Mirrors the reference's list comprehension exactly. The
+/// `hasattr(entry, "start_time")` gate is its own getattr read — the
+/// value discarded, only an `AttributeError` answering False (a
+/// property raising anything else propagates, like the reference's own
+/// `hasattr`); a kept entry's `start_time` is then read again by the
+/// expression itself (the reference's second read, so a counting
+/// property observes both), and divided through CPython's own true
+/// division — an int `start_time` answers the float seconds, a float
+/// or bool passes through the same `__truediv__` the reference would
+/// call, a non-numeric one raises the division's own `TypeError`. The
+/// text is `getattr(entry, "text", "")` — only the missing-attribute
+/// `AttributeError` swallowed to the `""` default, any other error
+/// surfacing, the value passing through as the very object it is
+/// (never coerced; the view builders' own gates handle the odd shapes
+/// exactly as the reference's would). The `(seconds, text)` pairs land
+/// in a fresh list in iteration order — no sort, unlike the LRC parse
+/// feeding the same view. The `hasTimestamps` gate and the
+/// `isinstance(..., list)` narrowing stay Python-side in the sidebar,
+/// as does the empty-conversion fallback to the string-lyrics path.
+#[pyfunction]
+#[pyo3(signature = (entries))]
+fn convert_lyric_lines<'py>(
+    py: Python<'py>,
+    entries: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    // 1000.0 — the reference's float literal, the right operand of the
+    // expression's true division.
+    let thousand: Bound<'py, PyAny> = 1000.0f64
+        .into_pyobject(py)
+        .expect("float conversion is infallible")
+        .into_any();
+    let out = PyList::empty(py);
+    for entry in entries.iter() {
+        // hasattr(entry, "start_time") — the gate's own read, its value
+        // discarded; only an AttributeError answers False.
+        match entry.getattr("start_time") {
+            Ok(_) => {}
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => continue,
+            Err(err) => return Err(err),
+        }
+        // entry.start_time / 1000.0 — the expression's own read (the
+        // reference's second), then the interpreter's true division.
+        let start_time = entry.getattr("start_time")?;
+        let seconds = start_time.div(&thousand)?;
+        // getattr(entry, "text", "") — the AttributeError fallback arm.
+        let text = match entry.getattr("text") {
+            Ok(text) => text,
+            Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+                "".into_pyobject(py)?.into_any()
+            }
+            Err(err) => return Err(err),
+        };
+        out.append((seconds, text))?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

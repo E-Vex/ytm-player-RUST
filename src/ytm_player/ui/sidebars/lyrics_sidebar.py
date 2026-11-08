@@ -48,6 +48,33 @@ def _parse_synced_lyrics(raw: str) -> list[tuple[float, str]]:
     return lines
 
 
+def _convert_lyric_lines(entries: Sequence[Any]) -> list[tuple[Any, Any]]:
+    """Convert ytmusicapi LyricLine objects into (seconds, text) pairs.
+
+    The pure core of ``_process_lyrics``'s synced arm: ytmusicapi's
+    ``timestamps=True`` shape (``hasTimestamps`` plus a ``lyrics`` list
+    of LyricLine dataclass objects — ``start_time`` in milliseconds,
+    ``text``) becomes the ``(timestamp_seconds, text)`` list the synced
+    view consumes. The millisecond count goes through CPython's own
+    ``/ 1000.0`` (an int answers a float, anything the division itself
+    rejects raises its own ``TypeError``), the text is read through
+    ``getattr(entry, "text", "")`` (only a missing attribute reads as
+    the empty string — the value itself is never coerced), and entries
+    without a ``start_time`` attribute are skipped by the ``hasattr``
+    gate. The pairs keep the input order — no sort, unlike the LRC
+    parse feeding the same view.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.convert_lyric_lines``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return [
+        (entry.start_time / 1000.0, getattr(entry, "text", ""))
+        for entry in entries
+        if hasattr(entry, "start_time")
+    ]
+
+
 def _compose_lyric_rows(
     lines: Sequence[str],
     wrap_width: int,
@@ -342,11 +369,7 @@ class LyricsSidebar(Widget):
 
         # ytmusicapi with timestamps=True returns hasTimestamps + lyrics as list of LyricLine objects
         if data.get("hasTimestamps") and isinstance(lyrics_data, list):
-            synced = [
-                (entry.start_time / 1000.0, getattr(entry, "text", ""))
-                for entry in lyrics_data
-                if hasattr(entry, "start_time")
-            ]
+            synced = _convert_lyric_lines(lyrics_data)
             if synced:
                 self._is_synced = True
                 self._synced_lines = synced
@@ -594,6 +617,31 @@ except ImportError:
     pass
 else:
     _parse_synced_lyrics = _native_parse_synced_lyrics  # type: ignore[assignment]
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        convert_lyric_lines as _native_convert_lyric_lines,
+    )
+except ImportError:
+    pass
+else:
+
+    def _convert_lyric_lines(  # noqa: F811
+        entries: Sequence[Any],
+    ) -> list[tuple[Any, Any]]:
+        """Convert ytmusicapi LyricLine objects into (seconds, text)
+        pairs (native Rust engine).
+
+        Same contract as the pure-Python reference above: the
+        ``hasattr(entry, "start_time")`` gate, the ``start_time / 1000.0``
+        seconds through the interpreter's own true division and the
+        ``getattr(entry, "text", "")`` read all run inside one native
+        call for the whole list. The sequence is materialised to a list
+        for the engine the same way the row engine's wrapper does, so
+        any iterable answers the same pairs in the same order.
+        """
+        return _native_convert_lyric_lines(list(entries))
 
 
 try:
