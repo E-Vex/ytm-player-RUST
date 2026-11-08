@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/peternaame-boop/ytm-player/master/docs/images/header.svg" alt="ytm-player — YouTube Music in your terminal — synced lyrics, vim keys, mpv backend. Runs on Linux, macOS, Windows. Free-tier supported." width="720" />
+  <b>ytm-player-<span style="color:#B7410E;">RUST</span></b> — YouTube Music in your terminal — synced lyrics, vim keys, mpv backend
 </p>
 
 <p align="center">
