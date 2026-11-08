@@ -6,7 +6,7 @@ import bisect
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
@@ -46,6 +46,40 @@ def _parse_synced_lyrics(raw: str) -> list[tuple[float, str]]:
             lines.append((ts, text))
     lines.sort(key=lambda x: x[0])
     return lines
+
+
+def _compose_lyric_rows(
+    lines: Sequence[str],
+    wrap_width: int,
+    transliteration_enabled: bool,
+) -> list[tuple[str, bool, str | None]]:
+    """Compose every lyric line's view row — the row engine.
+
+    The pure core of ``_build_synced_view`` and ``_build_unsynced_view``:
+    for each line, the ``(display, is_rtl, translit)`` triple the view
+    builders mount their widgets from — the display text through the
+    ``render_lyric_line`` chain (the gated multi-line pre-wrap, then the
+    FSI...PDI isolate so an RTL line's directional context cannot leak),
+    the RTL classification the ``lyrics-rtl`` class keys on (``text and
+    has_rtl(text)`` — an empty line carries no class), and the
+    transliteration shown under the line when the toggle is on AND the
+    line is non-empty non-ASCII (the ``has_non_ascii`` gate; ``None`` —
+    no transliteration widget — otherwise). The widget mounting, the
+    class lists and the auto-scroll stay with the sidebar.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.lyrics_view_rows``) when it is built; this
+    pure-Python composition is the fallback otherwise.
+    """
+    rows: list[tuple[str, bool, str | None]] = []
+    for text in lines:
+        display = render_lyric_line(text, wrap_width)
+        is_rtl = bool(text) and has_rtl(text)
+        translit = None
+        if transliteration_enabled and text and has_non_ascii(text):
+            translit = transliterate_line(text)
+        rows.append((display, is_rtl, translit))
+    return rows
 
 
 class _LyricLine(Static):
@@ -362,20 +396,23 @@ class LyricsSidebar(Widget):
         self.current_line_index = -1
         wrap_width = self._get_rtl_wrap_width()
         children: list[Static] = []
-        for ts, text in self._synced_lines:
-            # The per-line render engine fuses the wrap -> isolate chain
-            # into one call (Rust when the extension is built): one
-            # FSI...PDI pair bracketing the whole (possibly wrapped)
-            # line so its directional context cannot leak.
-            display_text = render_lyric_line(text, wrap_width)
+        # The whole per-line walk — every line's BiDi render, RTL
+        # classification and transliteration — resolves through the row
+        # engine in one call (Rust when the extension is built) instead
+        # of the two-to-four extension calls per line the loop used to
+        # make; the widget mounting stays here.
+        rows = _compose_lyric_rows(
+            [text for _ts, text in self._synced_lines], wrap_width, self._transliteration_enabled
+        )
+        for (ts, _text), (display_text, is_rtl, translit) in zip(self._synced_lines, rows):
             widget = _LyricLine(display_text, timestamp=ts)
             widget.add_class("lyrics-upcoming")
-            if text and has_rtl(text):
+            if is_rtl:
                 widget.add_class("lyrics-rtl")
             self._lyric_widgets.append(widget)
             children.append(widget)
-            if self._transliteration_enabled and text and has_non_ascii(text):
-                tl = Static(transliterate_line(text))
+            if translit is not None:
+                tl = Static(translit)
                 tl.add_class("lyrics-transliterated")
                 children.append(tl)
         scroll.mount(*children)
@@ -387,15 +424,18 @@ class LyricsSidebar(Widget):
         self._lyric_widgets = []
         wrap_width = self._get_rtl_wrap_width()
         children: list[Static] = []
-        for line in self._unsynced_lines:
-            widget = _LyricLine(render_lyric_line(line, wrap_width))
+        # Same fused row engine as the synced view — one call for every
+        # line's render, classification and transliteration.
+        rows = _compose_lyric_rows(self._unsynced_lines, wrap_width, self._transliteration_enabled)
+        for _line, (display_text, is_rtl, translit) in zip(self._unsynced_lines, rows):
+            widget = _LyricLine(display_text)
             widget.add_class("lyrics-upcoming")
-            if line and has_rtl(line):
+            if is_rtl:
                 widget.add_class("lyrics-rtl")
             self._lyric_widgets.append(widget)
             children.append(widget)
-            if self._transliteration_enabled and line and has_non_ascii(line):
-                tl = Static(transliterate_line(line))
+            if translit is not None:
+                tl = Static(translit)
                 tl.add_class("lyrics-transliterated")
                 children.append(tl)
         scroll.mount(*children)
@@ -538,13 +578,13 @@ class LyricsSidebar(Widget):
             logger.debug("Failed to scroll lyrics sidebar to bottom", exc_info=True)
 
 
-# ── Native (Rust/PyO3) override, if available ──────────────────────────
-# The Rust extension implements the same LRC parser; this binding
-# replaces the pure-Python definition above when the extension is
-# importable.  The rebinding must happen AFTER the definition above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statement (the lesson that produced formatting.py's dead
-# native bindings).
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same LRC parser and the same row
+# engine; these bindings replace the pure-Python definitions above when
+# the extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -554,3 +594,35 @@ except ImportError:
     pass
 else:
     _parse_synced_lyrics = _native_parse_synced_lyrics  # type: ignore[assignment]
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        lyrics_view_rows as _native_lyrics_view_rows,
+    )
+except ImportError:
+    pass
+else:
+
+    def _compose_lyric_rows(  # noqa: F811
+        lines: Sequence[str],
+        wrap_width: int,
+        transliteration_enabled: bool,
+    ) -> list[tuple[str, bool, str | None]]:
+        """Compose every lyric line's view row (native Rust engine).
+
+        Same contract as the pure-Python reference above: the whole
+        per-line walk — every line's BiDi render (the gated wrap and the
+        FSI...PDI isolate), RTL classification and transliteration —
+        runs inside one native call for the whole list, with only the
+        cached ``bidi_mode`` verdict read here (once per rebuild
+        instead of once per line). Non-string lines degrade the way the
+        reference's own gates would: a falsy one renders as a blank
+        row, a truthy one raises ``TypeError`` — the two view builders
+        only ever produce strings.
+        """
+        from ytm_player.utils.bidi import _get_reorder_enabled
+
+        return _native_lyrics_view_rows(
+            list(lines), wrap_width, transliteration_enabled, _get_reorder_enabled()
+        )

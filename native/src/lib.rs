@@ -149,6 +149,11 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(render_track_cell, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(render_bar_cell, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(render_lyric_line, module)?)?;
+    // The fused whole-list walk behind the lyrics sidebar's two views —
+    // every line's render / RTL classification / transliteration in one
+    // native call instead of two-to-four per line (the cached settings
+    // read stays Python-side, passed in as a bool).
+    module.add_function(pyo3::wrap_pyfunction!(lyrics_view_rows, module)?)?;
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(transliterate, module)?)?;
@@ -2098,12 +2103,82 @@ fn render_bar_cell(text: &str, width: isize, reorder_enabled: bool) -> String {
 #[pyfunction]
 #[pyo3(signature = (text, width, reorder_enabled))]
 fn render_lyric_line(text: &str, width: i64, reorder_enabled: bool) -> String {
+    render_lyric_line_impl(text, width, reorder_enabled)
+}
+
+/// The render-lyric-line body shared by the single-line export and the
+/// fused view-rows engine below — one definition so the per-line call
+/// and the whole-view walk render through exactly the same pipeline:
+/// the gated multi-line pre-wrap (the disabled / empty / no-RTL
+/// passthroughs, then the wrap-then-reorder pipeline of
+/// `wrap_line_impl` — the width short-circuit, the word walk, the
+/// per-line reorder join), then the isolate wrap around the WHOLE
+/// wrapped string — one FSI...PDI pair bracketing every wrapped line.
+fn render_lyric_line_impl(text: &str, width: i64, reorder_enabled: bool) -> String {
     let wrapped = if !reorder_enabled || text.is_empty() || !text.chars().any(is_rtl_char) {
         text.to_string()
     } else {
         wrap_line_impl(text, width)
     };
     isolate_bidi_impl(&wrapped, true)
+}
+
+/// The fused view-rows engine behind the lyrics sidebar's two views —
+/// the per-line walk `_build_synced_view` and `_build_unsynced_view`
+/// assembled through separate `render_lyric_line`, `has_rtl`,
+/// `has_non_ascii` and `transliterate_line` calls (two per line, four
+/// under the transliteration toggle), folded into one native call for
+/// the whole lyric list.
+///
+/// Each line answers its `(display, is_rtl, translit)` row exactly as
+/// the reference's loop composes it: the display is the
+/// `render_lyric_line` chain (the gated wrap, then the FSI...PDI
+/// isolate — pure-LTR lines pass through unwrapped and unwrapped-in),
+/// the RTL flag the `text and has_rtl(text)` verdict (an empty line
+/// carries no class), and the transliteration present only when the
+/// toggle is on AND the line is non-empty non-ASCII (the
+/// `has_non_ascii` gate) — the `anyascii` rendering the
+/// `transliterate_line` fallback produces, the same table this crate
+/// embeds. A falsy non-string line renders as a blank row where the
+/// reference would pass the falsy value through to a blank `Static` —
+/// the two view builders only ever produce strings — and a truthy
+/// non-string raises the reference's own `TypeError`. Only the cached
+/// `bidi_mode` verdict stays Python-side, travelling in as a plain
+/// bool read once per rebuild instead of once per line; the widget
+/// mounting, the class lists and the auto-scroll stay Python-side in
+/// the sidebar.
+#[pyfunction]
+#[pyo3(signature = (lines, wrap_width, transliteration_enabled, reorder_enabled))]
+fn lyrics_view_rows(
+    lines: &Bound<'_, PyList>,
+    wrap_width: i64,
+    transliteration_enabled: bool,
+    reorder_enabled: bool,
+) -> PyResult<Vec<(String, bool, Option<String>)>> {
+    let mut rows: Vec<(String, bool, Option<String>)> = Vec::with_capacity(lines.len());
+    for item in lines.iter() {
+        // The reference's falsy passthroughs: an empty (or otherwise
+        // falsy) line renders blank, carries no RTL class and no
+        // transliteration — the single "" spelling covers both the
+        // empty string the builders produce and the falsy values they
+        // never do.
+        if !item.is_truthy()? {
+            rows.push((String::new(), false, None));
+            continue;
+        }
+        let text: String = item
+            .extract()
+            .map_err(|_| PyTypeError::new_err("expected a string line"))?;
+        let display = render_lyric_line_impl(&text, wrap_width, reorder_enabled);
+        let is_rtl = !text.is_empty() && text.chars().any(is_rtl_char);
+        let translit = if transliteration_enabled && !text.is_empty() && !text.is_ascii() {
+            Some(any_ascii::any_ascii(&text))
+        } else {
+            None
+        };
+        rows.push((display, is_rtl, translit));
+    }
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
