@@ -1,4 +1,16 @@
-"""Playback coordination mixin for YTMPlayerApp."""
+"""Playback coordination mixin for YTMPlayerApp.
+
+Two decision cores are implemented by the Rust extension when it is
+built, with pure-Python transcriptions as the fallback otherwise: the
+playback-failure policy ``_play_failure_policy`` (the verdict behind
+``_handle_play_failure`` — repeat-one's hard stop, the below-threshold
+queue advance, the end-of-queue toast, or the escalation that resets
+the resolver) and the history-report poll step ``_history_report_step``
+(the listen-threshold gate and the two-poll idle termination behind
+both report timer chains, ``_report_local_play`` and
+``_report_ytm_play``). The failure counter, the queue state, the timer
+chains and every await stay Python-side in this mixin.
+"""
 
 from __future__ import annotations
 
@@ -33,6 +45,82 @@ _YTM_PENDING_MAX = 100
 # timers keep firing when the terminal window loses focus, while position stays
 # frozen during pause. Best of both: focus-independent, pause-aware.
 _YTM_HISTORY_POLL_SECONDS = 1.0
+
+
+def _play_failure_policy(
+    repeat_mode: Any,
+    consecutive_failures: Any,
+    failure_kind: Any,
+    resolver: Any,
+    next_track: Any,
+) -> dict[str, Any]:
+    """The playback-failure policy behind ``_handle_play_failure``.
+
+    The verdict for the tail of every failed play, consulted once the
+    counter has been bumped: repeat-one answers ``stop`` (a failing
+    track in repeat-one must not skip itself forever, and nothing else
+    is consulted — the queue is not advanced); a failure count still
+    under this module's ``_MAX_CONSECUTIVE_FAILURES`` cap answers
+    ``advance`` carrying the queue's next track — pulled through
+    *next_track* exactly here, exactly once, the reference's own
+    advance-and-read — or ``end_of_queue`` when the queue has nothing
+    left; a count at the cap answers ``escalate`` with
+    ``reset_resolver`` set only when *failure_kind* is not ``None``
+    and *resolver* is truthy (the systemic failures get a fresh
+    yt-dlp instance, the no-video-id path does not). The cap is read
+    through this module's own name at call time, so a patched cap
+    steers both backends identically; the counter state, the queue,
+    the resolver reset, the toasts and the deferred advance stay with
+    the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_failure_policy``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if repeat_mode == "one":
+        return {"action": "stop"}
+    if consecutive_failures < _MAX_CONSECUTIVE_FAILURES:
+        track = next_track()
+        if track:
+            return {"action": "advance", "track": track}
+        return {"action": "end_of_queue"}
+    reset_resolver = failure_kind is not None and bool(resolver)
+    return {"action": "escalate", "reset_resolver": reset_resolver}
+
+
+def _history_report_step(
+    listened: Any,
+    min_listen_seconds: Any,
+    current_track: Any,
+    idle_polls: Any,
+) -> dict[str, Any]:
+    """The history-report poll step behind both report timer chains.
+
+    The decision ``_report_local_play`` and ``_report_ytm_play``
+    consult on every timer tick: a listen still at or under the
+    configured minimum keeps polling — the chain ends once the player
+    has been idle for two consecutive polls (``idle_polls + 1 >= 2``,
+    the two-poll window absorbing the transient ``current_track``
+    clear a duplicate mpv end-file causes on natural advance), and a
+    live track resets the idle count — while a listen strictly over
+    the minimum answers ``report``. The boundary is the reference's
+    own: ``listened <= min`` keeps polling, so a listen exactly at
+    the threshold is not yet reportable. Every comparison, the bump
+    and the window walk are CPython's own, so the error shapes stay
+    the interpreter's; the position reads, the min-listen resolution,
+    the timer re-arms and the report workers stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_history_report_step``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if listened <= min_listen_seconds:
+        if current_track is None:
+            if idle_polls + 1 >= 2:
+                return {"action": "stop"}
+            return {"action": "poll", "idle_polls": idle_polls + 1}
+        return {"action": "poll", "idle_polls": 0}
+    return {"action": "report"}
 
 
 @dataclass
@@ -305,8 +393,13 @@ class PlaybackMixin(YTMHostBase):
     ) -> None:
         """Shared tail of play_track's failure paths.
 
-        Bumps the consecutive-failure counter, auto-advances to the next
-        queue track below the threshold, and escalates at it.
+        Bumps the consecutive-failure counter, then resolves the policy
+        — repeat-one's hard stop, the below-threshold queue advance, the
+        end-of-queue toast, or the escalation that resets the resolver
+        and the counter — through ``_play_failure_policy`` (native when
+        the Rust extension is built, the pure-Python transcription
+        otherwise), which also pulls the queue's next track exactly
+        when the reference's arm consults it.
         ``failure_kind`` names the failure in the resolver-reset warning;
         ``None`` skips the resolver reset (no-video-id path).
         """
@@ -315,40 +408,48 @@ class PlaybackMixin(YTMHostBase):
             self._last_play_video_id = ""
             self._last_play_time = 0.0
         self._consecutive_failures += 1
-        if self.queue.repeat_mode == "one":
+        verdict = _play_failure_policy(
+            repeat_mode=self.queue.repeat_mode,
+            consecutive_failures=self._consecutive_failures,
+            failure_kind=failure_kind,
+            resolver=self.stream_resolver,
+            next_track=self.queue.next_track,
+        )
+        action = verdict["action"]
+        if action == "stop":
             self.notify("Playback stopped after failure. Press Play to retry.", severity="error")
-            return
-        if self._consecutive_failures < _MAX_CONSECUTIVE_FAILURES:
-            next_track = self.queue.next_track()
-            if next_track:
-                # The advance runs later; a stop or a newer play landing
-                # before it does supersedes it, and the check has to happen
-                # inside the worker — the generation at scheduling time
-                # says nothing about what arrived in between.
-                scheduled_for = self._play_generation
-                scheduled_request = request_number(self)
-                scheduled_queue = self.queue.generation
+        elif action == "advance":
+            next_track = verdict["track"]
+            # The advance runs later; a stop or a newer play landing
+            # before it does supersedes it, and the check has to happen
+            # inside the worker — the generation at scheduling time
+            # says nothing about what arrived in between.
+            scheduled_for = self._play_generation
+            scheduled_request = request_number(self)
+            scheduled_queue = self.queue.generation
 
-                async def _advance() -> None:
-                    if (
-                        scheduled_for != self._play_generation
-                        or scheduled_request != request_number(self)
-                        or scheduled_queue != self.queue.generation
-                    ):
-                        logger.debug("Deferred queue advance superseded; not playing")
-                        return
-                    await self.play_track(next_track)
+            async def _advance() -> None:
+                if (
+                    scheduled_for != self._play_generation
+                    or scheduled_request != request_number(self)
+                    or scheduled_queue != self.queue.generation
+                ):
+                    logger.debug("Deferred queue advance superseded; not playing")
+                    return
+                await self.play_track(next_track)
 
-                self.call_later(lambda: self.run_worker(_advance()))
-            else:
-                self.notify(
-                    "Playback failed — end of queue. Press Play to retry.", severity="error"
-                )
+            self.call_later(lambda: self.run_worker(_advance()))
+        elif action == "end_of_queue":
+            self.notify("Playback failed — end of queue. Press Play to retry.", severity="error")
         else:
-            if failure_kind is not None and self.stream_resolver:
+            if verdict["reset_resolver"]:
                 # Likely a systemic issue (stale session, network) — reset
                 # the yt-dlp instance so the next attempt gets a fresh one.
-                self.stream_resolver.clear_cache()
+                # (The verdict's gate already proved the resolver truthy at
+                # consult time; the re-check only narrows for the type
+                # checker — nothing runs between the two reads.)
+                if self.stream_resolver is not None:
+                    self.stream_resolver.clear_cache()
                 logger.warning(
                     "Reset yt-dlp after %d consecutive %s failures",
                     self._consecutive_failures,
@@ -924,31 +1025,31 @@ class PlaybackMixin(YTMHostBase):
     def _report_local_play(self, claim: _LocalHistoryClaim, idle_polls: int = 0) -> None:
         # Identity is the liveness check: every committed play replaces
         # ``_local_history_claim`` and finalize marks the claim consumed;
-        # either ends this chain. We deliberately do NOT gate on
-        # player.current_track — on natural advance a duplicate mpv end-file
-        # can transiently clear current_track while the track keeps playing,
-        # which would otherwise drop the play from history.
+        # either ends this chain. The threshold gate and the two-poll
+        # idle termination — the chain ends once the player is idle for
+        # two consecutive polls, because stream errors, stop and
+        # end-of-queue never bump the generation or replace the claim —
+        # are resolved by the ``_history_report_step`` engine (native
+        # when the Rust extension is built, the pure-Python
+        # transcription otherwise).
         if claim is not self._local_history_claim or claim.finalized:
             return
         if not self.history or not self.player:
             return
         listened = int(self.player.position - self._track_start_position)
-        if listened <= self._history_min_listen_seconds():
-            # End the chain once the player is idle for two consecutive
-            # polls: stream errors, stop and end-of-queue never bump the
-            # generation or replace the claim, so nothing else would stop it.
-            # Two polls (not one) so the transient current_track clear from a
-            # duplicate end-file on natural advance can't kill a live chain.
-            if self.player.current_track is None:
-                if idle_polls + 1 >= 2:
-                    return
-                next_idle = idle_polls + 1
-            else:
-                next_idle = 0
+        step = _history_report_step(
+            listened=listened,
+            min_listen_seconds=self._history_min_listen_seconds(),
+            current_track=self.player.current_track,
+            idle_polls=idle_polls,
+        )
+        if step["action"] == "poll":
             self.set_timer(
                 _YTM_HISTORY_POLL_SECONDS,
-                lambda: self._report_local_play(claim, next_idle),
+                lambda: self._report_local_play(claim, step["idle_polls"]),
             )
+            return
+        if step["action"] == "stop":
             return
         claim.insert_started = True
         self.run_worker(
@@ -1071,7 +1172,11 @@ class PlaybackMixin(YTMHostBase):
         Best-effort and non-blocking. If playback started late or was paused,
         ``position`` may still be below threshold when the timer fires; in that
         case keep polling. This means pause does not count, but reporting still
-        works without window focus.
+        works without window focus. The threshold gate and the two-poll idle
+        termination are resolved by the ``_history_report_step`` engine
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise) — the same engine behind the local
+        chain's ``_report_local_play``.
         """
         if generation != self._play_generation:
             return
@@ -1086,20 +1191,19 @@ class PlaybackMixin(YTMHostBase):
         # (``_track_start_position`` > 0), so a bare ``position`` check would
         # report the play immediately even if the user only heard a second.
         listened = int(self.player.position - self._track_start_position)
-        if listened <= self._history_min_listen_seconds():
-            # Same stable-idle termination as _report_local_play: two
-            # consecutive idle polls end the chain; one may be the transient
-            # duplicate-end-file clear.
-            if self.player.current_track is None:
-                if idle_polls + 1 >= 2:
-                    return
-                next_idle = idle_polls + 1
-            else:
-                next_idle = 0
+        step = _history_report_step(
+            listened=listened,
+            min_listen_seconds=self._history_min_listen_seconds(),
+            current_track=self.player.current_track,
+            idle_polls=idle_polls,
+        )
+        if step["action"] == "poll":
             self.set_timer(
                 _YTM_HISTORY_POLL_SECONDS,
-                lambda: self._report_ytm_play(track, video_id, generation, next_idle),
+                lambda: self._report_ytm_play(track, video_id, generation, step["idle_polls"]),
             )
+            return
+        if step["action"] == "stop":
             return
         self.run_worker(
             self._push_ytm_history_report(track, video_id, generation),
@@ -1221,3 +1325,24 @@ class PlaybackMixin(YTMHostBase):
         else:
             error = result.error or "Unknown error"
             self.notify(f"Download failed: {error}", severity="error", timeout=4)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same playback-failure policy and the
+# same history-report poll step; these bindings replace the pure-Python
+# transcriptions above when the extension is importable.  The rebinding
+# must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_failure_policy as _native_play_failure_policy,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_history_report_step as _native_history_report_step,
+    )
+except ImportError:
+    pass
+else:
+    _play_failure_policy = _native_play_failure_policy  # type: ignore[assignment]
+    _history_report_step = _native_history_report_step  # type: ignore[assignment]
