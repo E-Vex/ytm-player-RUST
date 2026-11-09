@@ -3,6 +3,13 @@
 Single mode: paste one Spotify URL → match → create YTM playlist.
 Multi mode: enter combined name + number of parts → paste N URLs →
             match all sequentially → create one combined YTM playlist.
+
+The per-track match verdict is resolved by the import service's
+``_match_classification`` engine — implemented by the Rust extension
+(``_ytm_player_native.spotify_match_classification``) when it is built,
+by the pure-Python transcription in ``services/spotify_import.py``
+otherwise. The popup owns only the search call and the display arms
+around it; no Python-side scoring/sort/threshold walk remains here.
 """
 
 from __future__ import annotations
@@ -472,7 +479,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
         from ytm_player.services.spotify_import import (
             MatchResult,
             MatchType,
-            _fuzzy_score,
+            _match_classification,
             extract_spotify_tracks,
             get_video_id,
             has_spotify_creds,
@@ -517,9 +524,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
             except Exception:
                 search_results = []
 
-            result = self._classify_match(
-                sp_track, search_results, MatchType, MatchResult, _fuzzy_score
-            )
+            result = _match_classification(sp_track, search_results)
             results.append(result)
 
             display_text = f"{sp_track['name']} — {sp_track['artist']}"
@@ -636,9 +641,8 @@ class SpotifyImportPopup(BasePopup[str | None]):
     async def _do_multi_import(self) -> None:
         """Process all split playlists sequentially."""
         from ytm_player.services.spotify_import import (
-            MatchResult,
             MatchType,
-            _fuzzy_score,
+            _match_classification,
             extract_spotify_tracks,
             get_video_id,
         )
@@ -690,9 +694,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
                 except Exception:
                     search_results = []
 
-                result = self._classify_match(
-                    sp_track, search_results, MatchType, MatchResult, _fuzzy_score
-                )
+                result = _match_classification(sp_track, search_results)
                 self._all_results.append(result)
 
                 display_text = f"{sp_track['name']} — {sp_track['artist']}"
@@ -720,40 +722,6 @@ class SpotifyImportPopup(BasePopup[str | None]):
             self._start_disambiguation()
         else:
             self._show_summary(MatchType, get_video_id)
-
-    # ── Shared: match classification ─────────────────────────────────
-
-    @staticmethod
-    def _classify_match(
-        sp_track: dict,
-        search_results: list[dict],
-        MatchType,
-        MatchResult,
-        _fuzzy_score,
-    ):
-        """Score candidates and classify the match."""
-        from ytm_player.services.spotify_import import AUTO_MATCH_THRESHOLD
-
-        if not search_results:
-            return MatchResult(spotify_track=sp_track, match_type=MatchType.NONE)
-
-        scored = [(_fuzzy_score(sp_track, c), c) for c in search_results]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_candidate = scored[0]
-
-        if best_score >= AUTO_MATCH_THRESHOLD:
-            return MatchResult(
-                spotify_track=sp_track,
-                match_type=MatchType.EXACT,
-                candidates=[c for _, c in scored],
-                selected=best_candidate,
-            )
-        return MatchResult(
-            spotify_track=sp_track,
-            match_type=MatchType.MULTIPLE,
-            candidates=[c for _, c in scored],
-            selected=None,
-        )
 
     # ── Shared: disambiguation ───────────────────────────────────────
 
