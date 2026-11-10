@@ -1,4 +1,19 @@
-"""Track action handling mixin for YTMPlayerApp."""
+"""Track action handling mixin for YTMPlayerApp.
+
+The module's pure decision cores are dual-implemented: the Rust
+extension (``_ytm_player_native``) implements them when it is built,
+and the pure-Python transcriptions below run otherwise — the ID
+extractions (``_first_artist_id``, ``_album_browse_id``), the
+occurrence gate (``_queue_entry_id``), the popup-answer classification
+(``_track_action_route``), the entity-action dispatch (``_entity_action_route``),
+the like-toggle rating (``_like_toggle_rating``), the Remove-from-Queue
+plan (``_remove_from_queue_plan``), the in-queue verdict
+(``_in_queue_verdict``) and the artist-songs merge plan
+(``_artist_songs_merge_plan``). The bottom-of-module seam rebinds each
+to the native function when the extension is importable. The popups,
+the notifications, the awaited workers, the queue mutations and the
+navigation calls stay Python-side in the mixin.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +33,17 @@ logger = logging.getLogger(__name__)
 
 
 def _first_artist_id(source: dict) -> str:
-    """Browse ID of the first artist listed on a track/entity dict, or ''."""
+    """Browse ID of the first artist listed on a track/entity dict, or ''.
+
+    The gate is the reference's own — ``isinstance(artists, list) and
+    artists and isinstance(artists[0], dict)`` — and the answer the raw
+    ``artists[0].get("id") or artists[0].get("browseId", "")`` result
+    (the browseId default ``""`` included).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.first_artist_id``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
     artists = source.get("artists")
     if isinstance(artists, list) and artists and isinstance(artists[0], dict):
         return artists[0].get("id") or artists[0].get("browseId", "")
@@ -30,11 +55,315 @@ def _album_browse_id(source: dict) -> str:
 
     The nested album id must outrank the top-level ``browseId``: track dicts
     can carry a non-album ``browseId``, while album entities have no nested
-    ``album`` dict and legitimately resolve through ``browseId``.
+    ``album`` dict and legitimately resolve through ``browseId``. The reads
+    happen in the reference's own order — ``album`` first, the nested ``id``
+    only when the album is a dict — and the truthiness chain
+    ``album_id or nested or browseId or ""`` short-circuits each read.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.album_browse_id``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     album = source.get("album")
     nested = album.get("id") if isinstance(album, dict) else None
     return source.get("album_id") or nested or source.get("browseId") or ""
+
+
+def _queue_entry_id(from_queue: Any, key: Any) -> Any:
+    """The queue entry id a row's occurrence *key* names, or None.
+
+    Only the Queue page's table keys its rows by queue entry id
+    (``from_queue``); any other table's key, or no key, names no queue
+    occurrence. The gate is ``from_queue and isinstance(key, int)`` — a
+    ``bool`` key counts, CPython's own subclass rule — and the key
+    object passes through unchanged.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.queue_entry_id``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return key if from_queue and isinstance(key, int) else None
+
+
+def _track_action_route(action_id: Any) -> dict[str, Any]:
+    """The classification behind the track ActionsPopup's result callback.
+
+    Which handler ``_handle_action_result`` routes an *action_id* to:
+    ``None`` answers nothing (``"none"``), the first equal match among
+    the twelve known action ids answers its own arm name, and anything
+    no arm claims is ``"unhandled"`` — the reference's if/elif chain
+    has no else, so an unknown id simply does nothing. Every comparison
+    is CPython's own ``==``, and the arm order is the reference's own
+    (first equal match wins).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_action_route``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if action_id is None:
+        return {"handler": "none"}
+    arms = (
+        "add_to_playlist",
+        "play",
+        "download",
+        "play_next",
+        "add_to_queue",
+        "remove_from_queue",
+        "start_radio",
+        "go_to_artist",
+        "go_to_album",
+        "toggle_like",
+        "copy_link",
+        "remove_from_playlist",
+    )
+    for arm in arms:
+        if action_id == arm:
+            return {"handler": arm}
+    return {"handler": "unhandled"}
+
+
+def _entity_action_route(action_id: Any, item: Any, item_type: Any) -> dict[str, Any]:
+    """The dispatch behind ``_dispatch_entity_action``.
+
+    The pure half of the entity dispatch: the entity id and name are
+    extracted first (``item.get("browseId") or item.get("album_id") or
+    item.get("playlistId") or ""`` and ``item.get("title") or
+    item.get("name") or item.get("artist") or "Unknown"``, each read
+    short-circuited by every earlier falsy one), then the arms, in the
+    reference's own order: ``play_all``/``shuffle_play`` answer
+    ``"_play_album"``/``"_play_playlist"`` (with the ``shuffle`` flag)
+    for the album and playlist types, ``add_to_queue`` and ``play_next``
+    answer their album/playlist enqueue methods, ``start_radio`` answers
+    ``"_start_artist_radio"`` for artists and ``"_start_playlist_radio"``
+    for playlists (the playlist arm with no id gate), ``play_top_songs``
+    answers ``"_play_artist_top_songs"`` for artists,
+    ``go_to_artist``/``view_similar`` answer ``"_navigate_artist"`` with
+    the first-artist id when the item lists artists and the entity id
+    for artist items otherwise, ``go_to_album`` answers
+    ``"_navigate_album"`` with the album browse id, and ``add_to_library``
+    answers ``"_add_album_to_library"`` for albums. Every typed arm
+    without an entity id answers ``"notify"`` (handled — the caller's
+    own "No ID available" toast); an action no arm claims — or a type
+    the arm doesn't serve — answers ``"unhandled"`` with ``handled``
+    false.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.entity_action_route``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    entity_id = item.get("browseId") or item.get("album_id") or item.get("playlistId") or ""
+    entity_name = item.get("title") or item.get("name") or item.get("artist") or "Unknown"
+
+    if action_id in ("play_all", "shuffle_play"):
+        shuffle = action_id == "shuffle_play"
+        if item_type == "album":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_play_album",
+                "shuffle": shuffle,
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        if item_type == "playlist":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_play_playlist",
+                "shuffle": shuffle,
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        return {"handled": False, "handler": "unhandled"}
+
+    if action_id == "add_to_queue":
+        if item_type == "album":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_add_album_to_queue",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        if item_type == "playlist":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_add_playlist_to_queue",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        return {"handled": False, "handler": "unhandled"}
+
+    if action_id == "play_next":
+        if item_type == "album":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_add_album_next",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        if item_type == "playlist":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_add_playlist_next",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        return {"handled": False, "handler": "unhandled"}
+
+    if action_id == "start_radio":
+        if item_type == "artist":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {"handled": True, "handler": "_start_artist_radio", "entity_id": entity_id}
+        if item_type == "playlist":
+            # No id gate — the caller passes the item itself.
+            return {"handled": True, "handler": "_start_playlist_radio"}
+        return {"handled": False, "handler": "unhandled"}
+
+    if action_id == "play_top_songs":
+        if item_type == "artist":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {"handled": True, "handler": "_play_artist_top_songs", "entity_id": entity_id}
+        return {"handled": False, "handler": "unhandled"}
+
+    if action_id in ("go_to_artist", "view_similar"):
+        artists = item.get("artists")
+        if isinstance(artists, list) and artists:
+            artist_id = _first_artist_id(item)
+        else:
+            artist_id = entity_id if item_type == "artist" else ""
+        if not artist_id:
+            return {"handled": True, "handler": "notify"}
+        return {"handled": True, "handler": "_navigate_artist", "artist_id": artist_id}
+
+    if action_id == "go_to_album":
+        album_id = _album_browse_id(item)
+        if not album_id:
+            return {"handled": True, "handler": "notify"}
+        return {"handled": True, "handler": "_navigate_album", "album_id": album_id}
+
+    if action_id == "add_to_library":
+        if item_type == "album":
+            if not entity_id:
+                return {"handled": True, "handler": "notify"}
+            return {
+                "handled": True,
+                "handler": "_add_album_to_library",
+                "entity_id": entity_id,
+                "entity_name": entity_name,
+            }
+        return {"handled": False, "handler": "unhandled"}
+
+    return {"handled": False, "handler": "unhandled"}
+
+
+def _like_toggle_rating(track: Any) -> dict[str, Any]:
+    """The like-toggle rating behind the track ActionsPopup's Like arm.
+
+    ``is_liked`` is the raw ``track.get("likeStatus") == "LIKE" or
+    track.get("liked", False)`` result — the ``or`` keeping the very
+    object it selected — and the rating/label pair
+    (``"INDIFFERENT"``/``"Unliked"`` when the or-result is truthy,
+    ``"LIKE"``/``"Liked"`` otherwise) resolves through that same
+    truthiness.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.like_toggle_rating``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    is_liked = track.get("likeStatus") == "LIKE" or track.get("liked", False)
+    rating = "INDIFFERENT" if is_liked else "LIKE"
+    label = "Unliked" if is_liked else "Liked"
+    return {"is_liked": is_liked, "rating": rating, "label": label}
+
+
+def _remove_from_queue_plan(
+    from_queue: Any,
+    queue_entry_id: Any,
+    queue_tracks: Any,
+    video_id: Any,
+) -> dict[str, Any]:
+    """The removal plan behind ``_remove_from_queue``.
+
+    The occurrence arm ``from_queue or queue_entry_id is not None``
+    answers ``"entry"`` when an id is present (the caller's own
+    ``remove_entry`` attempt deciding success — only that occurrence
+    may go) and ``"stale"`` when ``from_queue`` carries no id (a Queue
+    page row whose id could not be read is stale, never nameless).
+    Without any occurrence to name, a falsy video id answers ``"none"``,
+    and otherwise the first queue row whose ``t.get("video_id") ==
+    video_id`` answers ``"remove_at"`` carrying that row's index — a
+    no-match walk answering ``"none"``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.remove_from_queue_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if from_queue or queue_entry_id is not None:
+        return {"arm": "entry" if queue_entry_id is not None else "stale"}
+    if not video_id:
+        return {"arm": "none"}
+    for i, t in enumerate(queue_tracks):
+        if t.get("video_id") == video_id:
+            return {"arm": "remove_at", "index": i}
+    return {"arm": "none"}
+
+
+def _in_queue_verdict(video_id: Any, queue_tracks: Any) -> bool:
+    """Whether the track the actions popup opens on is already queued.
+
+    The popup swaps "Add to Queue" for "Remove from Queue" when it is.
+    A falsy video id answers False without touching the queue; otherwise
+    the ``any()`` walk — each row's ``t.get("video_id") == video_id`` —
+    short-circuits on the first equal row.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.in_queue_verdict``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return bool(video_id) and any(t.get("video_id") == video_id for t in queue_tracks)
+
+
+def _artist_songs_merge_plan(
+    all_tracks: Any,
+    initial_tracks: Any,
+    queue_tracks: Any,
+) -> dict[str, Any]:
+    """The enrich-and-append plan behind ``_fetch_remaining_artist_songs``.
+
+    The full list's index ``{t.get("video_id", ""): t for t in all_tracks
+    if t.get("video_id")}`` (last-wins per video id) and the initial
+    batch's id set are built first, then the enrichment pass answers one
+    ``(queue_track, full_track)`` pair per queue track whose id is in the
+    index — the very objects, so the caller's in-place updates hit the
+    queue's own dicts — and the append pass answers every all-track
+    whose id is not in the initial set (duplicates within the fetch
+    included, the membership-only check the reference runs).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_songs_merge_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    full_by_id = {t.get("video_id", ""): t for t in all_tracks if t.get("video_id")}
+    existing_ids = {t.get("video_id", "") for t in initial_tracks}
+    updates = [
+        (qt, full_by_id[qt.get("video_id", "")])
+        for qt in queue_tracks
+        if qt.get("video_id", "") in full_by_id
+    ]
+    appends = [t for t in all_tracks if t.get("video_id", "") not in existing_ids]
+    return {"updates": updates, "appends": appends}
 
 
 class TrackActionsMixin(YTMHostBase):
@@ -69,9 +398,12 @@ class TrackActionsMixin(YTMHostBase):
 
         Only the Queue page's table keys its rows by queue entry id
         (``from_queue``); any other table's key, or no key, names no queue
-        occurrence.
+        occurrence. Delegates to the ``_queue_entry_id`` engine (native
+        when the Rust extension is built, the pure-Python transcription
+        otherwise) — the module-level function of the same name, looked
+        up at call time so the bottom-of-module seam steers it.
         """
-        return key if from_queue and isinstance(key, int) else None
+        return _queue_entry_id(from_queue, key)
 
     def _resolve_action_track(self) -> dict | None:
         """Focused-table track, falling back to the currently playing track."""
@@ -213,52 +545,64 @@ class TrackActionsMixin(YTMHostBase):
         *queue_entry_id* names the queue occurrence the popup was opened on
         (a Queue page row); *from_queue* says the track came from that page
         even if no id could be read, so removal never guesses by video id.
+        The popup-answer routing — which handler each picked action goes
+        to — resolves through the ``_track_action_route`` engine (native
+        when the Rust extension is built, the pure-Python transcription
+        otherwise), the in-queue verdict through ``_in_queue_verdict``, the
+        like-toggle rating through ``_like_toggle_rating``, and the
+        artist/album navigation targets through the ``_first_artist_id``
+        and ``_album_browse_id`` engines; this method performs each arm's
+        calls.
         """
 
         def _handle_action_result(action_id: str | None) -> None:
             """Callback when the user picks an action from the popup."""
-            if action_id is None:
+            handler = _track_action_route(action_id)["handler"]
+
+            if handler == "none" or handler == "unhandled":
+                # The reference's if/elif chain has no else — an unknown
+                # id simply does nothing.
                 return
 
-            if action_id == "add_to_playlist":
+            if handler == "add_to_playlist":
                 video_id = get_video_id(track)
                 if video_id:
                     self.push_screen(PlaylistPicker(video_ids=[video_id], tracks=[track]))
                 return
 
-            if action_id == "play":
+            if handler == "play":
                 self.run_worker(
                     self._play_popup_track(track, queue_entry_id, from_queue=from_queue)
                 )
-            elif action_id == "download":
+            elif handler == "download":
                 self.run_worker(self._download_track(track))
-            elif action_id == "play_next":
+            elif handler == "play_next":
                 self._play_track_next(track)
-            elif action_id == "add_to_queue":
+            elif handler == "add_to_queue":
                 self._enqueue_track(track)
-            elif action_id == "remove_from_queue":
+            elif handler == "remove_from_queue":
                 self._remove_from_queue(track, queue_entry_id, from_queue=from_queue)
-            elif action_id == "start_radio":
+            elif handler == "start_radio":
                 self.run_worker(self._fetch_and_play_radio(track))
-            elif action_id == "go_to_artist":
+            elif handler == "go_to_artist":
                 artist_id = _first_artist_id(track)
                 if artist_id:
                     self.run_worker(
                         self.navigate_to("context", context_type="artist", context_id=artist_id)
                     )
-            elif action_id == "go_to_album":
+            elif handler == "go_to_album":
                 album_id = _album_browse_id(track)
                 if album_id:
                     self.run_worker(
                         self.navigate_to("context", context_type="album", context_id=album_id)
                     )
-            elif action_id == "toggle_like":
+            elif handler == "toggle_like":
                 video_id = get_video_id(track)
                 ytmusic = self.ytmusic
                 if video_id and ytmusic is not None:
-                    is_liked = track.get("likeStatus") == "LIKE" or track.get("liked", False)
-                    rating = "INDIFFERENT" if is_liked else "LIKE"
-                    label = "Unliked" if is_liked else "Liked"
+                    verdict = _like_toggle_rating(track)
+                    rating = verdict["rating"]
+                    label = verdict["label"]
 
                     async def _rate(vid: str, r: str, lbl: str) -> None:
                         from ytm_player.services.ytmusic import mutation_failure_suffix
@@ -275,7 +619,7 @@ class TrackActionsMixin(YTMHostBase):
                             )
 
                     self.run_worker(_rate(video_id, rating, label))
-            elif action_id == "copy_link":
+            elif handler == "copy_link":
                 video_id = get_video_id(track)
                 if video_id:
                     link = f"https://music.youtube.com/watch?v={video_id}"
@@ -283,15 +627,16 @@ class TrackActionsMixin(YTMHostBase):
                         self.notify("Link copied", timeout=2)
                     else:
                         self.notify(link, timeout=5)
-            elif action_id == "remove_from_playlist":
+            elif handler == "remove_from_playlist":
                 self.run_worker(self._remove_track_from_playlist(track))
 
         # Detect whether this track is currently in the queue so the popup
-        # can swap "Add to Queue" for "Remove from Queue".
+        # can swap "Add to Queue" for "Remove from Queue" — the verdict
+        # resolved by the ``_in_queue_verdict`` engine (native when the
+        # Rust extension is built, the pure-Python transcription
+        # otherwise).
         track_vid = get_video_id(track)
-        in_queue = bool(track_vid) and any(
-            t.get("video_id") == track_vid for t in self.queue.tracks
-        )
+        in_queue = _in_queue_verdict(track_vid, self.queue.tracks)
         # Detect whether we're viewing a playlist so "Remove from Playlist"
         # can be offered.
         in_playlist = self._current_page == "library" and bool(
@@ -314,8 +659,21 @@ class TrackActionsMixin(YTMHostBase):
         could not be read (*from_queue* without an id) is treated the same
         way. Only without any occurrence to name (popup opened from the
         playback bar or another page) does the first copy by video id go.
+
+        The removal plan — which arm the removal takes — resolves through
+        the ``_remove_from_queue_plan`` engine (native when the Rust
+        extension is built, the pure-Python transcription otherwise); the
+        removals, the queue-page refreshes and the toasts stay here.
         """
-        if from_queue or queue_entry_id is not None:
+        plan = _remove_from_queue_plan(
+            from_queue, queue_entry_id, self.queue.tracks, get_video_id(track)
+        )
+        arm = plan["arm"]
+        if arm == "entry":
+            # The engine's entry arm answers only with an id present; the
+            # id re-check narrows for the type checker exactly like the
+            # reference's own compound gate — nothing runs between the
+            # consult and here that could clear it.
             if queue_entry_id is not None and self.queue.remove_entry(queue_entry_id):
                 self._refresh_queue_page()
                 self.notify("Removed from queue", timeout=2)
@@ -323,15 +681,14 @@ class TrackActionsMixin(YTMHostBase):
                 self._refresh_queue_page()
                 self.notify("That queue entry is no longer present", severity="warning", timeout=3)
             return
-        video_id = get_video_id(track)
-        if not video_id:
+        if arm == "stale":
+            self._refresh_queue_page()
+            self.notify("That queue entry is no longer present", severity="warning", timeout=3)
             return
-        for i, t in enumerate(self.queue.tracks):
-            if t.get("video_id") == video_id:
-                self.queue.remove(i)
-                self._refresh_queue_page()
-                self.notify("Removed from queue", timeout=2)
-                break
+        if arm == "remove_at":
+            self.queue.remove(plan["index"])
+            self._refresh_queue_page()
+            self.notify("Removed from queue", timeout=2)
 
     def _sync_shuffle_bar(self) -> None:
         try:
@@ -674,7 +1031,15 @@ class TrackActionsMixin(YTMHostBase):
     async def _fetch_remaining_artist_songs(
         self, browse_id: str, initial_tracks: list[dict[str, Any]]
     ) -> None:
-        """Background-fetch the full artist song list, enrich initial tracks, and append rest."""
+        """Background-fetch the full artist song list, enrich initial tracks, and append rest.
+
+        The enrich-and-append plan — which queued initial tracks get
+        enriched from which full-list entries, and which fetched tracks
+        are appended — resolves through the ``_artist_songs_merge_plan``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the in-place updates, the
+        queue adds and the queue-page refresh stay here.
+        """
         try:
             if not self.ytmusic:
                 return
@@ -682,15 +1047,11 @@ class TrackActionsMixin(YTMHostBase):
             if not owns_request(self):
                 return
             all_tracks = normalize_tracks(pl.get("tracks", []) if isinstance(pl, dict) else [])
-            full_by_id = {t.get("video_id", ""): t for t in all_tracks if t.get("video_id")}
-            existing_ids = {t.get("video_id", "") for t in initial_tracks}
-            for qt in self.queue.tracks:
-                vid = qt.get("video_id", "")
-                if vid in full_by_id:
-                    qt.update(full_by_id[vid])
-            for t in all_tracks:
-                if t.get("video_id", "") not in existing_ids:
-                    self.queue.add(t)
+            plan = _artist_songs_merge_plan(all_tracks, initial_tracks, self.queue.tracks)
+            for queue_track, full in plan["updates"]:
+                queue_track.update(full)
+            for t in plan["appends"]:
+                self.queue.add(t)
             self._refresh_queue_page()
         except Exception:
             logger.debug("Background artist songs fetch failed", exc_info=True)
@@ -797,109 +1158,52 @@ class TrackActionsMixin(YTMHostBase):
 
     @playback_request
     async def _dispatch_entity_action(self, action_id: str, item: dict, item_type: str) -> bool:
-        """Dispatch an entity action to the correct method. Returns True if handled."""
-        entity_id = item.get("browseId") or item.get("album_id") or item.get("playlistId") or ""
-        entity_name = item.get("title") or item.get("name") or item.get("artist") or "Unknown"
+        """Dispatch an entity action to the correct method. Returns True if handled.
 
-        if action_id in ("play_all", "shuffle_play"):
-            shuffle = action_id == "shuffle_play"
-            if item_type == "album":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._play_album(entity_id, entity_name, shuffle=shuffle)
-            elif item_type == "playlist":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._play_playlist(entity_id, entity_name, shuffle=shuffle)
-            else:
-                return False
+        The dispatch classification — which method each (action_id,
+        item_type) pair routes to, the entity id/name extraction from the
+        item, the missing-id early-outs, and the go_to_artist/go_to_album
+        target resolution — runs through the ``_entity_action_route``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); this method performs each
+        arm's calls.
+        """
+        route = _entity_action_route(action_id, item, item_type)
+        if not route["handled"]:
+            return False
+        handler = route["handler"]
+        if handler == "notify":
+            self.notify("No ID available", severity="error", timeout=2)
             return True
-
-        if action_id == "add_to_queue":
-            if item_type == "album":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._add_album_to_queue(entity_id, entity_name)
-            elif item_type == "playlist":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._add_playlist_to_queue(entity_id, entity_name)
-            else:
-                return False
-            return True
-
-        if action_id == "play_next":
-            if item_type == "album":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._add_album_next(entity_id, entity_name)
-            elif item_type == "playlist":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._add_playlist_next(entity_id, entity_name)
-            else:
-                return False
-            return True
-
-        if action_id == "start_radio":
-            if item_type == "artist":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._start_artist_radio(entity_id)
-            elif item_type == "playlist":
-                await self._start_playlist_radio(item)
-            else:
-                return False
-            return True
-
-        if action_id == "play_top_songs":
-            if item_type == "artist":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._play_artist_top_songs(entity_id)
-            else:
-                return False
-            return True
-
-        if action_id in ("go_to_artist", "view_similar"):
-            artists = item.get("artists")
-            if isinstance(artists, list) and artists:
-                artist_id = _first_artist_id(item)
-            else:
-                artist_id = entity_id if item_type == "artist" else ""
-            if not artist_id:
-                self.notify("No ID available", severity="error", timeout=2)
-                return True
-            await self.navigate_to("context", context_type="artist", context_id=artist_id)
-            return True
-
-        if action_id == "go_to_album":
-            album_id = _album_browse_id(item)
-            if not album_id:
-                self.notify("No ID available", severity="error", timeout=2)
-                return True
-            await self.navigate_to("context", context_type="album", context_id=album_id)
-            return True
-
-        if action_id == "add_to_library":
-            if item_type == "album":
-                if not entity_id:
-                    self.notify("No ID available", severity="error", timeout=2)
-                    return True
-                await self._add_album_to_library(entity_id, entity_name)
-            else:
-                return False
-            return True
-
-        return False
+        if handler == "_play_album":
+            await self._play_album(
+                route["entity_id"], route["entity_name"], shuffle=route["shuffle"]
+            )
+        elif handler == "_play_playlist":
+            await self._play_playlist(
+                route["entity_id"], route["entity_name"], shuffle=route["shuffle"]
+            )
+        elif handler == "_add_album_to_queue":
+            await self._add_album_to_queue(route["entity_id"], route["entity_name"])
+        elif handler == "_add_playlist_to_queue":
+            await self._add_playlist_to_queue(route["entity_id"], route["entity_name"])
+        elif handler == "_add_album_next":
+            await self._add_album_next(route["entity_id"], route["entity_name"])
+        elif handler == "_add_playlist_next":
+            await self._add_playlist_next(route["entity_id"], route["entity_name"])
+        elif handler == "_start_artist_radio":
+            await self._start_artist_radio(route["entity_id"])
+        elif handler == "_start_playlist_radio":
+            await self._start_playlist_radio(item)
+        elif handler == "_play_artist_top_songs":
+            await self._play_artist_top_songs(route["entity_id"])
+        elif handler == "_navigate_artist":
+            await self.navigate_to("context", context_type="artist", context_id=route["artist_id"])
+        elif handler == "_navigate_album":
+            await self.navigate_to("context", context_type="album", context_id=route["album_id"])
+        elif handler == "_add_album_to_library":
+            await self._add_album_to_library(route["entity_id"], route["entity_name"])
+        return True
 
     _PLAYLIST_FIRST_BATCH = 300
 
@@ -1044,3 +1348,59 @@ class TrackActionsMixin(YTMHostBase):
             bar.text = getattr(message, "text", "")
         except Exception:
             logger.debug("Failed to relay SelectionChanged to bar", exc_info=True)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same track-action decision cores; these
+# bindings replace the pure-Python transcriptions above when the extension
+# is importable.  The rebinding must happen AFTER the definitions above —
+# assigning the native functions any earlier would be clobbered by the
+# ``def`` statements (the lesson that produced formatting.py's dead native
+# bindings).  The mixin's ``_queue_entry_id`` staticmethod delegates to the
+# module-level ``_queue_entry_id`` engine through this same name, so the
+# seam steers it too.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        album_browse_id as _native_album_browse_id,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        artist_songs_merge_plan as _native_artist_songs_merge_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        entity_action_route as _native_entity_action_route,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        first_artist_id as _native_first_artist_id,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        in_queue_verdict as _native_in_queue_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        like_toggle_rating as _native_like_toggle_rating,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        queue_entry_id as _native_queue_entry_id,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        remove_from_queue_plan as _native_remove_from_queue_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_action_route as _native_track_action_route,
+    )
+except ImportError:
+    pass
+else:
+    _first_artist_id = _native_first_artist_id  # type: ignore[assignment]
+    _album_browse_id = _native_album_browse_id  # type: ignore[assignment]
+    _queue_entry_id = _native_queue_entry_id  # type: ignore[assignment]
+    _track_action_route = _native_track_action_route  # type: ignore[assignment]
+    _entity_action_route = _native_entity_action_route  # type: ignore[assignment]
+    _like_toggle_rating = _native_like_toggle_rating  # type: ignore[assignment]
+    _remove_from_queue_plan = (  # type: ignore[assignment]
+        _native_remove_from_queue_plan
+    )
+    _in_queue_verdict = _native_in_queue_verdict  # type: ignore[assignment]
+    _artist_songs_merge_plan = (  # type: ignore[assignment]
+        _native_artist_songs_merge_plan
+    )
