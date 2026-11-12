@@ -4,11 +4,17 @@ The page's pure home-feed classification engine — ``_is_event_shelf`` /
 ``_chart_sort_key`` / ``_split_events_and_charts`` (the event-vs-chart
 partition and priority pill ordering behind the Charts tab) and
 ``_is_playlist_row`` / ``_playlist_rows`` (the playlist-row extraction
-with per-id dedup behind the Playlists tab) — is implemented by the Rust
-extension (``_ytm_player_native``) when it is built and by the pure-Python
-transcriptions in this module otherwise; the bottom-of-module seam rebinds
-the engine to the native functions when the extension is importable. The
-widgets below only do I/O and rendering.
+with per-id dedup behind the Playlists tab) — and its rendering path —
+``_browse_item_route`` (the item-routing decision behind
+``navigate_browse_item``), ``_foryou_shelf_rows`` (the For You shelf
+view model), the Charts tab's ``_charts_raw_shelves`` /
+``_charts_pill_rows`` / ``_charts_country_label`` /
+``_charts_event_row_visible`` and the Releases / Playlists /
+Subscriptions row labels — are implemented by the Rust extension
+(``_ytm_player_native``) when it is built and by the pure-Python
+transcriptions in this module otherwise; the bottom-of-module seam
+rebinds the engines to the native functions when the extension is
+importable. The widgets below only do I/O and mounting.
 """
 
 from __future__ import annotations
@@ -206,16 +212,199 @@ def _playlist_rows(shelves: list[Any]) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Rendering view models (the per-section row/pill label assembly)
+# ---------------------------------------------------------------------------
+
+
+def _foryou_shelf_rows(shelf: dict[str, Any]) -> tuple[Any, list[tuple[Any, dict[str, Any]]]]:
+    """The For You shelf view model: one shelf's ``(title, rows)``.
+
+    *rows* holds up to eight ``(display, item)`` pairs — the item title
+    over the artist/description subtitle (joined ``" - "``), the
+    combined line truncated to 80 characters — and is empty when the
+    shelf has no contents. The title and each bare item title pass
+    through as the objects they are (only a combined line is
+    stringified); the row items are the feed's own objects, no copies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.foryou_shelf_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = shelf.get("title", "Recommendations")
+    contents = shelf.get("contents", [])
+    if not contents:
+        return title, []
+    rows: list[tuple[Any, dict[str, Any]]] = []
+    for item in contents[:8]:
+        item_title = item.get("title", "Unknown")
+        subtitle_parts: list[str] = []
+        artist_str = extract_artist(item)
+        if artist_str and artist_str != "Unknown":
+            subtitle_parts.append(artist_str)
+        description = item.get("description", "")
+        if description:
+            subtitle_parts.append(str(description))
+        subtitle = " - ".join(subtitle_parts)
+        display = truncate(f"{item_title}  {subtitle}", 80) if subtitle else item_title
+        rows.append((display, item))
+    return title, rows
+
+
+def _charts_raw_shelves(chart_data: Any) -> list[dict[str, Any]]:
+    """The raw chart shelves from a ``get_charts()`` payload.
+
+    The ``daily``, ``weekly`` and ``videos`` arrays in that order,
+    keeping only the dict shelves. A payload that is not a dict — the
+    service's ``None`` failure marker included — answers no shelves.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.charts_raw_shelves``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    raw: list[dict[str, Any]] = []
+    if isinstance(chart_data, dict):
+        for key in ("daily", "weekly", "videos"):
+            arr = chart_data.get(key)
+            if isinstance(arr, list):
+                raw.extend(s for s in arr if isinstance(s, dict))
+    return raw
+
+
+def _charts_pill_rows(
+    dailies: list[dict[str, Any]],
+    event_count: int,
+    active_daily: int,
+) -> list[tuple[str, str]]:
+    """The chart pill row view model: each shelf's ``(label, classes)``.
+
+    The label is the shelf title normalised by the shared
+    ``clean_shelf_title`` (the ``Shelf {n}`` fallback for a missing or
+    falsy one); the classes mark the leading event shelves (``event``)
+    and the shelf the table shows (``active``). The pill ids and the
+    mounting stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.charts_pill_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    rows: list[tuple[str, str]] = []
+    for i, shelf in enumerate(dailies):
+        raw_title = (shelf.get("title") if isinstance(shelf, dict) else None) or f"Shelf {i + 1}"
+        title = clean_shelf_title(str(raw_title))
+        classes = "shelf-pill event" if i < event_count else "shelf-pill"
+        if i == active_daily:
+            classes += " active"
+        rows.append((title, classes))
+    return rows
+
+
+def _charts_country_label(country: str) -> str:
+    """The chart country line shown above the pills.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.charts_country_label``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return f"Country: {country}    (press 'c' to change)"
+
+
+def _charts_event_row_visible(event_count: int, term_width: int, narrow_threshold: int) -> bool:
+    """The event pill row's visibility gate: at least one event shelf
+    and a terminal at least *narrow_threshold* columns wide.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.charts_event_row_visible``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return event_count > 0 and term_width >= narrow_threshold
+
+
+def _new_release_label(album: dict[str, Any]) -> str:
+    """The Releases row label for one album: the title, ``by <artist>``
+    when known, and the ``(<type>, <year>)`` meta clause — truncated to
+    80 characters.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.new_release_label``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = album.get("title", "Unknown Album")
+    artist_str = extract_artist(album)
+    if artist_str == "Unknown":
+        artist_str = ""
+    album_type = album.get("type", "")
+    year = album.get("year", "")
+
+    parts = [title]
+    if artist_str:
+        parts.append(f"by {artist_str}")
+    meta_parts: list[str] = []
+    if album_type:
+        meta_parts.append(album_type)
+    if year:
+        meta_parts.append(str(year))
+    if meta_parts:
+        parts.append(f"({', '.join(meta_parts)})")
+
+    return truncate(" ".join(parts), 80)
+
+
+def _playlist_row_label(playlist: dict[str, Any]) -> str:
+    """The Playlists row label for one home-feed playlist row: the title
+    (``Untitled playlist`` when missing) plus the parenthesised
+    description, or ``(<count> songs)`` when there is no description.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playlist_row_label``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    title = playlist.get("title") or "Untitled playlist"
+    parts = [str(title)]
+    description = playlist.get("description", "")
+    count = playlist.get("count", "")
+    if description:
+        parts.append(f"({description})")
+    elif count:
+        parts.append(f"({count} songs)")
+    return truncate(" ".join(parts), 80)
+
+
+def _subscription_label(artist: dict[str, Any]) -> str:
+    """The Subscriptions row label for one subscribed artist: the name
+    plus ``  (<subscribers> subscribers)`` when the count is known —
+    truncated to 80 characters.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.subscription_label``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    name = artist.get("artist", "Unknown artist")
+    subscribers = artist.get("subscribers", "")
+    display = f"{name}  ({subscribers} subscribers)" if subscribers else name
+    return truncate(display, 80)
+
+
+# ---------------------------------------------------------------------------
 # Shared item routing
 # ---------------------------------------------------------------------------
 
 
-async def navigate_browse_item(host: "YTMHostBase", item: dict[str, Any]) -> None:
-    """Route a get_home()-shaped item to the right context page, or play it
-    directly if it's a track.
+def _browse_item_route(item: dict[str, Any]) -> tuple[str, str]:
+    """The routing decision behind ``navigate_browse_item``: which
+    branch a get_home()-shaped item takes, and the context id it
+    navigates with.
 
-    Shared by every Browse tab that surfaces raw get_home() shelf content
-    (For You and Playlists), so the routing rules live in exactly one place.
+    The answer is ``(kind, context_id)`` — ``"play"`` for a track (the
+    caller plays the item itself, so the id is empty), one of
+    ``"album"`` / ``"artist"`` / ``"playlist"`` for a context
+    navigation, or ``("", "")`` when no branch applies (the branch's
+    own id gate folded in: an album or artist without a browse id
+    classifies as no route, exactly like the reference's ``if``
+    guards).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.browse_item_route``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
     """
     result_type = (item.get("resultType") or item.get("type") or "").lower()
     video_id = get_video_id(item)
@@ -223,29 +412,46 @@ async def navigate_browse_item(host: "YTMHostBase", item: dict[str, Any]) -> Non
     playlist_id = item.get("playlistId") or item.get("audioPlaylistId")
 
     if result_type in ("song", "video", "flat_song") or video_id:
+        return "play", ""
+    if result_type in ("album", "single"):
+        return ("album", browse_id) if browse_id else ("", "")
+    if result_type == "artist":
+        return ("artist", browse_id) if browse_id else ("", "")
+    if result_type == "playlist":
+        target = playlist_id or browse_id
+        return ("playlist", target) if target else ("", "")
+    if playlist_id:
+        return "playlist", playlist_id
+    if browse_id:
+        return "album", browse_id
+    return "", ""
+
+
+async def navigate_browse_item(host: "YTMHostBase", item: dict[str, Any]) -> None:
+    """Route a get_home()-shaped item to the right context page, or play it
+    directly if it's a track.
+
+    Shared by every Browse tab that surfaces raw get_home() shelf content
+    (For You and Playlists), so the routing rules live in exactly one
+    place. The route itself — which branch an item takes and the id it
+    navigates with — is decided by the ``_browse_item_route`` engine
+    (native when the Rust extension is built, the pure-Python
+    transcription otherwise); this coroutine only executes it.
+    """
+    kind, context_id = _browse_item_route(item)
+
+    if kind == "play":
         normalized_tracks = normalize_tracks([item])
         track_to_play = normalized_tracks[0] if normalized_tracks else item
         # Replace the queue instead of playing around it — otherwise the
         # queue page goes stale and next-track resumes the old queue.
         await host._replace_queue_and_play([track_to_play])
-    elif result_type in ("album", "single"):
-        if browse_id:
-            await host.navigate_to("context", context_type="album", context_id=browse_id)
-    elif result_type == "artist":
-        if browse_id:
-            await host.navigate_to("context", context_type="artist", context_id=browse_id)
-    elif result_type == "playlist":
-        if playlist_id or browse_id:
-            await host.navigate_to(
-                "context", context_type="playlist", context_id=playlist_id or browse_id
-            )
-    elif playlist_id:
-        # Shelves like "Mixed for you", "Listen again" radio entries, mixes
-        # etc. have a playlistId but no resultType.
-        await host.navigate_to("context", context_type="playlist", context_id=playlist_id)
-    elif browse_id:
-        # Fallback: treat any remaining browseId as an album/playlist context.
-        await host.navigate_to("context", context_type="album", context_id=browse_id)
+    elif kind == "album":
+        await host.navigate_to("context", context_type="album", context_id=context_id)
+    elif kind == "artist":
+        await host.navigate_to("context", context_type="artist", context_id=context_id)
+    elif kind == "playlist":
+        await host.navigate_to("context", context_type="playlist", context_id=context_id)
 
 
 class BrowseTab(Static):
@@ -498,9 +704,12 @@ class ForYouSection(Widget):
             return
 
         for shelf in self._shelves:
-            title = shelf.get("title", "Recommendations")
-            contents = shelf.get("contents", [])
-            if not contents:
+            # The shelf's render model — its title and up to eight
+            # (display, item) rows — comes from the ``_foryou_shelf_rows``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            title, rows = _foryou_shelf_rows(shelf)
+            if not rows:
                 continue
 
             try:
@@ -509,22 +718,11 @@ class ForYouSection(Widget):
                 list_view = ListView(classes="shelf-items")
                 await container.mount(list_view)
 
-                for item in contents[:8]:
-                    item_title = item.get("title", "Unknown")
-                    subtitle_parts: list[str] = []
-                    artist_str = extract_artist(item)
-                    if artist_str and artist_str != "Unknown":
-                        subtitle_parts.append(artist_str)
-                    description = item.get("description", "")
-                    if description:
-                        subtitle_parts.append(str(description))
-                    subtitle = " - ".join(subtitle_parts)
-                    display = truncate(f"{item_title}  {subtitle}", 80) if subtitle else item_title
-
+                for display, item in rows:
                     list_view.append(ListItem(Label(display)))
 
                 # Store items on the list_view for later retrieval.
-                list_view._shelf_items = contents[:8]  # type: ignore[attr-defined]
+                list_view._shelf_items = [item for _display, item in rows]  # type: ignore[attr-defined]
             except Exception:
                 logger.debug("Failed to render shelf %r", title, exc_info=True)
 
@@ -706,7 +904,7 @@ class ChartsSection(Widget):
         with Vertical(id="charts-content"):
             yield Static("Global Charts", classes="section-title")
             yield Static(
-                f"Country: {self._country}    (press 'c' to change)",
+                _charts_country_label(self._country),
                 id="charts-country",
             )
             # Two stacked pill rows:
@@ -791,12 +989,10 @@ class ChartsSection(Widget):
         self._data_revision = self._revision
 
         try:
-            raw: list[dict[str, Any]] = []
-            if isinstance(self._chart_data, dict):
-                for key in ("daily", "weekly", "videos"):
-                    arr = self._chart_data.get(key)
-                    if isinstance(arr, list):
-                        raw.extend(s for s in arr if isinstance(s, dict))
+            # The payload's chart shelves — the ``_charts_raw_shelves``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            raw = _charts_raw_shelves(self._chart_data)
 
             events, charts = _split_events_and_charts(raw)
             self._dailies = events + charts
@@ -841,17 +1037,16 @@ class ChartsSection(Widget):
         # what this strip is. Mounted only if there's at least one event.
         if self._event_count > 0:
             await event_row.mount(Static("Featured globally:", classes="event-row-label"))
-        for i, shelf in enumerate(self._dailies):
-            raw_title = (
-                shelf.get("title") if isinstance(shelf, dict) else None
-            ) or f"Shelf {i + 1}"
-            title = clean_shelf_title(str(raw_title))
-            is_event = i < self._event_count
-            classes = "shelf-pill event" if is_event else "shelf-pill"
-            if i == self._active_daily:
-                classes += " active"
+        # The pills' labels and classes — the ``_charts_pill_rows``
+        # engine (native when the Rust extension is built, the
+        # pure-Python transcription otherwise); each pill keeps its
+        # absolute index in ``_dailies`` as its id suffix so click
+        # handling stays uniform.
+        for i, (title, classes) in enumerate(
+            _charts_pill_rows(self._dailies, self._event_count, self._active_daily)
+        ):
             pill = Static(title, classes=classes, id=f"charts-pill-{i}")
-            await (event_row if is_event else chart_row).mount(pill)
+            await (event_row if i < self._event_count else chart_row).mount(pill)
         # Final visibility pass: hide the event row if no events at all,
         # or if the terminal is too narrow to spare a row.
         self._update_event_row_visibility()
@@ -866,7 +1061,7 @@ class ChartsSection(Widget):
             term_width = self.app.size.width
         except Exception:
             term_width = 0
-        show = self._event_count > 0 and term_width >= self._NARROW_THRESHOLD
+        show = _charts_event_row_visible(self._event_count, term_width, self._NARROW_THRESHOLD)
         event_row.display = show
 
     def on_resize(self) -> None:
@@ -954,9 +1149,11 @@ class ChartsSection(Widget):
         content = self.query_one("#charts-content")
         content.display = True
 
-        # Update country label.
+        # Update country label — the ``_charts_country_label`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise).
         country_label = self.query_one("#charts-country", Static)
-        country_label.update(f"Country: {self._country}    (press 'c' to change)")
+        country_label.update(_charts_country_label(self._country))
 
         table = self.query_one("#charts-table", TrackTable)
         table.load_tracks(normalize_tracks(tracks))
@@ -1064,27 +1261,11 @@ class NewReleasesSection(Widget):
             self._show_error("No new releases right now — check back later.")
             return
 
-        for album in self._albums:
-            title = album.get("title", "Unknown Album")
-            artist_str = extract_artist(album)
-            if artist_str == "Unknown":
-                artist_str = ""
-            album_type = album.get("type", "")
-            year = album.get("year", "")
-
-            parts = [title]
-            if artist_str:
-                parts.append(f"by {artist_str}")
-            meta_parts: list[str] = []
-            if album_type:
-                meta_parts.append(album_type)
-            if year:
-                meta_parts.append(str(year))
-            if meta_parts:
-                parts.append(f"({', '.join(meta_parts)})")
-
-            display = truncate(" ".join(parts), 80)
-            list_view.append(ListItem(Label(display)))
+        # Each album's row label — the ``_new_release_label`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise).
+        for label in map(_new_release_label, self._albums):
+            list_view.append(ListItem(Label(label)))
 
     def _show_error(self, message: str) -> None:
         self.load_failed = True
@@ -1213,16 +1394,11 @@ class PlaylistsSection(Widget):
             self._show_error("No playlists in your home feed right now — check back later.")
             return
 
-        for playlist in self._playlists:
-            title = playlist.get("title") or "Untitled playlist"
-            parts = [str(title)]
-            description = playlist.get("description", "")
-            count = playlist.get("count", "")
-            if description:
-                parts.append(f"({description})")
-            elif count:
-                parts.append(f"({count} songs)")
-            list_view.append(ListItem(Label(truncate(" ".join(parts), 80))))
+        # Each playlist's row label — the ``_playlist_row_label``
+        # engine (native when the Rust extension is built, the
+        # pure-Python transcription otherwise).
+        for label in map(_playlist_row_label, self._playlists):
+            list_view.append(ListItem(Label(label)))
 
     def _show_error(self, message: str) -> None:
         self.load_failed = True
@@ -1340,11 +1516,11 @@ class SubscriptionsSection(Widget):
             self._show_error("No subscriptions yet — follow an artist to see them here.")
             return
 
-        for artist in self._artists:
-            name = artist.get("artist", "Unknown artist")
-            subscribers = artist.get("subscribers", "")
-            display = f"{name}  ({subscribers} subscribers)" if subscribers else name
-            list_view.append(ListItem(Label(truncate(display, 80))))
+        # Each artist's row label — the ``_subscription_label`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise).
+        for label in map(_subscription_label, self._artists):
+            list_view.append(ListItem(Label(label)))
 
     def _show_error(self, message: str) -> None:
         self.load_failed = True
@@ -1958,3 +2134,108 @@ else:
     def _playlist_rows(shelves: list[Any]) -> list[dict[str, Any]]:  # noqa: F811
         """Playlist-row extraction + dedup (native Rust engine)."""
         return _native_playlist_rows(shelves)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        browse_item_route as _native_browse_item_route,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        charts_country_label as _native_charts_country_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        charts_event_row_visible as _native_charts_event_row_visible,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        charts_pill_rows as _native_charts_pill_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        charts_raw_shelves as _native_charts_raw_shelves,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        foryou_shelf_rows as _native_foryou_shelf_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        new_release_label as _native_new_release_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playlist_row_label as _native_playlist_row_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        subscription_label as _native_subscription_label,
+    )
+except ImportError:
+    pass
+else:
+
+    def _browse_item_route(item: dict[str, Any]) -> tuple[str, str]:  # noqa: F811
+        """The item-routing decision (native Rust engine).
+
+        Same contract as the pure-Python reference above; where the
+        reference would raise on a malformed item (a ``.get``-less
+        object, a non-string type tag), the engine degrades — the item
+        reads as field-less — and the chosen context id is stringified
+        outright. ``get_home()`` rows never hit those shapes.
+        """
+        return _native_browse_item_route(item)
+
+    def _foryou_shelf_rows(  # noqa: F811
+        shelf: dict[str, Any],
+    ) -> tuple[Any, list[tuple[Any, dict[str, Any]]]]:
+        """The For You shelf view model (native Rust engine).
+
+        Same contract as the pure-Python reference above; malformed
+        shelves and rows (a ``.get``-less shelf or item, non-list
+        contents) degrade to defaults where the reference would raise —
+        ``get_home()`` never produces them.
+        """
+        return _native_foryou_shelf_rows(shelf)
+
+    def _charts_raw_shelves(chart_data: Any) -> list[dict[str, Any]]:  # noqa: F811
+        """The raw chart shelves (native Rust engine)."""
+        return _native_charts_raw_shelves(chart_data)
+
+    def _charts_pill_rows(  # noqa: F811
+        dailies: list[dict[str, Any]],
+        event_count: int,
+        active_daily: int,
+    ) -> list[tuple[str, str]]:
+        """The chart pill rows (native Rust engine).
+
+        Same contract as the pure-Python reference above, with the
+        region-name table (the shared ``CHART_REGIONS`` spelling the
+        reference reaches through ``clean_shelf_title``) travelling in
+        from here so the engine and the reference strip the same
+        country suffixes.
+        """
+        from ytm_player.services.regions import CHART_REGIONS
+
+        return _native_charts_pill_rows(
+            dailies, event_count, active_daily, [name for _, name in CHART_REGIONS]
+        )
+
+    _charts_country_label = _native_charts_country_label  # type: ignore[assignment]
+
+    _charts_event_row_visible = _native_charts_event_row_visible  # type: ignore[assignment]
+
+    def _new_release_label(album: dict[str, Any]) -> str:  # noqa: F811
+        """The Releases row label (native Rust engine).
+
+        Same contract as the pure-Python reference above; a non-string
+        title or album type is stringified where the reference's join
+        would raise — ``get_new_releases()`` rows always carry strings.
+        """
+        return _native_new_release_label(album)
+
+    def _playlist_row_label(playlist: dict[str, Any]) -> str:  # noqa: F811
+        """The Playlists row label (native Rust engine)."""
+        return _native_playlist_row_label(playlist)
+
+    def _subscription_label(artist: dict[str, Any]) -> str:  # noqa: F811
+        """The Subscriptions row label (native Rust engine).
+
+        Same contract as the pure-Python reference above; a non-string
+        bare name is stringified where the reference's ``truncate``
+        would raise — ``get_library_artists()`` always answers strings.
+        """
+        return _native_subscription_label(artist)

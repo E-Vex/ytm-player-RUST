@@ -234,6 +234,24 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // rebuild Python-side.
     module.add_function(pyo3::wrap_pyfunction!(track_table_row_values, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(track_table_view_rows, module)?)?;
+    // Track-table rendering-integration engines (the same module's
+    // equivalents): the load/append stamping pass (the dict copy +
+    // `_original_index` stamp per track), the marked-rows status line,
+    // the selection-info label, the post-removal renumbering with the
+    // rebuilt visible map and the refreshed `#` cells, the header-click
+    // sort toggle, and the column keys mapping the composed cells onto
+    // the table's own columns — with the DataTable `add_row`/
+    // `update_cell` calls and the cursor preservation staying
+    // Python-side in the widget.
+    module.add_function(pyo3::wrap_pyfunction!(track_table_stamp_tracks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_mark_status, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_selection_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        track_table_reindex_after_removal,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_sort_state, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_column_keys, module)?)?;
 
     // Session-state validation engine (app/_session.py equivalent):
     // the one-pass validation + coercion of the parsed session.json
@@ -271,6 +289,23 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(split_events_and_charts, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(is_playlist_row, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(playlist_rows, module)?)?;
+    // Browse rendering path (the same module's equivalent): the
+    // item-routing decision core behind navigate_browse_item, the For
+    // You shelf view model (the title plus up-to-eight (display, item)
+    // rows), the Charts tab's raw-shelf extraction, pill-row view
+    // model, country line and event-row visibility gate, and the
+    // Releases / Playlists / Subscriptions row labels — the per-section
+    // render passes, with the widget mounting and the worker
+    // orchestration staying Python-side.
+    module.add_function(pyo3::wrap_pyfunction!(browse_item_route, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(foryou_shelf_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(charts_raw_shelves, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(charts_pill_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(charts_country_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(charts_event_row_visible, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(new_release_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(playlist_row_label, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(subscription_label, module)?)?;
 
     // Search-page label glue (ui/pages/search.py equivalent): the
     // item-to-label composer behind the Albums/Artists/Playlists panels
@@ -4794,6 +4829,173 @@ fn track_table_view_rows(
     Ok((positions, rows))
 }
 
+/// The load/append stamping pass — `TrackTable.load_tracks`' and
+/// `append_tracks`' per-track copies from `ui/widgets/track_table.py`:
+/// a shallow `dict(track)` copy per track carrying `_original_index` =
+/// *start* + position (the fresh load stamps from 0, the append path
+/// from its `start_idx`), the copies in list order. The input list and
+/// its dicts are never touched; the copies are new plain dicts holding
+/// the same value objects (see `shallow_copy_dict`), so a dict subclass
+/// in normalises to a plain dict exactly like the reference's
+/// `dict(track)`.
+///
+/// A non-dict track raises `TypeError` where the reference's
+/// `dict(track)` would raise for the shapes the table's own load paths
+/// produce — they receive normalized track dicts, never pair-iterables
+/// or scalars.
+#[pyfunction]
+#[pyo3(signature = (tracks, start=0))]
+fn track_table_stamp_tracks<'py>(
+    py: Python<'py>,
+    tracks: &Bound<'py, PyList>,
+    start: i64,
+) -> PyResult<Bound<'py, PyList>> {
+    let stamped = PyList::empty(py);
+    for (i, track) in tracks.iter().enumerate() {
+        let dict = track
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+        let copy = shallow_copy_dict(py, dict)?;
+        copy.set_item("_original_index", start + (i as i64))?;
+        stamped.append(copy)?;
+    }
+    Ok(stamped)
+}
+
+/// The marked-rows status line — `TrackTable._update_mark_status`'s text
+/// from `ui/widgets/track_table.py`: `"<count> selected"`, plus
+/// `" (<hidden> hidden)"` when the active filter hides any marked row,
+/// plus the bulk-action hint. The widget only ever asks with a count of
+/// one or more — it clears the line and drops the `-marked` class
+/// itself before any zero-count text could be shown.
+#[pyfunction]
+fn track_table_mark_status(count: i64, hidden: i64) -> String {
+    let mut text = format!("{count} selected");
+    if hidden > 0 {
+        text.push_str(&format!(" ({hidden} hidden)"));
+    }
+    text.push_str(" · A: add · Esc: clear");
+    text
+}
+
+/// The selection-info label for the highlighted row — the shared body
+/// of `TrackTable.on_data_table_row_highlighted` and `on_focus` from
+/// `ui/widgets/track_table.py`: the title (the `""` default through the
+/// `or ""` truthiness gate) joined with the `extract_artist` engine's
+/// artist by an em dash. `extract_artist` never answers empty (its
+/// `"Unknown"` fallback), so the join is the live path; the bare-title
+/// arm stays mirrored for safety. Where the reference would hand a
+/// non-string title object through to the info bar, the label
+/// stringifies it first (the bar renders the same text).
+#[pyfunction]
+fn track_table_selection_label<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    // title = track.get("title", "") or ""
+    let title = field_get(py, track, "title", Some(PyString::new(py, "").into_any()))?;
+    let title = if title.is_truthy()? {
+        title
+    } else {
+        PyString::new(py, "").into_any()
+    };
+    // artist = extract_artist(track) or ""
+    let artist = match track.downcast::<PyDict>() {
+        Ok(dict) => extract_artist(py, dict),
+        Err(_) => "Unknown".to_string(),
+    };
+    if artist.is_empty() {
+        return py_str(&title);
+    }
+    Ok(format!("{} — {}", py_str(&title)?, artist))
+}
+
+/// The post-removal renumbering — the tail of
+/// `TrackTable.remove_track` from `ui/widgets/track_table.py`: every
+/// remaining row of the backing list is re-stamped `_original_index` =
+/// its new position (mutated in place, in list order), and the answer
+/// carries the visible list's rebuilt `_filtered_map` plus each visible
+/// row's `#` cell text (`str(original + 1)`) for the cell refresh pass,
+/// so the widget only feeds Textual's `update_cell`.
+///
+/// A non-dict row raises `TypeError` where the reference's
+/// `t["_original_index"] = ...` would raise — `load_tracks` wraps every
+/// track in a fresh dict, so the shape is unreachable through the
+/// table's own paths.
+#[pyfunction]
+fn track_table_reindex_after_removal<'py>(
+    py: Python<'py>,
+    all_tracks: &Bound<'py, PyList>,
+    tracks: &Bound<'py, PyList>,
+) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+    for (i, track) in all_tracks.iter().enumerate() {
+        let dict = track
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+        dict.set_item("_original_index", i as i64)?;
+    }
+    let mut filtered_map: Vec<i64> = Vec::with_capacity(tracks.len());
+    let mut index_cells: Vec<String> = Vec::with_capacity(tracks.len());
+    for track in tracks.iter() {
+        let dict = track
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+        let orig: i64 = dict
+            .get_item("_original_index")?
+            .ok_or_else(|| PyKeyError::new_err("_original_index"))?
+            .extract()?;
+        filtered_map.push(orig);
+        index_cells.push((orig + 1).to_string());
+    }
+    Ok((
+        PyList::new(py, filtered_map)?,
+        PyList::new(py, index_cells)?,
+    ))
+}
+
+/// The header-click sort toggle — `TrackTable.sort_by`'s state decision
+/// from `ui/widgets/track_table.py`: a column outside the sortable set
+/// answers `None` (no sort happens); the already-sorted column flips
+/// the direction; a new column starts ascending. The empty-table gate
+/// that precedes the decision stays widget-side, where it reads the
+/// live table.
+#[pyfunction]
+#[pyo3(signature = (column, sort_column, sort_reverse))]
+fn track_table_sort_state(
+    column: &str,
+    sort_column: Option<String>,
+    sort_reverse: bool,
+) -> Option<(String, bool)> {
+    const SORTABLE: [&str; 5] = ["index", "title", "artist", "album", "duration"];
+    if !SORTABLE.contains(&column) {
+        return None;
+    }
+    if sort_column.as_deref() == Some(column) {
+        return Some((column.to_string(), !sort_reverse));
+    }
+    Some((column.to_string(), false))
+}
+
+/// The column keys of the composed cells — `_plain_cells`' key list from
+/// `ui/widgets/track_table.py`, mapping the `_row_values` engine's
+/// positional cells onto the table's own column order: `mark`, then
+/// `index` when shown, `title`/`artist`, `album` when shown, then
+/// `duration`.
+#[pyfunction]
+fn track_table_column_keys(show_index: bool, show_album: bool) -> Vec<String> {
+    let mut keys = vec!["mark".to_string()];
+    if show_index {
+        keys.push("index".to_string());
+    }
+    keys.push("title".to_string());
+    keys.push("artist".to_string());
+    if show_album {
+        keys.push("album".to_string());
+    }
+    keys.push("duration".to_string());
+    keys
+}
+
 // ---------------------------------------------------------------------------
 // Session-state validation engine (mirrors ytm_player/app/_session.py)
 // ---------------------------------------------------------------------------
@@ -6024,6 +6226,398 @@ fn playlist_rows<'py>(
         }
     }
     PyList::new(py, rows)
+}
+
+// ---------------------------------------------------------------------------
+// Browse rendering path (mirrors ui/pages/browse.py)
+// ---------------------------------------------------------------------------
+
+/// The browse-item routing decision core — the classification half of
+/// `navigate_browse_item` from `ui/pages/browse.py`.
+///
+/// Mirrors the reference's reads in order: the type tag (`resultType`
+/// falling back to `type` through the truthiness chain, then
+/// `.lower()`), the video id (the shared `get_video_id` engine),
+/// `browseId`, and the playlist id (`playlistId` falling back to
+/// `audioPlaylistId`). The answer names the branch the reference takes:
+/// `("play", "")` for a track (the caller plays the item itself), one
+/// of `("album", id)` / `("artist", id)` / `("playlist", id)` for a
+/// context navigation, or `("", "")` when no branch applies. Each
+/// branch's id gate folds in — an album/artist route without a browse
+/// id, or a playlist route without any id, classifies as no route,
+/// exactly like the reference's `if` guards — and the chosen id is
+/// stringified, as the navigation call's interpolation would.
+///
+/// Where the reference would raise — a `.get`-less item, or a
+/// non-string type tag hitting `.lower()` — the engine stays total: the
+/// item reads as field-less and the tag is stringified before lowering
+/// (see `field_get`); `get_home()` rows are always dicts with string
+/// tags.
+#[pyfunction]
+fn browse_item_route<'py>(py: Python<'py>, item: &Bound<'py, PyAny>) -> PyResult<(String, String)> {
+    // result_type = (item.get("resultType") or item.get("type") or "").lower()
+    let result_type = match first_truthy_get(py, item, &["resultType", "type"])? {
+        Some(value) => python_lower(&py_str(&value)?),
+        None => String::new(),
+    };
+    // video_id = get_video_id(item) — the shared engine.
+    let video_id = match item.downcast::<PyDict>() {
+        Ok(dict) => get_video_id(py, dict),
+        Err(_) => String::new(),
+    };
+    // browse_id = item.get("browseId")
+    let browse_id = field_get(py, item, "browseId", None)?;
+    // playlist_id = item.get("playlistId") or item.get("audioPlaylistId")
+    let playlist_id = first_truthy_get(py, item, &["playlistId", "audioPlaylistId"])?;
+
+    if matches!(result_type.as_str(), "song" | "video" | "flat_song") || !video_id.is_empty() {
+        return Ok(("play".to_string(), String::new()));
+    }
+    if matches!(result_type.as_str(), "album" | "single") {
+        if browse_id.is_truthy()? {
+            return Ok(("album".to_string(), py_str(&browse_id)?));
+        }
+        return Ok((String::new(), String::new()));
+    }
+    if result_type == "artist" {
+        if browse_id.is_truthy()? {
+            return Ok(("artist".to_string(), py_str(&browse_id)?));
+        }
+        return Ok((String::new(), String::new()));
+    }
+    if result_type == "playlist" {
+        // playlist_id or browse_id — the truthiness chain, re-evaluated.
+        let chosen = match &playlist_id {
+            Some(v) if v.is_truthy()? => v.clone(),
+            _ => browse_id.clone(),
+        };
+        if chosen.is_truthy()? {
+            return Ok(("playlist".to_string(), py_str(&chosen)?));
+        }
+        return Ok((String::new(), String::new()));
+    }
+    if let Some(v) = &playlist_id {
+        if v.is_truthy()? {
+            return Ok(("playlist".to_string(), py_str(v)?));
+        }
+    }
+    if browse_id.is_truthy()? {
+        return Ok(("album".to_string(), py_str(&browse_id)?));
+    }
+    Ok((String::new(), String::new()))
+}
+
+/// The For You shelf view model — `ForYouSection._populate_shelves`'s
+/// per-shelf render pass from `ui/pages/browse.py`.
+///
+/// Mirrors the reference's reads: the shelf title (the
+/// `"Recommendations"` default, returned as the object it is), the
+/// contents (the `[]` default; a falsy value answers no rows), and for
+/// each of the first eight items the `(display, item)` pair — the item
+/// title (the `"Unknown"` default, the object itself when no subtitle
+/// joins it) over the `extract_artist` artist (dropped when `"Unknown"`)
+/// and the stringified `description`, joined with `" - "`, the combined
+/// line truncated to 80 characters through the shared `truncate`
+/// semantics. The row's item is the input object itself (no copy), so
+/// the caller's `_shelf_items` list keeps identity with the feed.
+///
+/// Where the reference would raise — a `.get`-less shelf or item, or
+/// non-list contents failing the slice — the engine stays total: the
+/// shelf reads as title-less with no rows, a non-dict item renders
+/// through its defaults, and non-list contents answer no rows;
+/// `get_home()` shelves are always dicts with list contents.
+#[pyfunction]
+fn foryou_shelf_rows<'py>(
+    py: Python<'py>,
+    shelf: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyList>)> {
+    // title = shelf.get("title", "Recommendations")
+    let title = field_get(
+        py,
+        shelf,
+        "title",
+        Some(PyString::new(py, "Recommendations").into_any()),
+    )?;
+    // contents = shelf.get("contents", [])
+    let contents = field_get(py, shelf, "contents", Some(PyList::empty(py).into_any()))?;
+    if !contents.is_truthy()? {
+        return Ok((title, PyList::empty(py)));
+    }
+    let mut rows: Vec<Bound<'py, PyTuple>> = Vec::new();
+    if let Ok(list) = contents.downcast::<PyList>() {
+        for item in list.iter().take(8) {
+            // item_title = item.get("title", "Unknown")
+            let item_title = field_get(
+                py,
+                &item,
+                "title",
+                Some(PyString::new(py, "Unknown").into_any()),
+            )?;
+            // artist_str = extract_artist(item)
+            let artist_str = match item.downcast::<PyDict>() {
+                Ok(dict) => extract_artist(py, dict),
+                Err(_) => "Unknown".to_string(),
+            };
+            let mut subtitle_parts: Vec<String> = Vec::new();
+            if !artist_str.is_empty() && artist_str != "Unknown" {
+                subtitle_parts.push(artist_str);
+            }
+            // description = item.get("description", "")
+            let description = field_get(
+                py,
+                &item,
+                "description",
+                Some(PyString::new(py, "").into_any()),
+            )?;
+            if description.is_truthy()? {
+                subtitle_parts.push(py_str(&description)?);
+            }
+            let subtitle = subtitle_parts.join(" - ");
+            let display: Bound<'py, PyAny> = if subtitle.is_empty() {
+                item_title
+            } else {
+                let combined = format!("{}  {}", py_str(&item_title)?, subtitle);
+                PyString::new(py, &truncate_str(&combined, 80)).into_any()
+            };
+            rows.push(PyTuple::new(py, [display, item])?);
+        }
+    }
+    Ok((title, PyList::new(py, rows)?))
+}
+
+/// The raw chart shelves from a `get_charts()` payload —
+/// `ChartsSection.load_data`'s extraction walk from
+/// `ui/pages/browse.py`: the `daily`, `weekly` and `videos` arrays in
+/// that order, keeping only the dict shelves. A payload that is not a
+/// dict (the service's `None` failure marker included) answers no
+/// shelves; the payload is never mutated.
+#[pyfunction]
+fn charts_raw_shelves<'py>(
+    py: Python<'py>,
+    chart_data: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut raw: Vec<Bound<'py, PyAny>> = Vec::new();
+    if chart_data.is_instance_of::<PyDict>() {
+        for key in ["daily", "weekly", "videos"] {
+            // arr = chart_data.get(key)
+            let arr = field_get(py, chart_data, key, None)?;
+            if let Ok(list) = arr.downcast::<PyList>() {
+                for shelf in list.iter() {
+                    if shelf.is_instance_of::<PyDict>() {
+                        raw.push(shelf);
+                    }
+                }
+            }
+        }
+    }
+    PyList::new(py, raw)
+}
+
+/// The chart pill row view model — `ChartsSection._render_pills`' label
+/// and class pass from `ui/pages/browse.py`.
+///
+/// Mirrors the reference's per-shelf reads: the raw title (`shelf.get`
+/// only for a dict shelf, the `Shelf {n}` fallback for everything
+/// missing or falsy), normalised through the shared `clean_shelf_title`
+/// engine with *region_names* travelling in from the caller (the
+/// Python-side `CHART_REGIONS` spelling of the same table the module's
+/// own seam passes); the CSS classes — `shelf-pill event` for the
+/// leading event shelves (`index < *event_count*`), `shelf-pill` for
+/// the country charts, ` active` appended on the shelf the table shows.
+/// The pill ids and the mounting stay with the caller.
+#[pyfunction]
+#[pyo3(signature = (dailies, event_count, active_daily, region_names))]
+fn charts_pill_rows(
+    py: Python,
+    dailies: &Bound<'_, PyList>,
+    event_count: i64,
+    active_daily: i64,
+    region_names: &Bound<'_, PyList>,
+) -> PyResult<Vec<(String, String)>> {
+    let mut rows: Vec<(String, String)> = Vec::with_capacity(dailies.len());
+    for (i, shelf) in dailies.iter().enumerate() {
+        let idx = i as i64;
+        // raw_title = (shelf.get("title") if isinstance(shelf, dict) else None)
+        //             or f"Shelf {i + 1}"
+        let raw_title = if shelf.is_instance_of::<PyDict>() {
+            field_get(py, &shelf, "title", None)?
+        } else {
+            py.None().into_bound(py)
+        };
+        let raw_title = if raw_title.is_truthy()? {
+            raw_title
+        } else {
+            PyString::new(py, &format!("Shelf {}", idx + 1)).into_any()
+        };
+        // title = clean_shelf_title(str(raw_title))
+        let title = clean_shelf_title(py, &py_str(&raw_title)?, region_names);
+        let mut classes = if idx < event_count {
+            "shelf-pill event"
+        } else {
+            "shelf-pill"
+        }
+        .to_string();
+        if idx == active_daily {
+            classes.push_str(" active");
+        }
+        rows.push((title, classes));
+    }
+    Ok(rows)
+}
+
+/// The chart country line — the label `ChartsSection` mounts above the
+/// pills and refreshes on every load, from `ui/pages/browse.py`.
+#[pyfunction]
+fn charts_country_label(country: &str) -> String {
+    format!("Country: {country}    (press 'c' to change)")
+}
+
+/// The event pill row's visibility gate —
+/// `ChartsSection._update_event_row_visibility` from
+/// `ui/pages/browse.py`: at least one event shelf and a terminal at
+/// least *narrow_threshold* columns wide. The threshold travels in from
+/// the caller, where the `_NARROW_THRESHOLD` constant lives.
+#[pyfunction]
+fn charts_event_row_visible(event_count: i64, term_width: i64, narrow_threshold: i64) -> bool {
+    event_count > 0 && term_width >= narrow_threshold
+}
+
+/// The Releases row label for one album —
+/// `NewReleasesSection._populate_releases`' per-album assembly from
+/// `ui/pages/browse.py`.
+///
+/// Mirrors the reference's reads: the title (the `"Unknown Album"`
+/// default), the artist through the `extract_artist` engine (an
+/// `"Unknown"` answer drops the `by` clause), the album `type` and
+/// `year` (both the `""` default, truthiness-gated) joined into the
+/// parenthesised meta clause, and the whole line truncated to 80
+/// characters. Where the reference's `" ".join` would raise on a
+/// non-string title or type, the engine stringifies it first (the
+/// f-string branches already do); `get_new_releases()` rows always
+/// carry strings.
+#[pyfunction]
+fn new_release_label<'py>(py: Python<'py>, album: &Bound<'py, PyAny>) -> PyResult<String> {
+    // title = album.get("title", "Unknown Album")
+    let title = field_get(
+        py,
+        album,
+        "title",
+        Some(PyString::new(py, "Unknown Album").into_any()),
+    )?;
+    // artist_str = extract_artist(album); "Unknown" reads as absent.
+    let artist_str = match album.downcast::<PyDict>() {
+        Ok(dict) => extract_artist(py, dict),
+        Err(_) => "Unknown".to_string(),
+    };
+    let artist_str = if artist_str == "Unknown" {
+        String::new()
+    } else {
+        artist_str
+    };
+    // album_type = album.get("type", "")  /  year = album.get("year", "")
+    let album_type = field_get(py, album, "type", Some(PyString::new(py, "").into_any()))?;
+    let year = field_get(py, album, "year", Some(PyString::new(py, "").into_any()))?;
+
+    let mut parts: Vec<String> = vec![py_str(&title)?];
+    if !artist_str.is_empty() {
+        parts.push(format!("by {artist_str}"));
+    }
+    let mut meta_parts: Vec<String> = Vec::new();
+    if album_type.is_truthy()? {
+        meta_parts.push(py_str(&album_type)?);
+    }
+    if year.is_truthy()? {
+        meta_parts.push(py_str(&year)?);
+    }
+    if !meta_parts.is_empty() {
+        parts.push(format!("({})", meta_parts.join(", ")));
+    }
+    Ok(truncate_str(&parts.join(" "), 80))
+}
+
+/// The Playlists row label for one home-feed playlist row —
+/// `PlaylistsSection._populate_playlists`' per-playlist assembly from
+/// `ui/pages/browse.py`.
+///
+/// Mirrors the reference's reads: the title (the first truthy
+/// `playlist.get("title")`, else `"Untitled playlist"`, stringified),
+/// then the parenthesised `description` when truthy, else the
+/// parenthesised `<count> songs` for a truthy `count`, and the whole
+/// line truncated to 80 characters. Field reads resolve exactly like
+/// the reference's `.get` calls and truthiness is Python's (see
+/// `field_get`).
+#[pyfunction]
+fn playlist_row_label<'py>(py: Python<'py>, playlist: &Bound<'py, PyAny>) -> PyResult<String> {
+    // title = playlist.get("title") or "Untitled playlist"
+    let title = {
+        let raw = field_get(py, playlist, "title", None)?;
+        if raw.is_truthy()? {
+            raw
+        } else {
+            PyString::new(py, "Untitled playlist").into_any()
+        }
+    };
+    // description = playlist.get("description", "")  /  count = playlist.get("count", "")
+    let description = field_get(
+        py,
+        playlist,
+        "description",
+        Some(PyString::new(py, "").into_any()),
+    )?;
+    let count = field_get(
+        py,
+        playlist,
+        "count",
+        Some(PyString::new(py, "").into_any()),
+    )?;
+
+    let mut parts: Vec<String> = vec![py_str(&title)?];
+    if description.is_truthy()? {
+        parts.push(format!("({})", py_str(&description)?));
+    } else if count.is_truthy()? {
+        parts.push(format!("({} songs)", py_str(&count)?));
+    }
+    Ok(truncate_str(&parts.join(" "), 80))
+}
+
+/// The Subscriptions row label for one subscribed artist —
+/// `SubscriptionsSection._populate_subscriptions`' per-artist assembly
+/// from `ui/pages/browse.py`.
+///
+/// Mirrors the reference's reads: the name (the `"Unknown artist"`
+/// default) and the subscriber count (the `""` default); a truthy
+/// count appends the two-space `(<count> subscribers)` clause, and the
+/// whole line truncates to 80 characters. Where the reference would
+/// hand a non-string bare name through to `truncate` (which would
+/// raise on `len()`), the engine stringifies it first — the subscriber
+/// line's f-string already does, and `get_library_artists()` always
+/// answers strings.
+#[pyfunction]
+fn subscription_label<'py>(py: Python<'py>, artist: &Bound<'py, PyAny>) -> PyResult<String> {
+    // name = artist.get("artist", "Unknown artist")
+    let name = field_get(
+        py,
+        artist,
+        "artist",
+        Some(PyString::new(py, "Unknown artist").into_any()),
+    )?;
+    // subscribers = artist.get("subscribers", "")
+    let subscribers = field_get(
+        py,
+        artist,
+        "subscribers",
+        Some(PyString::new(py, "").into_any()),
+    )?;
+    let display = if subscribers.is_truthy()? {
+        format!(
+            "{}  ({} subscribers)",
+            py_str(&name)?,
+            py_str(&subscribers)?
+        )
+    } else {
+        py_str(&name)?
+    };
+    Ok(truncate_str(&display, 80))
 }
 
 // ---------------------------------------------------------------------------

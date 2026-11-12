@@ -1,4 +1,18 @@
-"""Reusable track listing table widget."""
+"""Reusable track listing table widget.
+
+The table's pure rendering logic — the view engine (``_filter_sort_positions``
+/ ``_row_values`` / ``_compose_view_rows``: the filter + sort pass and the
+per-row cell assembly) and its rendering integration (``_stamp_tracks``:
+the load/append stamping pass, ``_mark_status_text``: the marked-rows
+status line, ``_selection_label``: the info-bar label,
+``_reindex_after_removal``: the post-removal renumbering,
+``_sort_state``: the header-click sort toggle, ``_column_keys``: the
+composed cells' column keys) — is implemented by the Rust extension
+(``_ytm_player_native``) when it is built and by the pure-Python
+transcriptions in this module otherwise; the bottom-of-module seam rebinds
+the engines to the native functions when the extension is importable. The
+widget below only holds state and feeds Textual.
+"""
 
 from __future__ import annotations
 
@@ -145,6 +159,109 @@ def _compose_view_rows(
         for visible, pos in enumerate(positions)
     ]
     return positions, rows
+
+
+def _stamp_tracks(tracks: list[dict], start: int = 0) -> list[dict]:
+    """Shallow copies of *tracks*, each stamped with its load position.
+
+    ``_original_index`` is ``start`` + position — the fresh load stamps
+    from 0, the append path from its ``start_idx``. The copies are new
+    dicts holding the same value objects; the inputs are untouched.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_stamp_tracks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    stamped: list[dict] = []
+    for i, track in enumerate(tracks, start=start):
+        t = dict(track)
+        t["_original_index"] = i
+        stamped.append(t)
+    return stamped
+
+
+def _mark_status_text(count: int, hidden: int) -> str:
+    """The marked-rows status line: "<count> selected" plus the hidden
+    count and the bulk-action hint.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_mark_status``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    text = f"{count} selected"
+    if hidden:
+        text += f" ({hidden} hidden)"
+    return text + " · A: add · Esc: clear"
+
+
+def _selection_label(track: dict) -> str:
+    """The selection-info label for the highlighted row: the title and
+    artist joined by an em dash (the artist through the shared
+    ``extract_artist``, whose ``"Unknown"`` fallback joins like any
+    other name).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_selection_label``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = track.get("title", "") or ""
+    artist = extract_artist(track) or ""
+    return f"{title} — {artist}" if artist else title
+
+
+def _reindex_after_removal(
+    all_tracks: list[dict], tracks: list[dict]
+) -> tuple[list[int], list[str]]:
+    """Renumber after a removal: re-stamp every backing-list row with its
+    new position, and answer the visible list's rebuilt ``_filtered_map``
+    plus each visible row's ``#`` cell text (``str(original + 1)``).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_reindex_after_removal``) when it
+    is built; this pure-Python transcription is the fallback otherwise.
+    """
+    for new_idx, t in enumerate(all_tracks):
+        t["_original_index"] = new_idx
+    filtered_map = [t["_original_index"] for t in tracks]
+    index_cells = [str(t["_original_index"] + 1) for t in tracks]
+    return filtered_map, index_cells
+
+
+def _sort_state(
+    column: str, sort_column: str | None, sort_reverse: bool
+) -> tuple[str, bool] | None:
+    """The header-click sort toggle: ``None`` for a column outside the
+    sortable set; the same column flips the direction; a new column
+    starts ascending.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_sort_state``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if column not in _SORT_KEYS:
+        return None
+    if sort_column == column:
+        return column, not sort_reverse
+    return column, False
+
+
+def _column_keys(show_index: bool, show_album: bool) -> list[str]:
+    """The column keys of the composed cells: ``mark``, then ``index``
+    when shown, ``title``/``artist``, ``album`` when shown, then
+    ``duration``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_column_keys``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    keys = ["mark"]
+    if show_index:
+        keys.append("index")
+    keys += ["title", "artist"]
+    if show_album:
+        keys.append("album")
+    keys.append("duration")
+    return keys
 
 
 class TrackTable(DataTable):
@@ -452,16 +569,12 @@ class TrackTable(DataTable):
         self._occurrence_keys = list(keys) if keys is not None else None
         self._reset_selection()
         self.clear()
-        # Stamp each track with its original playlist position.
-        self._all_tracks = []
-        self._tracks = []
-        self._filtered_map = []
-        for i, track in enumerate(tracks):
-            t = dict(track)
-            t["_original_index"] = i
-            self._all_tracks.append(t)
-            self._tracks.append(t)
-            self._filtered_map.append(i)
+        # Stamp each track with its original playlist position — the
+        # ``_stamp_tracks`` engine (native when the Rust extension is
+        # built, the pure-Python transcription otherwise).
+        self._all_tracks = _stamp_tracks(tracks)
+        self._tracks = list(self._all_tracks)
+        self._filtered_map = list(range(len(self._all_tracks)))
         self._row_keys = []
         self._playing_index = None
         self._sort_column = None
@@ -580,26 +693,23 @@ class TrackTable(DataTable):
                 self._occurrence_keys = None
         start_idx = len(self._all_tracks)
         if self._sort_column is not None:
-            for i, track in enumerate(tracks, start=start_idx):
-                t = dict(track)
-                t["_original_index"] = i
-                self._all_tracks.append(t)
+            self._all_tracks.extend(_stamp_tracks(tracks, start=start_idx))
             current = self.selected_original_index
             self._rebuild_view()
             self._place_cursor_on(current)
             self._fill_title_column()
             self._invalidate_table()
             return
-        for i, track in enumerate(tracks, start=start_idx):
-            t = dict(track)
-            t["_original_index"] = i
+        # The appended rows join the view as it is: filtered like the
+        # rest, each stamped copy rendered through the row engine.
+        for t in _stamp_tracks(tracks, start=start_idx):
             self._all_tracks.append(t)
             # If filter is active, only add matching tracks to visible table.
             if self._filter_active and self._filter_text:
                 if not _matches_filter(t, self._filter_text):
                     continue
             self._tracks.append(t)
-            self._filtered_map.append(i)
+            self._filtered_map.append(t["_original_index"])
             row_key = self._add_track_row(len(self._tracks) - 1, t)
             self._row_keys.append(row_key)
         # Same reflow as load_tracks — the row-label column may have been
@@ -649,19 +759,18 @@ class TrackTable(DataTable):
                         break
 
                 # Re-number all remaining tracks so the # column stays
-                # contiguous after the removal.
-                for new_idx, t in enumerate(self._all_tracks):
-                    t["_original_index"] = new_idx
-
-                # Rebuild the visible→original map in VISIBLE order. The
-                # visible list may be sorted, so walking _all_tracks would
-                # put the entries in the wrong slots.
-                self._filtered_map = [t["_original_index"] for t in self._tracks]
+                # contiguous after the removal, and rebuild the visible
+                # map + the # cells — the ``_reindex_after_removal``
+                # engine (native when the Rust extension is built, the
+                # pure-Python transcription otherwise).
+                self._filtered_map, index_cells = _reindex_after_removal(
+                    self._all_tracks, self._tracks
+                )
 
                 # Refresh the # cell for every visible row that shifted.
-                for vis_idx, (rk, t) in enumerate(zip(self._row_keys, self._tracks)):
+                for rk, cell_value in zip(self._row_keys, index_cells):
                     try:
-                        self.update_cell(rk, "index", str(t["_original_index"] + 1))
+                        self.update_cell(rk, "index", cell_value)
                     except Exception:
                         pass
 
@@ -758,19 +867,13 @@ class TrackTable(DataTable):
             one fused call (native when the Rust extension is built,
             the pure-Python transcription otherwise) instead of the
             per-field walk, its positional cells mapped back onto the
-            column keys in the table's own column order.
+            column keys in the table's own column order (the
+            ``_column_keys`` engine).
             """
             _, cells = _row_values(
                 track, row_index, self._show_index, self._show_album, self._marked
             )
-            keys = ["mark"]
-            if self._show_index:
-                keys.append("index")
-            keys += ["title", "artist"]
-            if self._show_album:
-                keys.append("album")
-            keys.append("duration")
-            return dict(zip(keys, cells))
+            return dict(zip(_column_keys(self._show_index, self._show_album), cells))
 
         def _styled_cells(track: dict, row_index: int, style: str) -> dict[str, Any]:
             """Active-cells: same data values wrapped in Rich Text with *style*.
@@ -950,11 +1053,10 @@ class TrackTable(DataTable):
             self.border_subtitle = ""
             self.remove_class("-marked")
             return
-        hidden = self.hidden_marked_count
-        text = f"{count} selected"
-        if hidden:
-            text += f" ({hidden} hidden)"
-        self.border_subtitle = text + " · A: add · Esc: clear"
+        # The status line — the ``_mark_status_text`` engine (native
+        # when the Rust extension is built, the pure-Python
+        # transcription otherwise).
+        self.border_subtitle = _mark_status_text(count, self.hidden_marked_count)
         self.add_class("-marked")
 
     # -- Column resize (drag header border) ------------------------------
@@ -1135,10 +1237,10 @@ class TrackTable(DataTable):
             if track is None:
                 self.post_message(SelectionChanged(""))
                 return
-            title = track.get("title", "") or ""
-            artist = extract_artist(track) or ""
-            label = f"{title} — {artist}" if artist else title
-            self.post_message(SelectionChanged(label))
+            # The info-bar label — the ``_selection_label`` engine
+            # (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            self.post_message(SelectionChanged(_selection_label(track)))
         except Exception:
             self.post_message(SelectionChanged(""))
 
@@ -1150,10 +1252,7 @@ class TrackTable(DataTable):
                 self.post_message(SelectionChanged(""))
                 return
             track = self._tracks[row_idx]
-            title = track.get("title", "") or ""
-            artist = extract_artist(track) or ""
-            label = f"{title} — {artist}" if artist else title
-            self.post_message(SelectionChanged(label))
+            self.post_message(SelectionChanged(_selection_label(track)))
         except Exception:
             self.post_message(SelectionChanged(""))
 
@@ -1285,13 +1384,13 @@ class TrackTable(DataTable):
         if not self._tracks:
             return
 
-        if column not in _SORT_KEYS:
+        # The toggle decision — the ``_sort_state`` engine (native when
+        # the Rust extension is built, the pure-Python transcription
+        # otherwise); ``None`` leaves the sort untouched.
+        state = _sort_state(column, self._sort_column, self._sort_reverse)
+        if state is None:
             return
-        if self._sort_column == column:
-            self._sort_reverse = not self._sort_reverse
-        else:
-            self._sort_column = column
-            self._sort_reverse = False
+        self._sort_column, self._sort_reverse = state
 
         # Restore by occurrence, not video ID: with the same track listed
         # twice, the cursor stays on the copy it was on.
@@ -1403,9 +1502,10 @@ class TrackTable(DataTable):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same view engine and the same row
-# assembly; these bindings replace the pure-Python references above when
-# the extension is importable.  The rebinding must happen AFTER the
+# The Rust extension implements the same view engine, the same row
+# assembly and the same rendering-integration engines; these bindings
+# replace the pure-Python references above when the extension is
+# importable.  The rebinding must happen AFTER the
 # definitions above — assigning the native functions any earlier would
 # be clobbered by the ``def`` statements (the lesson that produced
 # formatting.py's dead native bindings).
@@ -1415,7 +1515,25 @@ try:
         filter_sort_tracks as _native_filter_sort_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_column_keys as _native_column_keys,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_mark_status as _native_mark_status,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_reindex_after_removal as _native_reindex_after_removal,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_row_values as _native_row_values,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_selection_label as _native_selection_label,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_sort_state as _native_sort_state,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_stamp_tracks as _native_stamp_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_view_rows as _native_view_rows,
@@ -1489,3 +1607,35 @@ else:
             marked,
             _get_reorder_enabled(),
         )
+
+    def _stamp_tracks(tracks: list[dict], start: int = 0) -> list[dict]:  # noqa: F811
+        """The load/append stamping pass (native Rust engine)."""
+        return _native_stamp_tracks(tracks, start)
+
+    def _mark_status_text(count: int, hidden: int) -> str:  # noqa: F811
+        """The marked-rows status line (native Rust engine)."""
+        return _native_mark_status(count, hidden)
+
+    def _selection_label(track: dict) -> str:  # noqa: F811
+        """The selection-info label (native Rust engine).
+
+        Same contract as the pure-Python reference above; a non-dict
+        track degrades through the defaults where the reference's
+        ``.get`` would raise — the table's own paths only ever hold
+        dicts.
+        """
+        return _native_selection_label(track)
+
+    def _reindex_after_removal(  # noqa: F811
+        all_tracks: list[dict], tracks: list[dict]
+    ) -> tuple[list[int], list[str]]:
+        """The post-removal renumbering (native Rust engine)."""
+        return _native_reindex_after_removal(all_tracks, tracks)
+
+    def _sort_state(  # noqa: F811
+        column: str, sort_column: str | None, sort_reverse: bool
+    ) -> tuple[str, bool] | None:
+        """The header-click sort toggle (native Rust engine)."""
+        return _native_sort_state(column, sort_column, sort_reverse)
+
+    _column_keys = _native_column_keys  # type: ignore[assignment]
