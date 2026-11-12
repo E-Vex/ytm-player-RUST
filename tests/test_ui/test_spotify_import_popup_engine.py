@@ -24,6 +24,7 @@ remains to drift.
 from __future__ import annotations
 
 import inspect
+from difflib import SequenceMatcher
 from typing import Any
 
 import pytest
@@ -40,6 +41,28 @@ except ImportError:
     _ytm_player_native = None
 
 _HAVE_NATIVE = _ytm_player_native is not None
+
+
+@pytest.fixture(autouse=True)
+def _fake_fuzz(monkeypatch):
+    """Deterministic stand-in for thefuzz, which is a [spotify]-extra dep.
+
+    CI installs only .[dev], so ``si.fuzz`` may be unbound there
+    (``raising=False``). The unpatched-engine tests below score real
+    candidates, and ``_fuzzy_score`` uses nothing but ``fuzz.ratio``
+    (read at call time by both backends, so the stand-in steers the
+    native engine exactly like the fallback) — SequenceMatcher has the
+    same shape, 100 for identical strings and near-0 for disjoint, so
+    the EXACT/MULTIPLE verdicts hold in every environment, real
+    thefuzz installed or not. Mirrors the service suite's own fixture.
+    """
+
+    class _Fuzz:
+        @staticmethod
+        def ratio(a: str, b: str) -> int:
+            return int(round(SequenceMatcher(None, a, b).ratio() * 100))
+
+    monkeypatch.setattr(si, "fuzz", _Fuzz, raising=False)
 
 
 # The canned catalogue: Spotify tracks and their YTM search candidates.
