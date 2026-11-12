@@ -8,8 +8,10 @@ occurrence gate (``_queue_entry_id``), the popup-answer classification
 (``_track_action_route``), the entity-action dispatch (``_entity_action_route``),
 the like-toggle rating (``_like_toggle_rating``), the Remove-from-Queue
 plan (``_remove_from_queue_plan``), the in-queue verdict
-(``_in_queue_verdict``) and the artist-songs merge plan
-(``_artist_songs_merge_plan``). The bottom-of-module seam rebinds each
+(``_in_queue_verdict``), the artist-songs merge plan
+(``_artist_songs_merge_plan``) and the artist/album popup-view assembly
+(``_artist_popup_plan``, ``_artist_picker_rows``, ``_artist_popup_item``
+and ``_album_popup_item``). The bottom-of-module seam rebinds each
 to the native function when the extension is importable. The popups,
 the notifications, the awaited workers, the queue mutations and the
 navigation calls stay Python-side in the mixin.
@@ -364,6 +366,105 @@ def _artist_songs_merge_plan(
     ]
     appends = [t for t in all_tracks if t.get("video_id", "") not in existing_ids]
     return {"updates": updates, "appends": appends}
+
+
+def _artist_popup_plan(track: Any) -> dict[str, Any]:
+    """The artist-popup gate behind ``_open_actions_for_artist``.
+
+    Which popup a track's artist column opens: no artists at all — the
+    reference's own ``not artists or not isinstance(artists, list)``
+    gate, the truthiness consulted before the isinstance — answers
+    ``"none"`` (the caller's own "No artist info available" warning);
+    a list whose every entry lacks both an ``id`` and a ``browseId``
+    answers ``"none"`` too; exactly one valid artist answers
+    ``"single"`` carrying that artist; anything else answers ``"pick"``
+    carrying the valid list (the picker, in the artists' own order).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_popup_plan``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    artists = track.get("artists", [])
+    if not artists or not isinstance(artists, list):
+        return {"arm": "none"}
+    valid = [a for a in artists if a.get("id") or a.get("browseId")]
+    if not valid:
+        return {"arm": "none"}
+    if len(valid) == 1:
+        return {"arm": "single", "valid": valid, "artist": valid[0]}
+    return {"arm": "pick", "valid": valid}
+
+
+def _artist_picker_rows(artists: Any) -> list[tuple[str, Any]]:
+    """The picker rows behind ``_show_artist_picker``.
+
+    One ``(str(i), name)`` pair per artist, in the list's own order —
+    the index through ``str()`` and the name the raw
+    ``a.get("name", "Unknown Artist")`` result (the default included).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_picker_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return [(str(i), a.get("name", "Unknown Artist")) for i, a in enumerate(artists)]
+
+
+def _artist_popup_item(artist: Any) -> dict[str, Any]:
+    """The popup item behind ``_show_artist_actions``.
+
+    The browse id — ``artist.get("id") or artist.get("browseId", "")``,
+    the id read short-circuited before the browseId read with its
+    ``""`` default — gates the popup: a falsy id answers ``"none"``
+    (the reference's own silent return), anything else answers
+    ``"item"`` carrying the id and the ``{"browseId": id, "artist":
+    name}`` assembly (the name the raw ``artist.get("name", "Unknown
+    Artist")`` result).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_popup_item``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    browse_id = artist.get("id") or artist.get("browseId", "")
+    if not browse_id:
+        return {"arm": "none"}
+    item: dict[str, Any] = {
+        "browseId": browse_id,
+        "artist": artist.get("name", "Unknown Artist"),
+    }
+    return {"arm": "item", "browse_id": browse_id, "item": item}
+
+
+def _album_popup_item(track: Any) -> dict[str, Any]:
+    """The popup item behind ``_open_actions_for_album``.
+
+    The album id — the reference's own chain
+    ``track.get("album_id") or (album.get("id") if isinstance(album,
+    dict) else None) or ""``, the nested read gated on the album being
+    a dict, each read short-circuited by every earlier falsy one —
+    gates the popup: a falsy id answers ``"none"`` (the caller's own
+    "No album info available" warning), anything else answers
+    ``"item"`` carrying the id and the assembly — ``{"browseId": id,
+    "title": album_name}`` with the album name the raw album string for
+    a string album and ``album.get("name", "Unknown Album")``
+    otherwise, plus the track's ``artists`` list attached verbatim when
+    the track lists one.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.album_popup_item``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    album = track.get("album", {})
+    album_id = track.get("album_id") or (album.get("id") if isinstance(album, dict) else None) or ""
+    if not album_id:
+        return {"arm": "none"}
+    album_name = album if isinstance(album, str) else album.get("name", "Unknown Album")
+    item: dict[str, Any] = {
+        "browseId": album_id,
+        "title": album_name,
+    }
+    if track.get("artists"):
+        item["artists"] = track["artists"]
+    return {"arm": "item", "album_id": album_id, "item": item}
 
 
 class TrackActionsMixin(YTMHostBase):
@@ -856,24 +957,31 @@ class TrackActionsMixin(YTMHostBase):
     def _open_actions_for_artist(self, track: dict) -> None:
         """Push ActionsPopup for an artist of a track.
 
-        For multi-artist tracks, shows a picker first.
+        For multi-artist tracks, shows a picker first. The artist gate —
+        no artist info versus one valid artist versus several — resolves
+        through the ``_artist_popup_plan`` engine (native when the Rust
+        extension is built, the pure-Python transcription otherwise);
+        the warnings and the popup pushes stay here.
         """
-        artists = track.get("artists", [])
-        if not artists or not isinstance(artists, list):
+        plan = _artist_popup_plan(track)
+        if plan["arm"] == "none":
             self.notify("No artist info available.", severity="warning", timeout=2)
             return
-        valid = [a for a in artists if a.get("id") or a.get("browseId")]
-        if not valid:
-            self.notify("No artist info available.", severity="warning", timeout=2)
-            return
-        if len(valid) == 1:
-            self._show_artist_actions(valid[0])
+        valid = plan["valid"]
+        if plan["arm"] == "single":
+            self._show_artist_actions(plan["artist"])
             return
         self._show_artist_picker(track, valid)
 
     def _show_artist_picker(self, track: dict, artists: list[dict]) -> None:
-        """Show a picker popup for multi-artist tracks."""
-        picker_actions = [(str(i), a.get("name", "Unknown Artist")) for i, a in enumerate(artists)]
+        """Show a picker popup for multi-artist tracks.
+
+        The picker rows — one ``(str(i), name)`` pair per artist —
+        assemble through the ``_artist_picker_rows`` engine (native
+        when the Rust extension is built, the pure-Python transcription
+        otherwise).
+        """
+        picker_actions = _artist_picker_rows(artists)
         picker_item = {"title": "Select Artist"}
 
         def _on_pick(action_id: str | None) -> None:
@@ -886,14 +994,20 @@ class TrackActionsMixin(YTMHostBase):
     def _show_artist_actions(
         self, artist: dict, back_to: tuple[dict, list[dict]] | None = None
     ) -> None:
-        """Push the artist actions popup for a single artist dict."""
-        browse_id = artist.get("id") or artist.get("browseId", "")
-        if not browse_id:
+        """Push the artist actions popup for a single artist dict.
+
+        The popup item — the browse-id gate and the ``{"browseId",
+        "artist"}`` assembly — resolves through the ``_artist_popup_item``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the answer handling, the
+        ``_back`` extension of the action list and the popup push stay
+        here.
+        """
+        verdict = _artist_popup_item(artist)
+        if verdict["arm"] == "none":
             return
-        item: dict[str, Any] = {
-            "browseId": browse_id,
-            "artist": artist.get("name", "Unknown Artist"),
-        }
+        browse_id = verdict["browse_id"]
+        item = verdict["item"]
 
         def _handle(action_id: str | None) -> None:
             if action_id is None:
@@ -920,21 +1034,21 @@ class TrackActionsMixin(YTMHostBase):
         self.push_screen(ActionsPopup(item, item_type="artist", actions=actions), _handle)
 
     def _open_actions_for_album(self, track: dict) -> None:
-        """Push ActionsPopup for the album of a track."""
-        album = track.get("album", {})
-        album_id = (
-            track.get("album_id") or (album.get("id") if isinstance(album, dict) else None) or ""
-        )
-        if not album_id:
+        """Push ActionsPopup for the album of a track.
+
+        The popup item — the album-id gate (``album_id``, the nested
+        album id, then ``""``), the album-name resolution and the
+        artists attachment — resolves through the ``_album_popup_item``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); the warning, the answer
+        handling and the popup push stay here.
+        """
+        verdict = _album_popup_item(track)
+        if verdict["arm"] == "none":
             self.notify("No album info available.", severity="warning", timeout=2)
             return
-        album_name = album if isinstance(album, str) else album.get("name", "Unknown Album")
-        item: dict[str, Any] = {
-            "browseId": album_id,
-            "title": album_name,
-        }
-        if track.get("artists"):
-            item["artists"] = track["artists"]
+        album_id = verdict["album_id"]
+        item = verdict["item"]
 
         def _handle(action_id: str | None) -> None:
             if action_id is None:
@@ -1365,6 +1479,18 @@ try:
         album_browse_id as _native_album_browse_id,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        album_popup_item as _native_album_popup_item,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        artist_picker_rows as _native_artist_picker_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        artist_popup_item as _native_artist_popup_item,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        artist_popup_plan as _native_artist_popup_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         artist_songs_merge_plan as _native_artist_songs_merge_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -1404,3 +1530,7 @@ else:
     _artist_songs_merge_plan = (  # type: ignore[assignment]
         _native_artist_songs_merge_plan
     )
+    _artist_popup_plan = _native_artist_popup_plan  # type: ignore[assignment]
+    _artist_picker_rows = _native_artist_picker_rows  # type: ignore[assignment]
+    _artist_popup_item = _native_artist_popup_item  # type: ignore[assignment]
+    _album_popup_item = _native_album_popup_item  # type: ignore[assignment]

@@ -2,7 +2,7 @@
 
 The pure decision cores behind ``app/_track_actions.py`` — the largest
 module in the app package, now with its decision surface running
-natively when the Rust extension is built. Nine engines: the ID
+natively when the Rust extension is built. Thirteen engines: the ID
 extractions (``_first_artist_id``, ``_album_browse_id``), the
 occurrence gate (``_queue_entry_id`` — only the Queue page's table
 keys its rows by entry id), the ActionsPopup answer classification
@@ -14,12 +14,14 @@ navigation targets), the like-toggle rating (``_like_toggle_rating``),
 the Remove-from-Queue plan (``_remove_from_queue_plan`` — the
 occurrence arm, the stale warning, the first-copy-by-video-id walk),
 the in-queue verdict (``_in_queue_verdict`` — the popup's
-Add/Remove-from-Queue swap), and the artist-songs merge plan
+Add/Remove-from-Queue swap), the artist-songs merge plan
 (``_artist_songs_merge_plan`` — the background fetch's
-enrich-and-append pass). The engines run with two interchangeable
-backends: the pure-Python transcriptions in the module and, when the
-Rust extension is built, the native implementations bound at the
-module's tail.
+enrich-and-append pass), and the artist/album popup-view assembly
+(``_artist_popup_plan``'s gate, ``_artist_picker_rows``'s picker,
+``_artist_popup_item``'s and ``_album_popup_item``'s item dicts). The
+engines run with two interchangeable backends: the pure-Python
+transcriptions in the module and, when the Rust extension is built,
+the native implementations bound at the module's tail.
 
 The unit tests below assert each engine's contract on whichever
 backend is loaded. When the extension is built, the parity tests
@@ -54,6 +56,10 @@ from ytm_player.app import _track_actions as track_actions
 from ytm_player.app._track_actions import (
     TrackActionsMixin,
     _album_browse_id,
+    _album_popup_item,
+    _artist_picker_rows,
+    _artist_popup_item,
+    _artist_popup_plan,
     _artist_songs_merge_plan,
     _entity_action_route,
     _first_artist_id,
@@ -684,6 +690,160 @@ class TestArtistSongsMergePlan:
             _artist_songs_merge_plan([], [{"video_id": ["not-hashable"]}], [])
 
 
+# ── The artist-popup gate ───────────────────────────────────────────
+
+
+class TestArtistPopupPlan:
+    """``_artist_popup_plan``'s classification, on whichever backend."""
+
+    def test_a_missing_artists_key_answers_none(self):
+        assert _artist_popup_plan({"title": "T"}) == {"arm": "none"}
+
+    def test_a_none_artists_value_answers_none(self):
+        assert _artist_popup_plan({"artists": None}) == {"arm": "none"}
+
+    def test_an_empty_artists_list_answers_none(self):
+        assert _artist_popup_plan({"artists": []}) == {"arm": "none"}
+
+    def test_a_non_list_artists_value_answers_none(self):
+        assert _artist_popup_plan({"artists": "UC1"}) == {"arm": "none"}
+
+    def test_artists_without_any_id_answer_none(self):
+        assert _artist_popup_plan({"artists": [{"name": "A"}, {"name": "B"}]}) == {"arm": "none"}
+
+    def test_an_empty_id_does_not_count_as_valid(self):
+        assert _artist_popup_plan({"artists": [{"name": "A", "id": ""}]}) == {"arm": "none"}
+
+    def test_a_browse_id_counts_as_valid(self):
+        plan = _artist_popup_plan({"artists": [{"name": "A", "browseId": "BR"}]})
+        assert plan["arm"] == "single"
+        assert plan["artist"] == {"name": "A", "browseId": "BR"}
+        assert plan["valid"] == [{"name": "A", "browseId": "BR"}]
+
+    def test_exactly_one_valid_artist_answers_single(self):
+        a, b = {"name": "A", "id": "UC1"}, {"name": "B"}
+        plan = _artist_popup_plan({"artists": [a, b]})
+        assert plan == {"arm": "single", "valid": [a], "artist": a}
+
+    def test_several_valid_artists_answer_pick(self):
+        a, b = {"name": "A", "id": "UC1"}, {"name": "B", "id": "UC2"}
+        plan = _artist_popup_plan({"artists": [a, {"name": "X"}, b]})
+        assert plan == {"arm": "pick", "valid": [a, b]}
+
+    def test_the_valid_list_keeps_the_artists_own_order(self):
+        a, b = {"name": "A", "id": "UC1"}, {"name": "B", "browseId": "BR2"}
+        plan = _artist_popup_plan({"artists": [b, a]})
+        assert plan["valid"] == [b, a]
+
+
+# ── The artist picker's rows ────────────────────────────────────────
+
+
+class TestArtistPickerRows:
+    """``_artist_picker_rows``'s assembly, on whichever backend."""
+
+    def test_one_pair_per_artist_in_order(self):
+        rows = _artist_picker_rows([{"name": "A"}, {"name": "B"}, {"name": "C"}])
+        assert rows == [("0", "A"), ("1", "B"), ("2", "C")]
+
+    def test_a_missing_name_answers_the_default(self):
+        assert _artist_picker_rows([{"id": "UC1"}]) == [("0", "Unknown Artist")]
+
+    def test_a_falsy_name_answers_itself(self):
+        assert _artist_picker_rows([{"name": ""}]) == [("0", "")]
+
+    def test_the_name_rides_home_verbatim(self):
+        assert _artist_picker_rows([{"name": 42}]) == [("0", 42)]
+
+    def test_an_empty_artists_list_answers_no_rows(self):
+        assert _artist_picker_rows([]) == []
+
+
+# ── The artist popup's item ─────────────────────────────────────────
+
+
+class TestArtistPopupItem:
+    """``_artist_popup_item``'s gate and assembly, on whichever backend."""
+
+    def test_the_id_outranks_the_browse_id(self):
+        verdict = _artist_popup_item({"id": "UC1", "browseId": "BR", "name": "A"})
+        assert verdict == {
+            "arm": "item",
+            "browse_id": "UC1",
+            "item": {"browseId": "UC1", "artist": "A"},
+        }
+
+    def test_a_falsy_id_falls_through_to_the_browse_id(self):
+        verdict = _artist_popup_item({"id": "", "browseId": "BR", "name": "A"})
+        assert verdict["browse_id"] == "BR"
+        assert verdict["item"] == {"browseId": "BR", "artist": "A"}
+
+    def test_a_missing_browse_id_answers_the_default_and_gates(self):
+        assert _artist_popup_item({"name": "A"}) == {"arm": "none"}
+
+    def test_an_empty_browse_id_gates_too(self):
+        assert _artist_popup_item({"id": "", "browseId": ""}) == {"arm": "none"}
+
+    def test_a_missing_name_answers_the_default(self):
+        verdict = _artist_popup_item({"id": "UC1"})
+        assert verdict["item"] == {"browseId": "UC1", "artist": "Unknown Artist"}
+
+    def test_the_name_rides_home_verbatim(self):
+        verdict = _artist_popup_item({"id": "UC1", "name": 7})
+        assert verdict["item"] == {"browseId": "UC1", "artist": 7}
+
+
+# ── The album popup's item ──────────────────────────────────────────
+
+
+class TestAlbumPopupItem:
+    """``_album_popup_item``'s gate and assembly, on whichever backend."""
+
+    def test_the_album_id_outranks_the_nested_album_id(self):
+        verdict = _album_popup_item({"album_id": "ALB1", "album": {"id": "ALB2", "name": "N"}})
+        assert verdict == {
+            "arm": "item",
+            "album_id": "ALB1",
+            "item": {"browseId": "ALB1", "title": "N"},
+        }
+
+    def test_a_missing_album_id_falls_through_to_the_nested_id(self):
+        verdict = _album_popup_item({"album": {"id": "ALB2", "name": "N"}})
+        assert verdict["album_id"] == "ALB2"
+        assert verdict["item"] == {"browseId": "ALB2", "title": "N"}
+
+    def test_a_string_album_names_the_item(self):
+        verdict = _album_popup_item({"album": "My Album"})
+        assert verdict["arm"] == "none"  # a string album carries no id
+
+    def test_an_album_id_with_a_string_album(self):
+        verdict = _album_popup_item({"album_id": "ALB1", "album": "My Album"})
+        assert verdict["item"] == {"browseId": "ALB1", "title": "My Album"}
+
+    def test_a_non_dict_album_contributes_no_nested_id(self):
+        verdict = _album_popup_item({"album": "plain", "browseId": "BR"})
+        assert verdict == {"arm": "none"}  # the reference reads no top-level browseId here
+
+    def test_a_missing_album_id_gates(self):
+        assert _album_popup_item({"title": "T"}) == {"arm": "none"}
+
+    def test_an_empty_nested_id_gates(self):
+        assert _album_popup_item({"album": {"id": "", "name": "N"}}) == {"arm": "none"}
+
+    def test_a_missing_album_name_answers_the_default(self):
+        verdict = _album_popup_item({"album": {"id": "ALB"}})
+        assert verdict["item"] == {"browseId": "ALB", "title": "Unknown Album"}
+
+    def test_a_truthy_artists_list_is_attached_verbatim(self):
+        artists = [{"name": "A", "id": "UC1"}]
+        verdict = _album_popup_item({"album": {"id": "ALB"}, "artists": artists})
+        assert verdict["item"]["artists"] is artists
+
+    def test_a_falsy_artists_list_is_not_attached(self):
+        verdict = _album_popup_item({"album": {"id": "ALB"}, "artists": []})
+        assert "artists" not in verdict["item"]
+
+
 # ── Error shapes ─────────────────────────────────────────────────────────
 
 
@@ -709,6 +869,18 @@ class TestEngineErrorShapes:
 
         with pytest.raises(RuntimeError, match="track read failed"):
             _like_toggle_rating(Boom())
+
+    def test_the_artist_popup_plan_needs_a_mapping_track(self):
+        with pytest.raises(AttributeError):
+            _artist_popup_plan(5)
+
+    def test_the_album_popup_item_needs_a_mapping_track(self):
+        with pytest.raises(AttributeError):
+            _album_popup_item(5)
+
+    def test_the_artist_popup_item_needs_a_mapping_artist(self):
+        with pytest.raises(AttributeError):
+            _artist_popup_item(5)
 
 
 # ── Wiring: the actions popup ────────────────────────────────────────────
@@ -1166,6 +1338,148 @@ class TestMergePlanWiring:
         host._refresh_queue_page.assert_called_once()
 
 
+# ── Wiring: the artist/album popup-view assembly ─────────────────────
+
+
+class TestArtistAlbumPopupWiring:
+    """The artist/album popup-open helpers consult the popup-view
+    engines and steer their own widget calls."""
+
+    def test_the_plan_engine_is_consulted_with_the_very_track(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_engine(track):
+            calls.append(track)
+            return {"arm": "none"}
+
+        monkeypatch.setattr(track_actions, "_artist_popup_plan", recording_engine)
+        host = MagicMock()
+        track = {"artists": [{"name": "A", "id": "UC1"}]}
+
+        TrackActionsMixin._open_actions_for_artist(host, track)
+
+        assert calls == [track]
+        host.notify.assert_called_once_with(
+            "No artist info available.", severity="warning", timeout=2
+        )
+        host.push_screen.assert_not_called()
+
+    def test_the_single_arm_opens_the_actions_popup_for_that_artist(self):
+        host = MagicMock()
+        a = {"name": "A", "id": "UC1"}
+
+        TrackActionsMixin._open_actions_for_artist(host, {"artists": [a]})
+
+        host._show_artist_actions.assert_called_once_with(a)
+        host.notify.assert_not_called()
+
+    def test_the_pick_arm_opens_the_picker_with_the_valid_list(self):
+        host = MagicMock()
+        a, b = {"name": "A", "id": "UC1"}, {"name": "B", "id": "UC2"}
+
+        TrackActionsMixin._open_actions_for_artist(host, {"artists": [a, b]})
+
+        host._show_artist_picker.assert_called_once()
+        args = host._show_artist_picker.call_args.args
+        assert args[0] == {"artists": [a, b]}
+        assert args[1] == [a, b]
+
+    def test_the_picker_rides_the_rows_engine(self, monkeypatch):
+        calls: list[list] = []
+
+        def recording_engine(artists):
+            calls.append(artists)
+            return [("9", "Picked")]
+
+        monkeypatch.setattr(track_actions, "_artist_picker_rows", recording_engine)
+        host = MagicMock()
+        artists = [{"name": "A", "id": "UC1"}]
+
+        TrackActionsMixin._show_artist_picker(host, {"artists": artists}, artists)
+
+        assert calls == [artists]
+        popup, _callback = host.push_screen.call_args.args
+        assert popup._actions == [("9", "Picked")]
+        assert popup.item == {"title": "Select Artist"}
+
+    def test_the_artist_actions_ride_the_item_engine(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_engine(artist):
+            calls.append(artist)
+            return {
+                "arm": "item",
+                "browse_id": "UC1",
+                "item": {"browseId": "UC1", "artist": "A"},
+            }
+
+        monkeypatch.setattr(track_actions, "_artist_popup_item", recording_engine)
+        host = MagicMock()
+        artist = {"id": "UC1", "name": "A"}
+
+        TrackActionsMixin._show_artist_actions(host, artist)
+
+        assert calls == [artist]
+        popup, _callback = host.push_screen.call_args.args
+        assert popup.item == {"browseId": "UC1", "artist": "A"}
+        assert popup.item_type == "artist"
+
+    def test_the_artist_actions_with_no_browse_id_push_nothing(self):
+        host = MagicMock()
+
+        TrackActionsMixin._show_artist_actions(host, {"name": "A"})
+
+        host.push_screen.assert_not_called()
+
+    def test_the_back_entry_extends_the_artists_action_list(self):
+        from ytm_player.ui.popups.actions import ARTIST_ACTIONS
+
+        host = MagicMock()
+        # The picker's callback must reach the real actions helper, not a
+        # mock — it is the one that extends ARTIST_ACTIONS with _back.
+        host._show_artist_actions = types.MethodType(TrackActionsMixin._show_artist_actions, host)
+        track = {"artists": [{"name": "A", "id": "UC1"}]}
+        artists = track["artists"]
+
+        TrackActionsMixin._show_artist_picker(host, track, artists)
+        _on_pick = host.push_screen.call_args.args[1]
+        _on_pick("0")
+
+        popup, _callback = host.push_screen.call_args.args
+        assert popup._actions == list(ARTIST_ACTIONS) + [("_back", "← Back")]
+
+    def test_the_album_item_engine_is_consulted_with_the_very_track(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_engine(track):
+            calls.append(track)
+            return {"arm": "none"}
+
+        monkeypatch.setattr(track_actions, "_album_popup_item", recording_engine)
+        host = MagicMock()
+        track = {"album": {"id": "ALB"}}
+
+        TrackActionsMixin._open_actions_for_album(host, track)
+
+        assert calls == [track]
+        host.notify.assert_called_once_with(
+            "No album info available.", severity="warning", timeout=2
+        )
+        host.push_screen.assert_not_called()
+
+    def test_the_album_popup_carries_the_engines_item(self):
+        host = MagicMock()
+        artists = [{"name": "A", "id": "UC1"}]
+
+        TrackActionsMixin._open_actions_for_album(
+            host, {"album": {"id": "ALB", "name": "N"}, "artists": artists}
+        )
+
+        popup, _callback = host.push_screen.call_args.args
+        assert popup.item == {"browseId": "ALB", "title": "N", "artists": artists}
+        assert popup.item_type == "album"
+
+
 # ── Native parity ────────────────────────────────────────────────────────
 
 # First-artist cases: the source dicts, scalars only.
@@ -1376,6 +1690,65 @@ _MERGE_PARITY_CASES = [
 # The empty-everything case, spelled plainly.
 _MERGE_PARITY_CASES[6] = [[], [], []]
 
+# Artist-popup-gate cases: the track dicts.
+_ARTIST_PLAN_PARITY_CASES = [
+    {},
+    {"artists": None},
+    {"artists": []},
+    {"artists": "UC1"},
+    {"artists": [{"name": "A"}]},
+    {"artists": [{"name": "A"}, {"id": "UC2"}]},
+    {"artists": [{"id": "UC1"}]},
+    {"artists": [{"id": "", "browseId": "BR"}]},
+    {"artists": [{"browseId": 0}]},
+    {"artists": [{"id": 0, "browseId": "BR"}]},
+    {"artists": [{"id": "UC1"}, {"id": "UC2"}]},
+    {"artists": [{"name": "A", "id": "UC1"}, {"name": "B"}]},
+    {"artists": ["not-a-dict"]},
+]
+
+# Artist-picker-row cases: the artist lists.
+_ARTIST_ROWS_PARITY_CASES = [
+    [],
+    [{"name": "A"}],
+    [{"id": "UC1"}],
+    [{"name": ""}],
+    [{"name": 42}],
+    [{"name": "A"}, {"name": "B"}],
+]
+
+# Artist-item cases: the artist dicts.
+_ARTIST_ITEM_PARITY_CASES = [
+    {},
+    {"id": "UC1"},
+    {"id": "", "browseId": "BR"},
+    {"browseId": ""},
+    {"id": "", "browseId": ""},
+    {"id": 7},
+    {"id": "UC1", "name": "A"},
+    {"name": "A"},
+    {"id": "UC1", "name": 7},
+    {"id": "", "name": "X"},
+]
+
+# Album-item cases: the track dicts.
+_ALBUM_ITEM_PARITY_CASES = [
+    {},
+    {"album_id": "A1"},
+    {"album": {"id": "A2"}},
+    {"album": "str"},
+    {"album_id": "A1", "album": {"id": "A2"}},
+    {"album_id": "", "album": {"id": ""}},
+    {"album": {"id": "A2", "name": "N"}},
+    {"album_id": "A1", "album": "My Album"},
+    {"album": {"id": "ALB"}, "artists": []},
+    {"album": {"id": "ALB"}, "artists": [{"name": "A"}]},
+    {"album": {"id": "ALB"}, "artists": None},
+    {"album_id": 0, "album": {"id": 0}},
+    {"album": None},
+    {"album": 5, "album_id": "A1"},
+]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -1421,6 +1794,18 @@ json.dump(
         "merge": [
             outcome(ta._artist_songs_merge_plan, *case) for case in payload["merge"]
         ],
+        "artist_plan": [
+            outcome(ta._artist_popup_plan, case) for case in payload["artist_plan"]
+        ],
+        "artist_rows": [
+            outcome(ta._artist_picker_rows, case) for case in payload["artist_rows"]
+        ],
+        "artist_item": [
+            outcome(ta._artist_popup_item, case) for case in payload["artist_item"]
+        ],
+        "album_item": [
+            outcome(ta._album_popup_item, case) for case in payload["album_item"]
+        ],
     },
     sys.stdout,
 )
@@ -1453,6 +1838,10 @@ def _native_outcomes():
         ],
         "in_queue": [outcome(_in_queue_verdict, *case) for case in _IN_QUEUE_PARITY_CASES],
         "merge": [outcome(_artist_songs_merge_plan, *case) for case in _MERGE_PARITY_CASES],
+        "artist_plan": [outcome(_artist_popup_plan, case) for case in _ARTIST_PLAN_PARITY_CASES],
+        "artist_rows": [outcome(_artist_picker_rows, case) for case in _ARTIST_ROWS_PARITY_CASES],
+        "artist_item": [outcome(_artist_popup_item, case) for case in _ARTIST_ITEM_PARITY_CASES],
+        "album_item": [outcome(_album_popup_item, case) for case in _ALBUM_ITEM_PARITY_CASES],
     }
 
 
@@ -1469,6 +1858,10 @@ def _run_child():
         "remove_plan": _REMOVE_PLAN_PARITY_CASES,
         "in_queue": _IN_QUEUE_PARITY_CASES,
         "merge": _MERGE_PARITY_CASES,
+        "artist_plan": _ARTIST_PLAN_PARITY_CASES,
+        "artist_rows": _ARTIST_ROWS_PARITY_CASES,
+        "artist_item": _ARTIST_ITEM_PARITY_CASES,
+        "album_item": _ALBUM_ITEM_PARITY_CASES,
     }
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
@@ -1504,6 +1897,10 @@ class TestNativeParity:
             ("remove_plan", _REMOVE_PLAN_PARITY_CASES),
             ("in_queue", _IN_QUEUE_PARITY_CASES),
             ("merge", _MERGE_PARITY_CASES),
+            ("artist_plan", _ARTIST_PLAN_PARITY_CASES),
+            ("artist_rows", _ARTIST_ROWS_PARITY_CASES),
+            ("artist_item", _ARTIST_ITEM_PARITY_CASES),
+            ("album_item", _ALBUM_ITEM_PARITY_CASES),
         ]:
             for case, n, f in zip(cases, native[family], fallback[family]):
                 assert n == f, (

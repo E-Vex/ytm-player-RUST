@@ -1040,7 +1040,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // stale warning, and the first-copy-by-video-id walk), the
     // in-queue verdict behind the popup's Add/Remove-from-Queue swap,
     // and the artist-songs merge plan behind the background fetch's
-    // enrich-and-append pass. The popups, the notifications, the
+    // enrich-and-append pass. The artist/album popup-view assembly
+    // rides with them: the artist-popup gate
+    // (_open_actions_for_artist's no-info/one-valid/picker
+    // classification), the artist picker's rows, the artist popup's
+    // item assembly (the browse-id gate and the {"browseId",
+    // "artist"} dict), and the album popup's item assembly (the
+    // album-id gate, the album-name resolution and the artists
+    // attachment). The popups, the notifications, the
     // awaited workers, the queue mutations and the navigation calls
     // stay Python-side in the mixin.
     module.add_function(pyo3::wrap_pyfunction!(first_artist_id, module)?)?;
@@ -1052,6 +1059,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(remove_from_queue_plan, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(in_queue_verdict, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(artist_songs_merge_plan, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(artist_popup_plan, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(artist_picker_rows, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(artist_popup_item, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(album_popup_item, module)?)?;
 
     // Discord presence engine (services/discord_rpc.py equivalent):
     // the presence-kwargs assembly behind update's rpc.update(**kwargs)
@@ -18710,3 +18721,206 @@ fn artist_songs_merge_plan<'py>(
     out.set_item("appends", appends)?;
     Ok(out)
 }
+
+/// The artist-popup gate — `app/_track_actions.py`'s
+/// `_open_actions_for_artist` decision core: which popup a track's
+/// artist column opens.
+///
+/// Mirrors the reference's walk exactly, every read through CPython's
+/// own protocol: `track.get("artists", [])` first, then the
+/// `not artists or not isinstance(artists, list)` gate (the truthiness
+/// consulted before the isinstance), then the valid list — every
+/// artist whose `a.get("id") or a.get("browseId")` chain resolves
+/// truthy (the id read short-circuited before the browseId read) —
+/// and finally the count gate: no artists at all, or none valid,
+/// answers `"none"` (the caller's own "No artist info available"
+/// warning); exactly one valid artist answers `"single"` carrying that
+/// very artist; anything else answers `"pick"` carrying the valid
+/// list. The notifications and the popup pushes stay Python-side in
+/// the mixin.
+#[pyfunction]
+fn artist_popup_plan<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let empty_list = PyList::empty(py).into_any();
+    let artists = track.call_method1("get", ("artists", empty_list))?;
+    if artists.is_truthy()? && artists.is_instance_of::<PyList>() {
+        let valid = PyList::empty(py);
+        for a in artists.try_iter()? {
+            let a = a?;
+            // a.get("id") or a.get("browseId") — the id read
+            // short-circuited before the browseId read.
+            let id = a.call_method1("get", ("id",))?;
+            let is_valid = if id.is_truthy()? {
+                true
+            } else {
+                let browse = a.call_method1("get", ("browseId",))?;
+                browse.is_truthy()?
+            };
+            if is_valid {
+                valid.append(a)?;
+            }
+        }
+        let out = PyDict::new(py);
+        if valid.len() == 1 {
+            let first = valid.get_item(0)?;
+            out.set_item("arm", "single")
+                .expect("dict insertion with a str key cannot fail");
+            out.set_item("valid", &valid)?;
+            out.set_item("artist", &first)?;
+            return Ok(out);
+        }
+        if valid.len() >= 2 {
+            out.set_item("arm", "pick")
+                .expect("dict insertion with a str key cannot fail");
+            out.set_item("valid", &valid)?;
+            return Ok(out);
+        }
+        out.set_item("arm", "none")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    let out = PyDict::new(py);
+    out.set_item("arm", "none")
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The artist picker's rows — `app/_track_actions.py`'s
+/// `_show_artist_picker` assembly: one `(str(i), name)` pair per
+/// artist, in the list's own order.
+///
+/// Mirrors the reference exactly: the index through Python's own
+/// `str()`, the name the raw `a.get("name", "Unknown Artist")` result
+/// (the default included, the very object the caller's popup renders).
+#[pyfunction]
+fn artist_picker_rows<'py>(
+    py: Python<'py>,
+    artists: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    let rows = PyList::empty(py);
+    for (i, a) in artists.try_iter()?.enumerate() {
+        let a = a?;
+        let name = a.call_method1("get", ("name", "Unknown Artist"))?;
+        let row = (PyString::new(py, &i.to_string()), name);
+        rows.append(row)?;
+    }
+    Ok(rows)
+}
+
+/// The artist popup's item — `app/_track_actions.py`'s
+/// `_show_artist_actions` assembly: the browse id gate and the item
+/// the entity dispatch reads.
+///
+/// Mirrors the reference exactly, every read through CPython's own
+/// protocol: the browse id — `artist.get("id") or
+/// artist.get("browseId", "")`, the id read short-circuited before the
+/// browseId read with its `""` default — gates the popup (a falsy id
+/// answers `"none"`, the reference's own silent return), and a truthy
+/// one answers `"item"` carrying the id and the
+/// `{"browseId": id, "artist": name}` assembly, the name the raw
+/// `artist.get("name", "Unknown Artist")` result. The answer handling
+/// and the popup push stay Python-side in the mixin.
+#[pyfunction]
+fn artist_popup_item<'py>(
+    py: Python<'py>,
+    artist: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // browse_id = artist.get("id") or artist.get("browseId", "")
+    let id = artist.call_method1("get", ("id",))?;
+    let browse_id = if id.is_truthy()? {
+        id
+    } else {
+        artist.call_method1("get", ("browseId", ""))?
+    };
+    if !browse_id.is_truthy()? {
+        let out = PyDict::new(py);
+        out.set_item("arm", "none")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    let name = artist.call_method1("get", ("name", "Unknown Artist"))?;
+    let item = PyDict::new(py);
+    item.set_item("browseId", &browse_id)?;
+    item.set_item("artist", &name)?;
+    let out = PyDict::new(py);
+    out.set_item("arm", "item")
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("browse_id", &browse_id)?;
+    out.set_item("item", &item)?;
+    Ok(out)
+}
+
+/// The album popup's item — `app/_track_actions.py`'s
+/// `_open_actions_for_album` assembly: the album id gate, the
+/// album-name resolution and the artists attachment.
+///
+/// Mirrors the reference exactly, every read through CPython's own
+/// protocol: the album id — `track.get("album_id") or
+/// (album.get("id") if isinstance(album, dict) else None) or ""`, the
+/// nested read gated on the album being a dict, each read
+/// short-circuited by every earlier falsy one — gates the popup (a
+/// falsy id answers `"none"`, the caller's own "No album info
+/// available" warning). A truthy one answers `"item"` carrying the id
+/// and the assembly — `{"browseId": id, "title": album_name}` with the
+/// album name the raw album string for a string album and
+/// `album.get("name", "Unknown Album")` otherwise, plus the track's
+/// `artists` list attached verbatim (its own `__getitem__` read, only
+/// once the truthiness gate holds) when the track lists one. The
+/// warning, the answer handling and the popup push stay Python-side in
+/// the mixin.
+#[pyfunction]
+fn album_popup_item<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // album = track.get("album", {})
+    let empty_album = PyDict::new(py).into_any();
+    let album = track.call_method1("get", ("album", empty_album))?;
+    // album_id = track.get("album_id") or (album.get("id") if
+    // isinstance(album, dict) else None) or ""
+    let album_id_read = track.call_method1("get", ("album_id",))?;
+    let album_id = if album_id_read.is_truthy()? {
+        album_id_read
+    } else {
+        let nested = if album.is_instance_of::<PyDict>() {
+            album.call_method1("get", ("id",))?
+        } else {
+            py.None().into_bound(py)
+        };
+        if nested.is_truthy()? {
+            nested
+        } else {
+            PyString::new(py, "").into_any()
+        }
+    };
+    if !album_id.is_truthy()? {
+        let out = PyDict::new(py);
+        out.set_item("arm", "none")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    // album_name = album if isinstance(album, str) else
+    //              album.get("name", "Unknown Album")
+    let album_name = if album.is_instance_of::<PyString>() {
+        album
+    } else {
+        album.call_method1("get", ("name", "Unknown Album"))?
+    };
+    let item = PyDict::new(py);
+    item.set_item("browseId", &album_id)?;
+    item.set_item("title", &album_name)?;
+    // if track.get("artists"): item["artists"] = track["artists"]
+    let artists = track.call_method1("get", ("artists",))?;
+    if artists.is_truthy()? {
+        item.set_item("artists", track.get_item("artists")?)?;
+    }
+    let out = PyDict::new(py);
+    out.set_item("arm", "item")
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("album_id", &album_id)?;
+    out.set_item("item", &item)?;
+    Ok(out)
+}
+
