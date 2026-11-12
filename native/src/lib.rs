@@ -6,7 +6,8 @@ use pyo3::exceptions::{
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{
-    PyBool, PyBytes, PyDict, PyFloat, PyInt, PyIterator, PyList, PySet, PySlice, PyString, PyTuple,
+    PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyIterator, PyList, PySet, PySlice,
+    PyString, PyTuple,
 };
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -252,6 +253,31 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(track_table_sort_state, module)?)?;
     module.add_function(pyo3::wrap_pyfunction!(track_table_column_keys, module)?)?;
+    // Track-table mark/range selection engines (the same module's
+    // equivalents): the visible-run core behind the shift-click extend
+    // and the keyboard range marks, the shift-click extend decision and
+    // the range-mode marks themselves, the toggle's symmetric
+    // difference, the post-removal selection shift (marks, baseline,
+    // anchor and range mode with the generation-bump flag), the
+    // marked-tracks walk in displayed order, the hidden-marks count,
+    // and the occurrence-key carry that resolves a selection across a
+    // background reload — with the mark-cell repainting, the cursor
+    // placement and the selection-generation arithmetic staying
+    // Python-side in the widget.
+    module.add_function(pyo3::wrap_pyfunction!(track_table_visible_run, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_extend_marks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_range_marks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_toggle_marks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_shift_selection, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_table_marked_tracks, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        track_table_hidden_marked_count,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        track_table_carry_selection_keys,
+        module
+    )?)?;
 
     // Session-state validation engine (app/_session.py equivalent):
     // the one-pass validation + coercion of the parsed session.json
@@ -4994,6 +5020,500 @@ fn track_table_column_keys(show_index: bool, show_album: bool) -> Vec<String> {
     }
     keys.push("duration".to_string());
     keys
+}
+
+// ---------------------------------------------------------------------------
+// Track-table mark/range selection engine
+// (mirrors ui/widgets/track_table.py's selection core)
+// ---------------------------------------------------------------------------
+
+/// The post-removal shift's answer — the new
+/// `(marked, range_base, anchor, range_mode, bump)` quintuple.
+type TrackSelectionShift<'py> = (
+    Bound<'py, PySet>,
+    Bound<'py, PyFrozenSet>,
+    Option<i64>,
+    bool,
+    bool,
+);
+
+/// The reload carry's answer — the resolved
+/// `(marked, range_base, anchor, cursor, dropped)` quintuple.
+type TrackSelectionCarry<'py> = (
+    Bound<'py, PySet>,
+    Bound<'py, PyFrozenSet>,
+    Option<i64>,
+    Option<i64>,
+    bool,
+);
+
+/// `filtered_map.index(value)` — the first visible position whose
+/// original is *value* (int equality; the map's own invariant is plain
+/// ints), or `None` where CPython's `list.index` would raise
+/// `ValueError`. A non-int map entry compares unequal, exactly like the
+/// reference's `==` scan over the list.
+fn filtered_map_index_of(filtered_map: &Bound<'_, PyList>, value: i64) -> Option<usize> {
+    for (row, item) in filtered_map.iter().enumerate() {
+        if item
+            .extract::<i64>()
+            .map(|orig| orig == value)
+            .unwrap_or(false)
+        {
+            return Some(row);
+        }
+    }
+    None
+}
+
+/// The visible-run core — `TrackTable._run` from
+/// `ui/widgets/track_table.py`: the original indices of the visible rows
+/// from *start* to *end*, inclusive. The two occurrences resolve through
+/// `list.index` (the first row carrying each original) and order through
+/// `sorted`, so the run reads the same whichever end the drag started
+/// from; a *start* the filter hides counts as no start — the run is
+/// *end* alone — exactly like the reference's swallowed `ValueError`.
+/// The slice's own items join the set through CPython's `set(...)`
+/// construction, so an (unreachable) duplicate original dedups the way
+/// the reference's set comprehension would.
+fn visible_run_impl<'py>(
+    py: Python<'py>,
+    filtered_map: &Bound<'py, PyList>,
+    start: i64,
+    end: i64,
+) -> PyResult<Bound<'py, PySet>> {
+    let run = PySet::empty(py)?;
+    let pos_start = filtered_map_index_of(filtered_map, start);
+    let pos_end = filtered_map_index_of(filtered_map, end);
+    if let (Some(a), Some(b)) = (pos_start, pos_end) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        for item in filtered_map.iter().skip(lo).take(hi - lo + 1) {
+            run.add(item)?;
+        }
+    } else {
+        // {end} — the ValueError arm: an invisible row is never marked
+        // through a run.
+        run.add(
+            end.into_pyobject(py)
+                .expect("int conversion is infallible")
+                .into_any(),
+        )?;
+    }
+    Ok(run)
+}
+
+/// The visible-run engine — `ui/widgets/track_table.py`'s `_run`, the
+/// run core behind the shift-click extend (`_extend_to`) and the
+/// keyboard range marks (`_apply_range`). See `visible_run_impl` for the
+/// mirrored contract; the answer is the set of original indices the
+/// caller unions into its marks.
+#[pyfunction]
+#[pyo3(signature = (filtered_map, start, end))]
+fn track_table_visible_run<'py>(
+    py: Python<'py>,
+    filtered_map: &Bound<'py, PyList>,
+    start: i64,
+    end: i64,
+) -> PyResult<Bound<'py, PySet>> {
+    visible_run_impl(py, filtered_map, start, end)
+}
+
+/// A fresh set seeded from an iterable — `set(obj)`, so the caller's own
+/// set is never mutated by the union the engines build on top of it.
+fn set_from_iterable<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySet>> {
+    let out = PySet::empty(py)?;
+    for item in obj.try_iter()? {
+        out.add(item?)?;
+    }
+    Ok(out)
+}
+
+/// The shift-click extend decision — `TrackTable._extend_to` from
+/// `ui/widgets/track_table.py`: with no anchor, or an anchor the filter
+/// hides (the `in filtered_map` list containment), the row is marked and
+/// becomes the anchor — a run never reaches a row that isn't shown —
+/// while an anchored view marks the visible run from the anchor to the
+/// row, existing marks outside the run staying. Answers the new
+/// `(anchor, marked)` pair; the repaint (`_set_marks`) stays
+/// widget-side.
+#[pyfunction]
+#[pyo3(signature = (anchor, filtered_map, marked, original))]
+fn track_table_extend_marks<'py>(
+    py: Python<'py>,
+    anchor: Option<i64>,
+    filtered_map: &Bound<'py, PyList>,
+    marked: &Bound<'py, PyAny>,
+    original: i64,
+) -> PyResult<(Option<i64>, Bound<'py, PySet>)> {
+    // set(marked) | ... — the union seeded from a copy, so the caller's
+    // set is untouched.
+    let marks = set_from_iterable(py, marked)?;
+    match anchor {
+        Some(a) if filtered_map_index_of(filtered_map, a).is_some() => {
+            let run = visible_run_impl(py, filtered_map, a, original)?;
+            for item in run.iter() {
+                marks.add(item)?;
+            }
+            Ok((Some(a), marks))
+        }
+        _ => {
+            marks.add(
+                original
+                    .into_pyobject(py)
+                    .expect("int conversion is infallible")
+                    .into_any(),
+            )?;
+            Ok((Some(original), marks))
+        }
+    }
+}
+
+/// The keyboard-range marks — `TrackTable._apply_range`'s decision from
+/// `ui/widgets/track_table.py`: range mode's marks are the baseline
+/// (`range_base`) plus the anchor-to-cursor run — an empty run when the
+/// cursor is off the table (the whole displayed run between the anchor
+/// row and the highlighted row). No anchor answers `None` and the caller
+/// leaves the marks alone. The generation bump and the repaint stay
+/// widget-side.
+#[pyfunction]
+#[pyo3(signature = (anchor, cursor, filtered_map, range_base))]
+fn track_table_range_marks<'py>(
+    py: Python<'py>,
+    anchor: Option<i64>,
+    cursor: Option<i64>,
+    filtered_map: &Bound<'py, PyList>,
+    range_base: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PySet>>> {
+    // if self._anchor is None: return
+    let Some(anchor) = anchor else {
+        return Ok(None);
+    };
+    // set(self._range_base) | run — a fresh set seeded from the baseline.
+    let marks = set_from_iterable(py, range_base)?;
+    // run = set() if cursor is None else self._run(anchor, cursor)
+    if let Some(cursor) = cursor {
+        let run = visible_run_impl(py, filtered_map, anchor, cursor)?;
+        for item in run.iter() {
+            marks.add(item)?;
+        }
+    }
+    Ok(Some(marks))
+}
+
+/// The toggle's marked set — `TrackTable._toggle_mark`'s symmetric
+/// difference from `ui/widgets/track_table.py`: the caller's marks with
+/// *original*'s membership flipped, built as a fresh set. The anchor
+/// assignment and the repaint stay widget-side.
+#[pyfunction]
+#[pyo3(signature = (marked, original))]
+fn track_table_toggle_marks<'py>(
+    py: Python<'py>,
+    marked: &Bound<'py, PyAny>,
+    original: i64,
+) -> PyResult<Bound<'py, PySet>> {
+    // marked ^ {original} — the copy with the membership flipped.
+    let marks = set_from_iterable(py, marked)?;
+    let original = original
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    if marks.contains(&original)? {
+        marks.discard(&original)?;
+    } else {
+        marks.add(original)?;
+    }
+    Ok(marks)
+}
+
+/// The post-removal selection shift —
+/// `TrackTable._shift_selection_after_removal` from
+/// `ui/widgets/track_table.py`: when the occurrence *removed* leaves
+/// the list, every mark above it slides down one and the removed mark
+/// itself goes (the bump flag answers whether the removed occurrence
+/// was marked, so the caller advances the selection generation exactly
+/// when the marked set actually shrank). The range baseline shifts the
+/// same way; the anchor dies with its occurrence (an un-anchored range
+/// mode drops out and empties the baseline). The answers are the new
+/// `(marked, range_base, anchor, range_mode, bump)` quintuple, all
+/// built fresh; the repaint stays widget-side.
+#[pyfunction]
+#[pyo3(signature = (removed, marked, range_base, anchor, range_mode))]
+fn track_table_shift_selection<'py>(
+    py: Python<'py>,
+    removed: i64,
+    marked: &Bound<'py, PyAny>,
+    range_base: &Bound<'py, PyAny>,
+    anchor: Option<i64>,
+    range_mode: bool,
+) -> PyResult<TrackSelectionShift<'py>> {
+    // if removed in self._marked — containment over the caller's set.
+    let removed_obj = removed
+        .into_pyobject(py)
+        .expect("int conversion is infallible")
+        .into_any();
+    let bump = marked.contains(&removed_obj)?;
+
+    // {shift(i) for i in marked if i != removed} — the shift being
+    // `original - 1 if original > removed else original`.
+    let new_marked = PySet::empty(py)?;
+    for item in marked.try_iter()? {
+        let item = item?;
+        let orig: i64 = item
+            .extract()
+            .map_err(|_| PyTypeError::new_err("expected int marked indices"))?;
+        if orig == removed {
+            continue;
+        }
+        new_marked.add(
+            (if orig > removed { orig - 1 } else { orig })
+                .into_pyobject(py)
+                .expect("int conversion is infallible"),
+        )?;
+    }
+
+    // frozenset(shift(i) for i in range_base if i != removed)
+    let mut shifted_base: Vec<i64> = Vec::new();
+    for item in range_base.try_iter()? {
+        let item = item?;
+        let orig: i64 = item
+            .extract()
+            .map_err(|_| PyTypeError::new_err("expected int range-base indices"))?;
+        if orig == removed {
+            continue;
+        }
+        shifted_base.push(if orig > removed { orig - 1 } else { orig });
+    }
+
+    // self._anchor = None if removed else shift(self._anchor)
+    let new_anchor = match anchor {
+        None => None,
+        Some(a) if a == removed => None,
+        Some(a) => Some(if a > removed { a - 1 } else { a }),
+    };
+
+    // An un-anchored range mode drops out and empties the baseline.
+    let new_range_mode;
+    let new_base = if new_anchor.is_none() && range_mode {
+        new_range_mode = false;
+        PyFrozenSet::empty(py)?
+    } else {
+        new_range_mode = range_mode;
+        PyFrozenSet::new(py, shifted_base)?
+    };
+
+    Ok((new_marked, new_base, new_anchor, new_range_mode, bump))
+}
+
+/// The marked-tracks walk — `TrackTable.marked_tracks` from
+/// `ui/widgets/track_table.py`: the marked tracks in the displayed
+/// order, hidden (filtered-out) ones included — under a sort the whole
+/// backing list is ordered by that sort (`filter_sort_tracks` with the
+/// empty query), so a marked track the filter hides lands where it
+/// would show without the filter; otherwise the load order applies. The
+/// answer holds the backing list's own track objects (no copies), the
+/// mark test reading each row's `_original_index` through the dict's
+/// own lookup (`KeyError` where missing) and the containment running
+/// through CPython's protocol over *marked*.
+#[pyfunction]
+#[pyo3(signature = (all_tracks, marked, sort_column, sort_reverse))]
+fn track_table_marked_tracks<'py>(
+    py: Python<'py>,
+    all_tracks: &Bound<'py, PyList>,
+    marked: &Bound<'py, PyAny>,
+    sort_column: Option<&str>,
+    sort_reverse: bool,
+) -> PyResult<Bound<'py, PyList>> {
+    // if not self._marked: return []
+    if !marked.is_truthy()? {
+        return Ok(PyList::empty(py));
+    }
+    let positions = filter_sort_tracks(py, all_tracks, "", sort_column, sort_reverse);
+    let out = PyList::empty(py);
+    for i in positions {
+        let track = all_tracks.get_item(i)?;
+        // track["_original_index"] in marked
+        let dict = track
+            .downcast::<PyDict>()
+            .map_err(|_| PyTypeError::new_err("expected a dict track"))?;
+        let orig = dict
+            .get_item("_original_index")?
+            .ok_or_else(|| PyKeyError::new_err("_original_index"))?;
+        if marked.contains(&orig)? {
+            out.append(track)?;
+        }
+    }
+    Ok(out)
+}
+
+/// The hidden-marks count — `TrackTable.hidden_marked_count` from
+/// `ui/widgets/track_table.py`: the marked rows the active filter
+/// currently hides, i.e. the marked originals absent from the visible
+/// map. Both the set construction (`set(filtered_map)`) and the
+/// membership run through CPython's own protocol.
+#[pyfunction]
+#[pyo3(signature = (marked, filtered_map))]
+fn track_table_hidden_marked_count(
+    py: Python<'_>,
+    marked: &Bound<'_, PyAny>,
+    filtered_map: &Bound<'_, PyList>,
+) -> PyResult<i64> {
+    // visible = set(self._filtered_map)
+    let visible = PySet::new(py, filtered_map.iter())?;
+    // sum(1 for i in self._marked if i not in visible)
+    let mut hidden: i64 = 0;
+    for item in marked.try_iter()? {
+        if !visible.contains(&item?)? {
+            hidden += 1;
+        }
+    }
+    Ok(hidden)
+}
+
+/// `old_keys[index]` with CPython's own negative-wrap semantics — an
+/// in-range negative counts from the end, anything else answers the
+/// `IndexError` the reference's subscript would raise.
+fn py_list_get_item_i64<'py>(list: &Bound<'py, PyList>, index: i64) -> PyResult<Bound<'py, PyAny>> {
+    let len = list.len() as i64;
+    let effective = if index < 0 { index + len } else { index };
+    if effective < 0 || effective >= len {
+        return Err(PyIndexError::new_err("list index out of range"));
+    }
+    list.get_item(effective as usize)
+}
+
+/// The occurrence-key carry — the pure resolution core of
+/// `TrackTable.refresh_tracks` from `ui/widgets/track_table.py`: which
+/// occurrences of a reloaded list the selection's marks, range baseline,
+/// anchor and cursor carried over to.
+///
+/// The old list's keys count through a `Counter` (a dict keyed by the
+/// key objects themselves, so hash/eq semantics decide identity), and
+/// `key_at` names an occurrence by its key only when that key is
+/// unique in the old list — a duplicated key resolves nothing, so a
+/// mark on it is dropped rather than moved to another row. The new
+/// list's keys count the same way, and `position` maps each key unique
+/// in the new list to its index. `resolve` then carries each candidate
+/// key to its new position, skipping `None` (the duplicated-old-key
+/// case) and keys missing from or duplicated in the new list.
+///
+/// Answers the `(marked, range_base, anchor, cursor, dropped)`
+/// quintuple: the marked set and range baseline resolved onto the new
+/// list (the baseline as a frozenset), the anchor and cursor as single
+/// positions or `None`, and *dropped* — true when any marked key failed
+/// to resolve (the reference's `len(resolved) < len(marked_keys)`), the
+/// caller's signal to advance the selection generation. The reload
+/// itself, the view rebuild, the cursor placement and the generation
+/// arithmetic stay widget-side.
+#[pyfunction]
+#[pyo3(signature = (old_keys, new_keys, marked, range_base, anchor, cursor))]
+fn track_table_carry_selection_keys<'py>(
+    py: Python<'py>,
+    old_keys: &Bound<'py, PyList>,
+    new_keys: &Bound<'py, PyList>,
+    marked: &Bound<'py, PyAny>,
+    range_base: &Bound<'py, PyAny>,
+    anchor: Option<i64>,
+    cursor: Option<i64>,
+) -> PyResult<TrackSelectionCarry<'py>> {
+    // Counter(old_keys)
+    let old_counts = PyDict::new(py);
+    for key in old_keys.iter() {
+        let count: i64 = match old_counts.get_item(&key)? {
+            Some(c) => c.extract()?,
+            None => 0,
+        };
+        old_counts.set_item(&key, count + 1)?;
+    }
+
+    // key_at(index) — the occurrence's key when unique in the old list.
+    let key_at = |index: i64| -> PyResult<Option<Bound<'py, PyAny>>> {
+        let key = py_list_get_item_i64(old_keys, index)?;
+        let count: i64 = old_counts
+            .get_item(&key)?
+            .map(|c| c.extract())
+            .transpose()?
+            .unwrap_or(0);
+        Ok(if count == 1 { Some(key) } else { None })
+    };
+
+    // marked_keys / base_keys / anchor_key / cursor_key
+    let mut marked_keys: Vec<Option<Bound<'py, PyAny>>> = Vec::new();
+    for item in marked.try_iter()? {
+        marked_keys.push(key_at(
+            item?
+                .extract()
+                .map_err(|_| PyTypeError::new_err("expected int marked indices"))?,
+        )?);
+    }
+    let mut base_keys: Vec<Option<Bound<'py, PyAny>>> = Vec::new();
+    for item in range_base.try_iter()? {
+        base_keys.push(key_at(item?.extract().map_err(|_| {
+            PyTypeError::new_err("expected int range-base indices")
+        })?)?);
+    }
+    let anchor_key = match anchor {
+        Some(a) => key_at(a)?,
+        None => None,
+    };
+    let cursor_key = match cursor {
+        Some(c) => key_at(c)?,
+        None => None,
+    };
+
+    // Counter(keys) + position = {k: i for i, k in enumerate(keys) if
+    // new_counts[k] == 1}
+    let new_counts = PyDict::new(py);
+    for key in new_keys.iter() {
+        let count: i64 = match new_counts.get_item(&key)? {
+            Some(c) => c.extract()?,
+            None => 0,
+        };
+        new_counts.set_item(&key, count + 1)?;
+    }
+    let position = PyDict::new(py);
+    for (i, key) in new_keys.iter().enumerate() {
+        let count: i64 = new_counts
+            .get_item(&key)?
+            .map(|c| c.extract())
+            .transpose()?
+            .unwrap_or(0);
+        if count == 1 {
+            position.set_item(&key, i as i64)?;
+        }
+    }
+
+    // resolve(candidates) — the new positions of the keys that resolve.
+    let resolve = |candidates: &[Option<Bound<'py, PyAny>>]| -> PyResult<Bound<'py, PySet>> {
+        let out = PySet::empty(py)?;
+        for candidate in candidates.iter().flatten() {
+            if let Some(pos) = position.get_item(candidate)? {
+                out.add(pos)?;
+            }
+        }
+        Ok(out)
+    };
+
+    let resolved = resolve(&marked_keys)?;
+    // dropped = len(resolved) < len(marked_keys)
+    let dropped = resolved.len() < marked_keys.len();
+    let new_base = PyFrozenSet::new(py, resolve(&base_keys)?.iter())?;
+    // next(iter(resolve([anchor_key])), None) — a zero-or-one-element
+    // resolution, so the single answer or None.
+    let new_anchor = match &anchor_key {
+        Some(key) => match position.get_item(key)? {
+            Some(pos) => Some(pos.extract()?),
+            None => None,
+        },
+        None => None,
+    };
+    let new_cursor = match &cursor_key {
+        Some(key) => match position.get_item(key)? {
+            Some(pos) => Some(pos.extract()?),
+            None => None,
+        },
+        None => None,
+    };
+
+    Ok((resolved, new_base, new_anchor, new_cursor, dropped))
 }
 
 // ---------------------------------------------------------------------------

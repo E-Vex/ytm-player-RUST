@@ -7,11 +7,19 @@ the load/append stamping pass, ``_mark_status_text``: the marked-rows
 status line, ``_selection_label``: the info-bar label,
 ``_reindex_after_removal``: the post-removal renumbering,
 ``_sort_state``: the header-click sort toggle, ``_column_keys``: the
-composed cells' column keys) — is implemented by the Rust extension
-(``_ytm_player_native``) when it is built and by the pure-Python
-transcriptions in this module otherwise; the bottom-of-module seam rebinds
-the engines to the native functions when the extension is importable. The
-widget below only holds state and feeds Textual.
+composed cells' column keys) — and its mark/range selection engine
+(``_visible_run``: the visible-run core, ``_extend_marks``: the
+shift-click extend decision, ``_range_marks``: the keyboard-range
+marks, ``_toggle_marks``: the toggle's symmetric difference,
+``_shift_selection``: the post-removal selection shift,
+``_marked_tracks``: the marked-tracks walk, ``_hidden_marked_count``:
+the hidden-marks count, ``_carry_selection_keys``: the
+occurrence-key carry across a background reload) are implemented by
+the Rust extension (``_ytm_player_native``) when it is built and by
+the pure-Python transcriptions in this module otherwise; the
+bottom-of-module seam rebinds the engines to the native functions
+when the extension is importable. The widget below only holds state
+and feeds Textual.
 """
 
 from __future__ import annotations
@@ -264,6 +272,219 @@ def _column_keys(show_index: bool, show_album: bool) -> list[str]:
     return keys
 
 
+def _visible_run(filtered_map: Sequence[int], start: int, end: int) -> set[int]:
+    """Original indices of the visible rows from *start* to *end*, inclusive.
+
+    The run core behind the shift-click extend (``_extend_to``) and the
+    keyboard range marks (``_apply_range``): the two occurrences resolve
+    through ``list.index`` and order through ``sorted``, so the run
+    reads the same whichever end the gesture started from. A *start*
+    the filter hides counts as no start — the run is *end* alone, so
+    an invisible row is never marked through a run.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_visible_run``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    try:
+        lo, hi = sorted((filtered_map.index(start), filtered_map.index(end)))
+    except ValueError:
+        return {end}
+    return set(filtered_map[lo : hi + 1])
+
+
+def _extend_marks(
+    anchor: int | None,
+    filtered_map: Sequence[int],
+    marked: AbstractSet[int],
+    original: int,
+) -> tuple[int | None, set[int]]:
+    """The shift-click extend decision: ``(new_anchor, new_marks)``.
+
+    With no anchor, or an anchor the filter hides (the ``in
+    filtered_map`` list containment), the row is marked and becomes the
+    anchor — a run never reaches a row that isn't shown — while an
+    anchored view marks the visible run from the anchor to the row
+    (existing marks outside the run stay). The repaint (``_set_marks``)
+    stays with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_extend_marks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if anchor is None or anchor not in filtered_map:
+        return original, set(marked) | {original}
+    return anchor, set(marked) | _visible_run(filtered_map, anchor, original)
+
+
+def _range_marks(
+    anchor: int | None,
+    cursor: int | None,
+    filtered_map: Sequence[int],
+    range_base: AbstractSet[int],
+) -> set[int] | None:
+    """The keyboard-range marks: the baseline plus the anchor-to-cursor run.
+
+    Range mode's decision core behind ``_apply_range`` — ``None`` when
+    there is no anchor (the caller leaves the marks alone), otherwise
+    the range baseline unioned with the run from the anchor to the
+    cursor, an empty run when the cursor is off the table. The
+    generation bump and the repaint stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_range_marks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if anchor is None:
+        return None
+    run: set[int] = set() if cursor is None else _visible_run(filtered_map, anchor, cursor)
+    return set(range_base) | run
+
+
+def _toggle_marks(marked: AbstractSet[int], original: int) -> set[int]:
+    """The toggle's marked set: the marks with *original*'s membership flipped.
+
+    ``_toggle_mark``'s symmetric difference — the anchor assignment and
+    the repaint stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_toggle_marks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return set(marked) ^ {original}
+
+
+def _shift_selection(
+    removed: int,
+    marked: AbstractSet[int],
+    range_base: AbstractSet[int],
+    anchor: int | None,
+    range_mode: bool,
+) -> tuple[set[int], frozenset[int], int | None, bool, bool]:
+    """The post-removal selection shift: ``(marks, base, anchor, range_mode, bump)``.
+
+    When the occurrence *removed* leaves the list, every mark above it
+    slides down one and the removed mark itself goes (the *bump* flag
+    answers whether the removed occurrence was marked, so the caller
+    advances the selection generation exactly when the marked set
+    actually shrank). The range baseline shifts the same way; the
+    anchor dies with its occurrence — an un-anchored range mode drops
+    out and empties the baseline. The repaint stays with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_shift_selection``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+
+    def shift(original: int) -> int:
+        return original - 1 if original > removed else original
+
+    bump = removed in marked
+    new_marked = {shift(i) for i in marked if i != removed}
+    new_base = frozenset(shift(i) for i in range_base if i != removed)
+    new_anchor = None if anchor is None else (None if anchor == removed else shift(anchor))
+    new_range_mode = range_mode
+    if new_anchor is None and range_mode:
+        new_range_mode = False
+        new_base = frozenset()
+    return new_marked, new_base, new_anchor, new_range_mode, bump
+
+
+def _marked_tracks(
+    all_tracks: list[dict],
+    marked: AbstractSet[int],
+    sort_column: str | None,
+    sort_reverse: bool,
+) -> list[dict]:
+    """The marked tracks in the displayed order, hidden ones included.
+
+    ``marked_tracks``'s walk: under a sort the whole backing list is
+    ordered by that sort (the ``_filter_sort_positions`` engine with
+    the empty query), so a marked track the filter hides lands where it
+    would show without the filter; otherwise the load order applies.
+    The answer holds the backing list's own track objects, no copies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_marked_tracks``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if not marked:
+        return []
+    positions = _filter_sort_positions(all_tracks, "", sort_column, sort_reverse)
+    return [all_tracks[i] for i in positions if all_tracks[i]["_original_index"] in marked]
+
+
+def _hidden_marked_count(marked: AbstractSet[int], filtered_map: Sequence[int]) -> int:
+    """The marked rows the active filter currently hides.
+
+    ``hidden_marked_count``'s count: the marked originals absent from
+    the visible map.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_hidden_marked_count``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    visible = set(filtered_map)
+    return sum(1 for i in marked if i not in visible)
+
+
+def _carry_selection_keys(
+    old_keys: Sequence[Hashable],
+    new_keys: Sequence[Hashable],
+    marked: Iterable[int],
+    range_base: Iterable[int],
+    anchor: int | None,
+    cursor: int | None,
+) -> tuple[set[int], frozenset[int], int | None, int | None, bool]:
+    """Resolve the selection's occurrence keys across a reload.
+
+    ``refresh_tracks``'s carry core: which occurrences of the new list
+    the marks, the range baseline, the anchor and the cursor carried
+    over to. The old list's keys count through a ``Counter``, and
+    ``key_at`` names an occurrence by its key only when that key is
+    unique in the old list — a duplicated key resolves nothing, so a
+    mark on it is dropped rather than moved to another row. The new
+    list's keys count the same way, and ``position`` maps each key
+    unique in the new list to its index; ``resolve`` then carries each
+    candidate key to its new position, skipping keys missing from or
+    duplicated in the new list.
+
+    Answers ``(marked, range_base, anchor, cursor, dropped)`` — the
+    marked set and range baseline resolved onto the new list (the
+    baseline as a frozenset), the anchor and cursor as single
+    positions or ``None``, and *dropped*, true when any marked key
+    failed to resolve — the caller's signal to advance the selection
+    generation. The reload itself stays with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.track_table_carry_selection_keys``) when it
+    is built; this pure-Python transcription is the fallback otherwise.
+    """
+    old_counts = Counter(old_keys)
+
+    def key_at(index: int) -> Hashable | None:
+        key = old_keys[index]
+        return key if old_counts[key] == 1 else None
+
+    marked_keys = [key_at(i) for i in marked]
+    base_keys = [key_at(i) for i in range_base]
+    anchor_key = key_at(anchor) if anchor is not None else None
+    cursor_key = key_at(cursor) if cursor is not None else None
+
+    new_counts = Counter(new_keys)
+    position = {k: i for i, k in enumerate(new_keys) if new_counts[k] == 1}
+
+    def resolve(candidates: Iterable[Hashable | None]) -> set[int]:
+        return {position[k] for k in candidates if k is not None and k in position}
+
+    resolved = resolve(marked_keys)
+    dropped = len(resolved) < len(marked_keys)
+    new_base = frozenset(resolve(base_keys))
+    new_anchor = next(iter(resolve([anchor_key])), None)
+    new_cursor = next(iter(resolve([cursor_key])), None)
+    return resolved, new_base, new_anchor, new_cursor, dropped
+
+
 class TrackTable(DataTable):
     """A DataTable subclass for displaying lists of tracks.
 
@@ -480,8 +701,10 @@ class TrackTable(DataTable):
     @property
     def hidden_marked_count(self) -> int:
         """Marked rows the active filter currently hides."""
-        visible = set(self._filtered_map)
-        return sum(1 for i in self._marked if i not in visible)
+        # The count — the ``_hidden_marked_count`` engine (native when
+        # the Rust extension is built, the pure-Python transcription
+        # otherwise).
+        return _hidden_marked_count(self._marked, self._filtered_map)
 
     @property
     def selection_generation(self) -> int:
@@ -505,19 +728,11 @@ class TrackTable(DataTable):
 
         Under a sort the whole backing list is ordered by that sort, so a
         marked track the filter hides lands where it would show without
-        the filter; otherwise the load order applies.
+        the filter; otherwise the load order applies — the
+        ``_marked_tracks`` engine (native when the Rust extension is
+        built, the pure-Python transcription otherwise).
         """
-        if not self._marked:
-            return []
-        positions = _filter_sort_positions(
-            self._all_tracks, "", self._sort_column, self._sort_reverse
-        )
-        marked: list[dict] = []
-        for i in positions:
-            track = self._all_tracks[i]
-            if track["_original_index"] in self._marked:
-                marked.append(track)
-        return marked
+        return _marked_tracks(self._all_tracks, self._marked, self._sort_column, self._sort_reverse)
 
     # -- Setup ------------------------------------------------------------
 
@@ -625,29 +840,22 @@ class TrackTable(DataTable):
             self.load_tracks(tracks, keys=keys)
             return
 
-        old_counts = Counter(old_keys)
-
-        def key_at(index: int) -> Hashable | None:
-            key = old_keys[index]
-            return key if old_counts[key] == 1 else None
-
-        marked_keys = [key_at(i) for i in self._marked]
-        base_keys = [key_at(i) for i in self._range_base]
-        anchor_key = key_at(self._anchor) if self._anchor is not None else None
         cursor_index = self.selected_original_index
-        cursor_key = key_at(cursor_index) if cursor_index is not None else None
         range_mode = self._range_mode
         sort_column, sort_reverse = self._sort_column, self._sort_reverse
         filter_text, filter_active = self._filter_text, self._filter_active
         generation = self._selection_generation
 
+        # The occurrence-key carry — the ``_carry_selection_keys``
+        # engine (native when the Rust extension is built, the
+        # pure-Python transcription otherwise): the marks, the range
+        # baseline, the anchor and the cursor resolved onto the new
+        # list, read before the reload replaces the selection state.
+        resolved, base, new_anchor, new_cursor, dropped = _carry_selection_keys(
+            old_keys, keys, self._marked, self._range_base, self._anchor, cursor_index
+        )
+
         self.load_tracks(tracks, keys=keys)
-
-        new_counts = Counter(keys)
-        position = {k: i for i, k in enumerate(keys) if new_counts[k] == 1}
-
-        def resolve(candidates: Iterable[Hashable | None]) -> set[int]:
-            return {position[k] for k in candidates if k is not None and k in position}
 
         # The view first, so the rows exist in their final order before
         # marks are painted and the cursor is placed.
@@ -656,17 +864,14 @@ class TrackTable(DataTable):
         if filter_text or sort_column is not None:
             self._rebuild_view()
 
-        resolved = resolve(marked_keys)
-        dropped = len(resolved) < len(marked_keys)
-        self._range_base = frozenset(resolve(base_keys))
-        self._anchor = next(iter(resolve([anchor_key])), None)
-        self._range_mode = range_mode and self._anchor is not None
+        self._range_base = base
+        self._anchor = new_anchor
+        self._range_mode = range_mode and new_anchor is not None
         self._set_marks(resolved, bump=False)
 
-        target = resolve([cursor_key])
-        if target:
+        if new_cursor is not None:
             try:
-                self.move_cursor(row=self._filtered_map.index(next(iter(target))))
+                self.move_cursor(row=self._filtered_map.index(new_cursor))
             except ValueError:
                 pass
         if self._range_mode:
@@ -990,56 +1195,59 @@ class TrackTable(DataTable):
 
     def _toggle_mark(self, original: int) -> None:
         self._anchor = original
-        self._set_marks(self._marked ^ {original})
+        # The symmetric difference — the ``_toggle_marks`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise).
+        self._set_marks(_toggle_marks(self._marked, original))
 
     def _extend_to(self, original: int) -> None:
         """Shift-click: mark the displayed run from the anchor to *original*.
 
         Existing marks outside the run stay. With no anchor, or an anchor
         the filter hides, the row is marked and becomes the anchor — a run
-        never reaches a row that isn't shown.
+        never reaches a row that isn't shown. The ``(anchor, marks)``
+        decision — the ``_extend_marks`` engine (native when the Rust
+        extension is built, the pure-Python transcription otherwise).
         """
-        if self._anchor is None or self._anchor not in self._filtered_map:
-            self._anchor = original
-            self._set_marks(self._marked | {original})
-            return
-        self._set_marks(self._marked | self._run(self._anchor, original))
-
-    def _run(self, start: int, end: int) -> set[int]:
-        """Original indices of the visible rows from *start* to *end*, inclusive.
-
-        A *start* the filter hides counts as no start: the run is *end*
-        alone, so an invisible row is never marked through a run.
-        """
-        try:
-            lo, hi = sorted((self._filtered_map.index(start), self._filtered_map.index(end)))
-        except ValueError:
-            return {end}
-        return set(self._filtered_map[lo : hi + 1])
+        self._anchor, marks = _extend_marks(
+            self._anchor, self._filtered_map, self._marked, original
+        )
+        self._set_marks(marks)
 
     def _apply_range(self, *, bump: bool = True) -> None:
-        """Range mode: marks are the baseline plus the anchor-to-cursor run."""
+        """Range mode: marks are the baseline plus the anchor-to-cursor run.
+
+        The decision — the ``_range_marks`` engine (native when the Rust
+        extension is built, the pure-Python transcription otherwise);
+        ``None`` for a range without an anchor leaves the marks alone.
+        """
         if self._anchor is None:
             return
-        cursor = self.selected_original_index
-        run = set() if cursor is None else self._run(self._anchor, cursor)
-        self._set_marks(set(self._range_base) | run, bump=bump)
+        marks = _range_marks(
+            self._anchor, self.selected_original_index, self._filtered_map, self._range_base
+        )
+        if marks is not None:
+            self._set_marks(marks, bump=bump)
 
     def _shift_selection_after_removal(self, removed: int) -> None:
-        """Keep marks on their rows when the occurrence *removed* leaves the list."""
+        """Keep marks on their rows when the occurrence *removed* leaves the list.
 
-        def shift(original: int) -> int:
-            return original - 1 if original > removed else original
-
-        if removed in self._marked:
+        The shift — the ``_shift_selection`` engine (native when the
+        Rust extension is built, the pure-Python transcription
+        otherwise): the marks and the range baseline slide down past
+        the removed occurrence, the anchor dies with its occurrence,
+        and the *bump* flag advances the selection generation exactly
+        when the removed occurrence was marked.
+        """
+        marked, base, anchor, range_mode, bump = _shift_selection(
+            removed, self._marked, self._range_base, self._anchor, self._range_mode
+        )
+        if bump:
             self._selection_generation += 1
-        self._marked = {shift(i) for i in self._marked if i != removed}
-        self._range_base = frozenset(shift(i) for i in self._range_base if i != removed)
-        if self._anchor is not None:
-            self._anchor = None if self._anchor == removed else shift(self._anchor)
-        if self._anchor is None and self._range_mode:
-            self._range_mode = False
-            self._range_base = frozenset()
+        self._marked = marked
+        self._range_base = base
+        self._anchor = anchor
+        self._range_mode = range_mode
 
     def _update_mark_status(self) -> None:
         """Show the count on the table's own bottom line while anything is marked.
@@ -1515,10 +1723,25 @@ try:
         filter_sort_tracks as _native_filter_sort_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_carry_selection_keys as _native_carry_selection_keys,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_column_keys as _native_column_keys,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_extend_marks as _native_extend_marks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_hidden_marked_count as _native_hidden_marked_count,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_mark_status as _native_mark_status,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_marked_tracks as _native_marked_tracks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_range_marks as _native_range_marks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_reindex_after_removal as _native_reindex_after_removal,
@@ -1530,13 +1753,22 @@ try:
         track_table_selection_label as _native_selection_label,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_shift_selection as _native_shift_selection,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_sort_state as _native_sort_state,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_stamp_tracks as _native_stamp_tracks,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_toggle_marks as _native_toggle_marks,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         track_table_view_rows as _native_view_rows,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        track_table_visible_run as _native_visible_run,
     )
 except ImportError:
     pass
@@ -1637,5 +1869,105 @@ else:
     ) -> tuple[str, bool] | None:
         """The header-click sort toggle (native Rust engine)."""
         return _native_sort_state(column, sort_column, sort_reverse)
+
+    def _visible_run(  # noqa: F811
+        filtered_map: Sequence[int], start: int, end: int
+    ) -> set[int]:
+        """The visible-run core (native Rust engine).
+
+        Same contract as the pure-Python reference above: the original
+        indices of the visible rows from *start* to *end*, inclusive —
+        a *start* the filter hides counting as no start, the run *end*
+        alone.
+        """
+        return _native_visible_run(filtered_map, start, end)
+
+    def _extend_marks(  # noqa: F811
+        anchor: int | None,
+        filtered_map: Sequence[int],
+        marked: AbstractSet[int],
+        original: int,
+    ) -> tuple[int | None, set[int]]:
+        """The shift-click extend decision (native Rust engine).
+
+        Same contract as the pure-Python reference above: the new
+        ``(anchor, marked)`` pair, with no anchor (or an anchor the
+        filter hides) marking the row and taking the anchor.
+        """
+        return _native_extend_marks(anchor, filtered_map, marked, original)
+
+    def _range_marks(  # noqa: F811
+        anchor: int | None,
+        cursor: int | None,
+        filtered_map: Sequence[int],
+        range_base: AbstractSet[int],
+    ) -> set[int] | None:
+        """The keyboard-range marks (native Rust engine).
+
+        Same contract as the pure-Python reference above: ``None``
+        without an anchor, otherwise the range baseline unioned with
+        the anchor-to-cursor run.
+        """
+        return _native_range_marks(anchor, cursor, filtered_map, range_base)
+
+    def _toggle_marks(  # noqa: F811
+        marked: AbstractSet[int], original: int
+    ) -> set[int]:
+        """The toggle's marked set (native Rust engine)."""
+        return _native_toggle_marks(marked, original)
+
+    def _shift_selection(  # noqa: F811
+        removed: int,
+        marked: AbstractSet[int],
+        range_base: AbstractSet[int],
+        anchor: int | None,
+        range_mode: bool,
+    ) -> tuple[set[int], frozenset[int], int | None, bool, bool]:
+        """The post-removal selection shift (native Rust engine).
+
+        Same contract as the pure-Python reference above: the
+        ``(marks, base, anchor, range_mode, bump)`` quintuple.
+        """
+        return _native_shift_selection(removed, marked, range_base, anchor, range_mode)
+
+    def _marked_tracks(  # noqa: F811
+        all_tracks: list[dict],
+        marked: AbstractSet[int],
+        sort_column: str | None,
+        sort_reverse: bool,
+    ) -> list[dict]:
+        """The marked tracks in displayed order (native Rust engine).
+
+        Same contract as the pure-Python reference above; a non-dict
+        track raises where the reference's ``track["_original_index"]``
+        would raise — ``load_tracks`` never produces them.
+        """
+        return _native_marked_tracks(all_tracks, marked, sort_column, sort_reverse)
+
+    def _hidden_marked_count(  # noqa: F811
+        marked: AbstractSet[int], filtered_map: Sequence[int]
+    ) -> int:
+        """The hidden-marks count (native Rust engine)."""
+        return _native_hidden_marked_count(marked, filtered_map)
+
+    def _carry_selection_keys(  # noqa: F811
+        old_keys: Sequence[Hashable],
+        new_keys: Sequence[Hashable],
+        marked: Iterable[int],
+        range_base: Iterable[int],
+        anchor: int | None,
+        cursor: int | None,
+    ) -> tuple[set[int], frozenset[int], int | None, int | None, bool]:
+        """Resolve the selection's occurrence keys across a reload
+        (native Rust engine).
+
+        Same contract as the pure-Python reference above: the
+        ``(marked, range_base, anchor, cursor, dropped)`` quintuple,
+        with duplicated or missing keys resolving nothing. The
+        ``old_keys``/``new_keys`` lists and the mark sets pass through
+        as the objects they are, so CPython's own hash/eq semantics
+        decide key identity.
+        """
+        return _native_carry_selection_keys(old_keys, new_keys, marked, range_base, anchor, cursor)
 
     _column_keys = _native_column_keys  # type: ignore[assignment]
