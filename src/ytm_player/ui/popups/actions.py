@@ -1,10 +1,12 @@
 """Context action menu popup for tracks, albums, artists, and playlists.
 
-The menu builder — ``_build_actions`` — is dual-implemented: the Rust
-extension (``_ytm_player_native.build_actions``) implements it when it
-is built, and the pure-Python transcription below runs otherwise; the
-bottom-of-module seam rebinds the builder to the native function when
-the extension is importable. The per-type catalogs
+The menu builder — ``_build_actions`` — and the title derivation
+behind the popup's header — ``_derive_title`` — are dual-implemented:
+the Rust extension (``_ytm_player_native.build_actions`` /
+``_ytm_player_native.actions_popup_title``) implements them when it
+is built, and the pure-Python transcriptions below run otherwise; the
+bottom-of-module seam rebinds the builders to the native functions
+when the extension is importable. The per-type catalogs
 (``TRACK_ACTIONS`` & co.) stay the module's public data — the app's
 artist-actions flow extends ``ARTIST_ACTIONS`` with its ``_back`` entry
 — and the Rust side carries the same tables, pinned together by the
@@ -143,6 +145,24 @@ def _build_actions(
     return result
 
 
+def _derive_title(item: dict[str, Any], item_type: str) -> str:
+    """Derive the popup's header title from the item — the ``title`` engine.
+
+    The pure core of ``ActionsPopup._title_text``: the first truthy of
+    the item's ``title`` / ``name`` / ``artist`` fields, the
+    capitalized item type when none of them is truthy, truncated to
+    34 characters (the first 31 plus ``...``) when longer.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.actions_popup_title``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    name = item.get("title") or item.get("name") or item.get("artist") or item_type.capitalize()
+    if len(name) > 34:
+        name = name[:31] + "..."
+    return name
+
+
 class _ActionItem(ListItem):
     """A single action entry in the list."""
 
@@ -220,15 +240,7 @@ class ActionsPopup(BasePopup[str | None]):
     @property
     def _title_text(self) -> str:
         """Derive a short title from the item for display."""
-        name = (
-            self.item.get("title")
-            or self.item.get("name")
-            or self.item.get("artist")
-            or self.item_type.capitalize()
-        )
-        if len(name) > 34:
-            name = name[:31] + "..."
-        return name
+        return _derive_title(self.item, self.item_type)
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -276,15 +288,18 @@ class ActionsPopup(BasePopup[str | None]):
 
 
 # ── Native (Rust/PyO3) override, if available ──────────────────────────
-# The Rust extension implements the same menu builder; this binding
-# overrides the pure-Python reference above when the extension is
-# importable.  The rebinding must happen AFTER the definition above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statement (the lesson that produced formatting.py's dead
-# native bindings).
+# The Rust extension implements the same menu builder and title
+# derivation; these bindings override the pure-Python references above
+# when the extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        actions_popup_title as _native_actions_popup_title,
+    )
+    from ytm_player.utils._ytm_player_native import (
         build_actions as _native_build_actions,
     )
 except ImportError:
@@ -303,3 +318,7 @@ else:
         return _native_build_actions(
             item, item_type, in_queue=in_queue, in_playlist=in_playlist, source=source
         )
+
+    def _derive_title(item: dict[str, Any], item_type: str) -> str:  # noqa: F811
+        """The popup's header title (native Rust engine)."""
+        return _native_actions_popup_title(item, item_type)

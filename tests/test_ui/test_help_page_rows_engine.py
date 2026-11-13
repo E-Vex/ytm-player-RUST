@@ -148,6 +148,15 @@ class TestTitleCasing:
         ("ΑΣΣ", "Ασς"),
         ("aΣ·b", "Aσ·B"),  # middle dot is case-ignorable — b is still ahead
         ("aΣ\u0301b", "Aσ́B"),  # so is a combining mark
+        # A character that is BOTH cased and case-ignorable (ʰ is Lm
+        # with Other_Lowercase): the sigma's lowercase path sees it as
+        # the preceding cased character, but the Final_Sigma scan steps
+        # over it — an uncased character beyond (1, ·) un-finals the
+        # sigma, a cased one (a) keeps it final.
+        ("1ʰΣ", "1ʰσ"),
+        ("·ʰΣ", "·ʰσ"),
+        ("aʰΣ", "Aʰς"),
+        ("1ʰΣb", "1ʰσb"),
         # Ypogegrammeni titles: the single-char capitals.
         ("ᾳ", "ᾼ"),
         ("ᾀ", "ᾈ"),

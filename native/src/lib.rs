@@ -582,6 +582,28 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // swap, the playlist-view and search-source gates, and the
     // like/subscribe label flips.
     module.add_function(pyo3::wrap_pyfunction!(build_actions, module)?)?;
+    // The actions popup's title derivation (the same module's
+    // _title_text): the title/name/artist or-chain with the capitalized
+    // item type behind it, and the 34-character truncation — through
+    // CPython's own len/slice/add protocol so exotic names answer
+    // exactly like the reference.
+    module.add_function(pyo3::wrap_pyfunction!(actions_popup_title, module)?)?;
+    // The confirm / input / create-playlist popup cores (the same
+    // package's remaining pure computations): the confirm popup's
+    // button-id verdict, the input popup's submitted-value
+    // normalization, the create-playlist popup's chrome-label pair and
+    // its submit normalization (strip + str() with the empty-name
+    // gate).
+    module.add_function(pyo3::wrap_pyfunction!(confirm_popup_button_result, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(input_popup_submitted_value, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        create_playlist_chrome_labels,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        create_playlist_submit_values,
+        module
+    )?)?;
 
     // Progress-bar render geometry (ui/widgets/progress_bar.py
     // equivalents): the progress fraction, the time-prefix/suffix/
@@ -1475,7 +1497,12 @@ fn normalise_region(value: &str) -> String {
 
 /// Build the metadata subtitle line for a playlist header.
 /// Format: `Owner · Privacy · Year · N tracks`
-/// *year* is a PyAny that may be None, int, or str.
+/// *year* is a PyAny that may be None, int, or str. The privacy runs
+/// through `py_capitalize` — a faithful `str.capitalize()`, the same
+/// call the pure-Python fallback makes (the ported `capitalize_first`
+/// helper this used to call uppercased the first character instead of
+/// titlecasing it, diverging from the fallback on `ß`-shaped inputs
+/// the ASCII-only production values never hit).
 #[pyfunction]
 fn build_playlist_subtitle(
     owner: &str,
@@ -1485,7 +1512,7 @@ fn build_playlist_subtitle(
 ) -> PyResult<String> {
     let mut parts: Vec<String> = vec![owner.to_string()];
     if !privacy.is_empty() {
-        parts.push(capitalize_first(privacy));
+        parts.push(py_capitalize(privacy));
     }
     if !year.is_none() {
         let y_str = year.to_string();
@@ -1496,20 +1523,6 @@ fn build_playlist_subtitle(
     let track_label = if track_count == 1 { "track" } else { "tracks" };
     parts.push(format!("{track_count} {track_label}"));
     Ok(parts.join(" \u{b7} "))
-}
-
-fn capitalize_first(s: &str) -> String {
-    // Mirror Python's str.capitalize(): first char uppercased, the rest
-    // lowercased ("PUBLIC" -> "Public", not "PUBLIC").
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => {
-            let mut out: String = f.to_uppercase().collect();
-            out.extend(c.flat_map(char::to_lowercase));
-            out
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12455,6 +12468,146 @@ fn build_actions<'py>(
     Ok(out)
 }
 
+/// The title derivation behind `ActionsPopup`'s header — the pure core
+/// of `_title_text` from `ui/popups/actions.py`: the first truthy of
+/// `item.get("title")` / `name` / `artist` (each read exactly like the
+/// reference's `.get` calls — see `field_get`; a `.get`-less item reads
+/// as field-less where the reference would raise, the `build_actions`
+/// totality precedent), the capitalized *item_type* when none of the
+/// three is truthy (`py_capitalize`, a faithful `str.capitalize()`),
+/// and the 34-character truncation — a name longer than 34 characters
+/// (CPython's own `len()`) becomes its first 31 characters plus
+/// `"..."`.
+///
+/// The truncation runs through CPython's own protocol so every shape
+/// the reference survives, the engine survives identically: an exact
+/// `str` takes the code-point fast path (returning the very same
+/// object when it fits, a fresh string when it truncates), while a
+/// `str` subclass, a non-UTF-8 `str` (lone surrogates) or any other
+/// object flows through `len()`, `[:31]` (the `slice(None, 31, None)`
+/// the reference's subscription compiles to) and `+ "..."` — the
+/// number protocol, the subscript protocol and the binary-add protocol
+/// exactly, so a sized exotic answers whatever its own protocol
+/// answers (a 40-item list: `len` 40, a 31-item slice, then the list
+/// + str `TypeError` — the reference's own), and an unsized one
+/// raises `len()`'s own `TypeError` on both sides.
+#[pyfunction]
+fn actions_popup_title<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    item_type: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    // name = item.get("title") or item.get("name") or item.get("artist")
+    //        or item_type.capitalize()
+    let name = match first_truthy_get(py, item, &["title", "name", "artist"])? {
+        Some(name) => name,
+        None => PyString::new(py, &py_capitalize(item_type)).into_any(),
+    };
+    // if len(name) > 34: name = name[:31] + "..."
+    if name.is_exact_instance_of::<PyString>() {
+        let s = name.downcast::<PyString>().unwrap();
+        if let Ok(contents) = s.to_str() {
+            if contents.chars().count() > 34 {
+                let mut truncated: String = contents.chars().take(31).collect();
+                truncated.push_str("...");
+                return Ok(PyString::new(py, &truncated).into_any());
+            }
+            // A name that fits is handed back unchanged — the very
+            // same object the reference returns.
+            return Ok(name.clone());
+        }
+        // A str PyO3 cannot borrow as UTF-8 (lone surrogates) falls
+        // through to the protocol path, which handles any str content.
+    }
+    let length = name.len()?;
+    if length > 34 {
+        // slice(None, 31, None) — the descriptor `name[:31]` compiles
+        // to; built through the builtins `slice` type so an overridden
+        // `__getitem__` sees exactly the object the reference passes.
+        let slice = py
+            .import("builtins")?
+            .getattr("slice")?
+            .call1((py.None(), 31i64))?;
+        let head = name.get_item(&slice)?;
+        return head.add("...");
+    }
+    Ok(name.clone())
+}
+
+// ---------------------------------------------------------------------------
+// The confirm / input / create-playlist popup cores
+// ---------------------------------------------------------------------------
+
+/// The dismissal verdict behind `ConfirmPopup`'s button press — the
+/// pure core of `on_button_pressed` from `ui/popups/confirm_popup.py`:
+/// `True` only for the confirm button's id, `False` for the cancel
+/// button's, any other id, or a widget with no id at all (`Button.id`
+/// is `str | None`; `None == "confirm-yes"` is `False`, CPython's own
+/// `==` on the None literal). The popup's `y`/`n` key bindings and the
+/// `BasePopup` cancel shell stay Python-side.
+#[pyfunction]
+#[pyo3(signature = (button_id))]
+fn confirm_popup_button_result(button_id: Option<&str>) -> bool {
+    button_id == Some("confirm-yes")
+}
+
+/// The submission normalization behind `InputPopup`'s submit — the pure
+/// core of `on_input_submitted` from `ui/popups/input_popup.py`: the
+/// value stripped (CPython's own `str.strip()` set — see
+/// `py_str_strip`, wider than Rust's `str::trim`), `Some` when what
+/// remains is non-empty, `None` when the submission was empty or all
+/// whitespace. The popup dismisses with the answer; the Input widget,
+/// the focus and the event plumbing stay Python-side.
+#[pyfunction]
+fn input_popup_submitted_value(value: &str) -> Option<String> {
+    let stripped = py_str_strip(value);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+/// The chrome labels behind `CreatePlaylistPopup`'s compose — the pure
+/// core of the title / submit-button pair from
+/// `ui/popups/create_playlist_popup.py`: `("Edit Playlist", "Edit")`
+/// in edit mode, `("New Playlist", "Create")` otherwise. The Input /
+/// Select / Button mounts stay Python-side in the popup.
+#[pyfunction]
+fn create_playlist_chrome_labels(edit_mode: bool) -> (String, String) {
+    if edit_mode {
+        ("Edit Playlist".to_string(), "Edit".to_string())
+    } else {
+        ("New Playlist".to_string(), "Create".to_string())
+    }
+}
+
+/// The submission normalization behind `CreatePlaylistPopup`'s submit —
+/// the pure core of `_submit` from
+/// `ui/popups/create_playlist_popup.py`: the name and the description
+/// stripped (CPython's own `str.strip()` set), the privacy through
+/// `str()` (the protocol `__str__` call — an exact `str` hands back
+/// the very same object), `None` when the stripped name is empty (the
+/// popup warns and stays open; the notification and the re-focus stay
+/// Python-side), otherwise the `(name, description, privacy)`
+/// dismissal tuple. The name gate runs first, exactly like the
+/// reference — a bad name answers `None` before the privacy's `str()`
+/// is ever consulted.
+#[pyfunction]
+fn create_playlist_submit_values<'py>(
+    name: &str,
+    description: &str,
+    privacy: &Bound<'py, PyAny>,
+) -> PyResult<Option<(String, String, Bound<'py, PyString>)>> {
+    let name = py_str_strip(name);
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let description = py_str_strip(description);
+    let privacy = privacy.str()?;
+    Ok(Some((name.to_string(), description.to_string(), privacy)))
+}
+
 // ---------------------------------------------------------------------------
 // Progress-bar render geometry
 // ---------------------------------------------------------------------------
@@ -13058,6 +13211,40 @@ static TITLE_DIVERGENCES: &[(char, &str)] = &[
     ('\u{FB17}', "\u{0544}\u{056D}"),
 ];
 
+/// The Final_Sigma verdict for the capital sigma at *i* in *chars* —
+/// the condition Unicode's SpecialCasing spells and CPython's
+/// `str.lower()`/`str.capitalize()` apply: the sigma lowers to `ς`
+/// exactly when the run before it is zero or more case-ignorable
+/// characters ending on a cased one, AND the run after it is zero or
+/// more case-ignorable characters with no cased one beyond. A sigma
+/// with no cased character behind it (or only an uncased one, once the
+/// ignorables are stepped over) is never final — `1Σ`.lower() keeps
+/// its `σ` — and one with a cased character ahead keeps it too
+/// (`aΣb` → `aσb`, the mark between skipped: `aΣ◌́b` → `aσ◌́b`).
+/// `str.title()`'s lowercase path reaches this with the preceded side
+/// already guaranteed (its `prev` is the immediately preceding
+/// character's casedness, no skipping — see `py_title`).
+fn sigma_is_final(chars: &[char], i: usize) -> bool {
+    // Preceded by: zero or more case-ignorables, then a cased one.
+    let mut j = i;
+    while j > 0 && case_ignorable(chars[j - 1]) {
+        j -= 1;
+    }
+    if j == 0 || !py_is_cased(chars[j - 1]) {
+        return false;
+    }
+    // Not followed by: zero or more case-ignorables, then a cased one.
+    let mut k = i + 1;
+    while k < chars.len() {
+        if case_ignorable(chars[k]) {
+            k += 1;
+            continue;
+        }
+        return !py_is_cased(chars[k]);
+    }
+    true
+}
+
 /// CPython's `str.title()`: the titlecase mapping of a character that
 /// follows an uncased one, the full lowercase mapping of one that follows
 /// a cased one — "cased" being the property `py_is_cased` tests on the
@@ -13098,20 +13285,10 @@ fn py_title(s: &str) -> String {
                 // Final sigma: preceded by a cased character (the
                 // lowercase path guarantees it), ς unless a cased
                 // character follows once the ignorable set is skipped.
-                let mut j = i + 1;
-                let mut followed_by_cased = false;
-                while j < chars.len() {
-                    if case_ignorable(chars[j]) {
-                        j += 1;
-                        continue;
-                    }
-                    followed_by_cased = py_is_cased(chars[j]);
-                    break;
-                }
-                out.push(if followed_by_cased {
-                    '\u{03C3}'
-                } else {
+                out.push(if sigma_is_final(&chars, i) {
                     '\u{03C2}'
+                } else {
+                    '\u{03C3}'
                 });
             } else {
                 // The full lowercase mapping (İ → i + U+0307 included).
@@ -13129,6 +13306,42 @@ fn py_title(s: &str) -> String {
         // Casedness of the ORIGINAL character decides the next step —
         // not of anything the mapping emitted.
         prev_cased = py_is_cased(ch);
+    }
+    out
+}
+
+/// CPython's `str.capitalize()`: the TITLECASE mapping of the first
+/// character (not its uppercase — `ß` capitalizes to `Ss`, exactly its
+/// title, not the `SS` its uppercase gives; `ǳ` to `ǲ`; `ﬀ` to `Ff`;
+/// everywhere else title equals uppercase, which `char::to_uppercase`
+/// supplies — see `TITLE_DIVERGENCES`), the full lowercase mapping of
+/// every character after it, with the tail's capital sigmas read
+/// through the Final_Sigma condition exactly as `str.lower()` reads
+/// them (`sigma_is_final`, scanning past the first character: `ΑΣΣ`
+/// capitalizes to `Ασς`, `ABCΣ` to `Abcς`, while `1Σ` keeps its `σ`).
+/// The production inputs are ASCII (`item_type`'s `track`/`album`/
+/// `artist`/`playlist`, the subtitle's `PRIVATE`/`PUBLIC`/`UNLISTED`),
+/// where the mapping is the trivial one; the case machinery exists for
+/// the parity zoo, and tracks the Rust toolchain's Unicode tables
+/// exactly like `py_title` does (the help-page caveat).
+fn py_capitalize(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &ch) in chars.iter().enumerate() {
+        if i == 0 {
+            // The titlecase mapping: the divergence table first, the
+            // uppercase mapping (identical to title everywhere else)
+            // otherwise.
+            match TITLE_DIVERGENCES.binary_search_by(|probe| probe.0.cmp(&ch)) {
+                Ok(idx) => out.push_str(TITLE_DIVERGENCES[idx].1),
+                Err(_) => out.extend(ch.to_uppercase()),
+            }
+        } else if ch == '\u{03A3}' && sigma_is_final(&chars, i) {
+            out.push('\u{03C2}');
+        } else {
+            // The full lowercase mapping (İ → i + U+0307 included).
+            out.extend(ch.to_lowercase());
+        }
     }
     out
 }
