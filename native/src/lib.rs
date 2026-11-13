@@ -605,6 +605,21 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         module
     )?)?;
 
+    // The header-bar / selection-info-bar / track-filter cores (the
+    // three remaining ui/ modules' pure computations): the header bar's
+    // click routing and lyrics-toggle class choice, the selection bar's
+    // truncation width (a zero widget width reads the 80-column
+    // default, the padding-reserved floor is 10), and the track
+    // filter's input-ownership gate and escape-clear verdict.
+    module.add_function(pyo3::wrap_pyfunction!(header_bar_click_route, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(header_bar_lyrics_class, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        selection_info_visible_width,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_filter_owns_input, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(track_filter_escape_clears, module)?)?;
+
     // Progress-bar render geometry (ui/widgets/progress_bar.py
     // equivalents): the progress fraction, the time-prefix/suffix/
     // bar-width metrics, the filled/empty/marker cell computation behind
@@ -12606,6 +12621,100 @@ fn create_playlist_submit_values<'py>(
     let description = py_str_strip(description);
     let privacy = privacy.str()?;
     Ok(Some((name.to_string(), description.to_string(), privacy)))
+}
+
+// ---------------------------------------------------------------------------
+// The header-bar / selection-info-bar / track-filter cores
+// ---------------------------------------------------------------------------
+
+/// The click routing behind `HeaderBar`'s pointer routing — the pure
+/// core of `on_click` from `ui/header_bar.py`: the clicked widget's id
+/// maps onto one of the four toggle routes — `"toggle-playlist"` →
+/// `"playlist"`, `"toggle-lyrics"` → `"lyrics"`, `"back-btn"` →
+/// `"back"`, `"forward-btn"` → `"forward"` — and any other id, or a
+/// widget with no id at all (`Widget.id` is `str | None`; `None ==
+/// "toggle-playlist"` is `False`, CPython's own `==` on the None
+/// literal — the confirm-popup verdict precedent), routes `"none"`.
+/// The message construction, the event stopping and the widget-object
+/// None gate stay Python-side in the bar.
+#[pyfunction]
+#[pyo3(signature = (target_id))]
+fn header_bar_click_route(target_id: Option<&str>) -> &'static str {
+    match target_id {
+        Some("toggle-playlist") => "playlist",
+        Some("toggle-lyrics") => "lyrics",
+        Some("back-btn") => "back",
+        Some("forward-btn") => "forward",
+        _ => "none",
+    }
+}
+
+/// The class choice behind `HeaderBar`'s lyrics-toggle render — the
+/// pure core of `_apply_lyrics_classes` from `ui/header_bar.py`:
+/// `"dimmed"` when the lyrics pane is dimmed (open without a synced
+/// payload), `"active"` when it is open and lit, `None` when it is
+/// closed — the caller removes both classes first and then adds the
+/// answer, exactly the reference's remove-then-add. The DOM reads and
+/// writes stay Python-side in the bar.
+#[pyfunction]
+#[pyo3(signature = (is_dimmed, is_on))]
+fn header_bar_lyrics_class(is_dimmed: bool, is_on: bool) -> Option<&'static str> {
+    if is_dimmed {
+        Some("dimmed")
+    } else if is_on {
+        Some("active")
+    } else {
+        None
+    }
+}
+
+/// The render width behind `SelectionInfoBar`'s text truncation — the
+/// pure core of `watch_text` from `ui/selection_info_bar.py`: a zero
+/// widget width (the bar not yet laid out) reads the 80-column
+/// default; any other width reserves the bar's 1-column padding on
+/// each side but never fewer than 10 columns (`max(width - 2, 10)`,
+/// CPython's own two-argument `max` — a negative width, truthy like
+/// every nonzero int, keeps the 10 floor). The truncation itself is
+/// the already-ported formatting engine; the Static update and the
+/// untruncated fallback path stay Python-side in the bar.
+#[pyfunction]
+fn selection_info_visible_width(width: i64) -> i64 {
+    // `max(width - 2, 10) if width else 80` — the truthiness gate is
+    // `width != 0` for the int the widget width is.
+    if width != 0 {
+        if width - 2 > 10 {
+            width - 2
+        } else {
+            10
+        }
+    } else {
+        80
+    }
+}
+
+/// The input-ownership gate behind the filter wiring — the pure core
+/// of `on_input_changed` / `on_input_submitted` from
+/// `ui/track_filter.py`: only the shared `#track-filter` Input's
+/// events are the filter's (`Input.id` is `str | None`; a widget with
+/// no id, or any other id, is not ours — the confirm-popup verdict
+/// precedent). The Input reads and writes, the table calls and the
+/// focus moves stay Python-side in the host page.
+#[pyfunction]
+#[pyo3(signature = (input_id))]
+fn track_filter_owns_input(input_id: Option<&str>) -> bool {
+    input_id == Some("track-filter")
+}
+
+/// The escape verdict behind the filter's key handler — the pure core
+/// of `on_key` from `ui/track_filter.py`: Escape clears the filter
+/// (and hides the input, refocuses the table) exactly when the key is
+/// `"escape"` and the filter input is still visible; every other key,
+/// or an Escape after Enter hid the input (the keep-filter path),
+/// leaves the page alone. The event stopping, the clear, the class
+/// removal and the refocus stay Python-side in the host page.
+#[pyfunction]
+fn track_filter_escape_clears(key: &str, filter_visible: bool) -> bool {
+    key == "escape" && filter_visible
 }
 
 // ---------------------------------------------------------------------------

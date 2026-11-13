@@ -11,6 +11,52 @@ from textual.widget import Widget
 from textual.widgets import Static
 
 
+def _click_route(target_id: str | None) -> str:
+    """The click-routing verdict — the ``route`` engine.
+
+    The pure core of ``HeaderBar.on_click``: which of the four toggle
+    routes a click on the bar takes — ``"playlist"`` for the playlist
+    toggle, ``"lyrics"`` for the lyrics toggle, ``"back"`` /
+    ``"forward"`` for the navigation buttons — or ``"none"`` for any
+    other id, and for a widget with no id at all. The message
+    construction and the event stopping stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.header_bar_click_route``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if target_id == "toggle-playlist":
+        return "playlist"
+    if target_id == "toggle-lyrics":
+        return "lyrics"
+    if target_id == "back-btn":
+        return "back"
+    if target_id == "forward-btn":
+        return "forward"
+    return "none"
+
+
+def _lyrics_class(is_dimmed: bool, is_on: bool) -> str | None:
+    """The lyrics-toggle class choice — the ``class`` engine.
+
+    The pure core of ``HeaderBar._apply_lyrics_classes``:
+    ``"dimmed"`` when the lyrics pane is dimmed (open without a synced
+    payload), ``"active"`` when it is open and lit, ``None`` when it
+    is closed — the caller removes both classes first and then adds
+    the answer, exactly the reference's remove-then-add.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.header_bar_lyrics_class``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The DOM
+    reads and writes stay with the caller.
+    """
+    if is_dimmed:
+        return "dimmed"
+    if is_on:
+        return "active"
+    return None
+
+
 class HeaderBar(Widget):
     """Top bar with toggle buttons for playlist and lyrics sidebars."""
 
@@ -87,16 +133,21 @@ class HeaderBar(Widget):
         target = event.widget
         if target is None:
             return
-        if target.id == "toggle-playlist":
+        # The routing itself is resolved by the ``_click_route`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise); the message construction and the
+        # event stopping stay here.
+        route = _click_route(target.id)
+        if route == "playlist":
             event.stop()
             self.post_message(self.TogglePlaylistSidebar())
-        elif target.id == "toggle-lyrics":
+        elif route == "lyrics":
             event.stop()
             self.post_message(self.ToggleLyricsSidebar())
-        elif target.id == "back-btn":
+        elif route == "back":
             event.stop()
             self.post_message(self.BackRequested())
-        elif target.id == "forward-btn":
+        elif route == "forward":
             event.stop()
             self.post_message(self.ForwardRequested())
 
@@ -122,13 +173,15 @@ class HeaderBar(Widget):
         self._apply_lyrics_classes()
 
     def _apply_lyrics_classes(self) -> None:
+        # The class choice is resolved by the ``_lyrics_class`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise); the DOM reads and writes stay here.
         try:
             btn = self.query_one("#toggle-lyrics", Static)
             btn.remove_class("active", "dimmed")
-            if self.is_lyrics_dimmed:
-                btn.add_class("dimmed")
-            elif self.is_lyrics_on:
-                btn.add_class("active")
+            cls = _lyrics_class(self.is_lyrics_dimmed, self.is_lyrics_on)
+            if cls is not None:
+                btn.add_class(cls)
         except Exception:
             pass
 
@@ -153,3 +206,31 @@ class HeaderBar(Widget):
                 btn.remove_class("visible")
         except Exception:
             pass
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same header-bar engines; these
+# bindings override the pure-Python transcriptions above when the
+# extension is importable. The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        header_bar_click_route as _native_header_bar_click_route,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        header_bar_lyrics_class as _native_header_bar_lyrics_class,
+    )
+except ImportError:
+    pass
+else:
+
+    def _click_route(target_id: str | None) -> str:  # noqa: F811
+        """The click-routing verdict (native Rust engine)."""
+        return _native_header_bar_click_route(target_id)
+
+    def _lyrics_class(is_dimmed: bool, is_on: bool) -> str | None:  # noqa: F811
+        """The lyrics-toggle class choice (native Rust engine)."""
+        return _native_header_bar_lyrics_class(is_dimmed, is_on)
