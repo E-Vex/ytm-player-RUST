@@ -58,6 +58,63 @@ if _MEDIA_PLAYER_AVAILABLE:
     _PLAYBACK_STATE_PAUSED = getattr(_MP, "MPNowPlayingPlaybackStatePaused", None)
     _PLAYBACK_STATE_STOPPED = getattr(_MP, "MPNowPlayingPlaybackStateStopped", None)
 
+# The engine's state names resolved onto the framework constants — the
+# entries are None without the MediaPlayer bindings, leaving the
+# ``setPlaybackState_`` write skipped exactly as the reference's None
+# returns did.
+_PLAYBACK_STATES: dict[str, Any] = {
+    "playing": _PLAYBACK_STATE_PLAYING,
+    "paused": _PLAYBACK_STATE_PAUSED,
+    "stopped": _PLAYBACK_STATE_STOPPED,
+}
+
+
+def _state_choice(status: str | None, is_playing: bool) -> str:
+    """The Now-Playing state choice — the ``state`` engine.
+
+    The pure core of ``MacOSMediaService._playback_state``: the exact
+    status match — ``"playing"`` / ``"paused"`` / ``"stopped"`` — and
+    the no-status publish resolving through the service's own playing
+    flag (``PLAYING if is_playing else PAUSED``). The match is exact,
+    not case-insensitive: a ``"Playing"`` that skipped the caller's
+    ``lower()`` falls to the playing-flag branch exactly as the
+    reference's ``==`` does.
+
+    The answer is the state name, not the framework constant — the
+    caller maps it through the module's constant table. Implemented
+    by the Rust extension
+    (``_ytm_player_native.macos_playback_state``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The
+    ``setNowPlayingInfo_`` call and its broad except stay with the
+    caller.
+    """
+    if status == "playing":
+        return "playing"
+    if status == "paused":
+        return "paused"
+    if status == "stopped":
+        return "stopped"
+    return "playing" if is_playing else "paused"
+
+
+def _now_playing_seconds(microseconds: int) -> float:
+    """The µs→seconds conversion — the ``seconds`` engine.
+
+    The pure core behind both Now-Playing time writes —
+    ``max(0.0, microseconds / 1_000_000)``, CPython's own int/int true
+    division — from ``update_metadata``'s ``playbackDuration`` and
+    ``update_position``'s ``elapsedPlaybackTime``. The floor at zero
+    turns a negative count into ``0.0`` exactly as the reference's
+    ``max`` does.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.macos_now_playing_seconds``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    The ``MPMediaItemProperty*`` key writes and the publish stay with
+    the caller.
+    """
+    return max(0.0, microseconds / 1_000_000)
+
 
 class MacOSMediaService:
     """Connect app playback state to macOS media controls."""
@@ -137,7 +194,7 @@ class MacOSMediaService:
         if not self._running:
             return
 
-        duration_seconds = max(0.0, length_us / 1_000_000)
+        duration_seconds = _now_playing_seconds(length_us)
         self._now_playing[_TITLE_KEY] = title or ""
         self._now_playing[_ARTIST_KEY] = artist or ""
         self._now_playing[_ALBUM_KEY] = album or ""
@@ -161,7 +218,7 @@ class MacOSMediaService:
         if not self._running:
             return
 
-        self._now_playing[_ELAPSED_KEY] = max(0.0, position_us / 1_000_000)
+        self._now_playing[_ELAPSED_KEY] = _now_playing_seconds(position_us)
         self._publish_now_playing()
 
     def _register_command(self, command: Any, action_name: str) -> None:
@@ -198,10 +255,37 @@ class MacOSMediaService:
             logger.debug("Failed to publish macOS Now Playing info", exc_info=True)
 
     def _playback_state(self, status: str | None) -> Any:
-        if status == "playing":
-            return _PLAYBACK_STATE_PLAYING
-        if status == "paused":
-            return _PLAYBACK_STATE_PAUSED
-        if status == "stopped":
-            return _PLAYBACK_STATE_STOPPED
-        return _PLAYBACK_STATE_PLAYING if self._is_playing else _PLAYBACK_STATE_PAUSED
+        # The state choice is resolved by the ``_state_choice`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise); the framework-constant resolution
+        # through the module's table (whose entries are None without
+        # the MediaPlayer bindings) stays here.
+        return _PLAYBACK_STATES[_state_choice(status, self._is_playing)]
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same Now-Playing engines; these
+# bindings override the pure-Python transcriptions above when the
+# extension is importable. The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        macos_now_playing_seconds as _native_macos_now_playing_seconds,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        macos_playback_state as _native_macos_playback_state,
+    )
+except ImportError:
+    pass
+else:
+
+    def _state_choice(status: str | None, is_playing: bool) -> str:  # noqa: F811
+        """The Now-Playing state choice (native Rust engine)."""
+        return _native_macos_playback_state(status, is_playing)
+
+    def _now_playing_seconds(microseconds: int) -> float:  # noqa: F811
+        """The µs→seconds conversion (native Rust engine)."""
+        return _native_macos_now_playing_seconds(microseconds)

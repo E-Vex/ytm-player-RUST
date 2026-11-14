@@ -49,6 +49,33 @@ _KEY_TO_ACTION = {
 }
 
 
+def _key_action(data1: int) -> str | None:
+    """The media-key classification — the ``action`` engine.
+
+    The pure core of ``_event_action``: the NSEvent ``data1`` word's
+    bit unpack — the key code in the high 16 bits, the flags in the
+    low 16 with the key state in bits 8-15 — the media-key-down state
+    gate, and the key-code → action map (16 play/pause, 17 next, 18
+    previous, 19 fast-forward → next, 20 rewind → previous).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.macos_event_tap_action``) when it is built;
+    this pure-Python transcription is the fallback otherwise. The
+    ``ns_event`` None gate, the ``subtype()`` comparison against the
+    raw framework value (not int()-coerced — the reference compares
+    whatever ``subtype()`` returns), the ``int()`` coercion of
+    ``data1()`` and the broad ``except`` around the attribute
+    extraction stay with the caller.
+    """
+    key_code = (data1 & 0xFFFF0000) >> 16
+    key_flags = data1 & 0x0000FFFF
+    key_state = (key_flags & 0xFF00) >> 8
+    if key_state != _MEDIA_KEY_DOWN_STATE:
+        return None
+
+    return _KEY_TO_ACTION.get(key_code)
+
+
 def _event_action(ns_event: Any) -> str | None:
     """Return callback action for a media key event, else None."""
     if ns_event is None:
@@ -60,13 +87,11 @@ def _event_action(ns_event: Any) -> str | None:
     except Exception:
         return None
 
-    key_code = (data1 & 0xFFFF0000) >> 16
-    key_flags = data1 & 0x0000FFFF
-    key_state = (key_flags & 0xFF00) >> 8
-    if key_state != _MEDIA_KEY_DOWN_STATE:
-        return None
-
-    return _KEY_TO_ACTION.get(key_code)
+    # The classification itself is resolved by the ``_key_action``
+    # engine (native when the Rust extension is built, the
+    # pure-Python transcription otherwise); the None gate, the
+    # subtype comparison, the int() coercion and the except stay here.
+    return _key_action(data1)
 
 
 class MacOSEventTapService:
@@ -178,3 +203,24 @@ class MacOSEventTapService:
 
         # Swallow event so Apple Music does not steal media-key presses.
         return None
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same media-key classification engine;
+# this binding overrides the pure-Python transcription above when the
+# extension is importable. The rebinding must happen AFTER the definition
+# above — assigning the native function any earlier would be clobbered by
+# the ``def`` statement (the lesson that produced formatting.py's dead
+# native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        macos_event_tap_action as _native_macos_event_tap_action,
+    )
+except ImportError:
+    pass
+else:
+
+    def _key_action(data1: int) -> str | None:  # noqa: F811
+        """The media-key classification (native Rust engine)."""
+        return _native_macos_event_tap_action(data1)

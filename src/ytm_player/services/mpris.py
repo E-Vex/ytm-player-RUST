@@ -63,6 +63,45 @@ def _empty_metadata() -> dict[str, Variant]:
     }
 
 
+def _clamp_volume(volume: float) -> float:
+    """The volume clamp — the ``clamp`` engine.
+
+    The pure core behind every MPRIS volume write: the D-Bus ``Volume``
+    property's ``[0, 1]`` domain — ``max(0.0, min(1.0, volume))`` — from
+    ``_PlayerInterface``'s ``Volume`` setter and ``set_volume`` helper
+    and from ``MPRISService.update_volume``'s push. A NaN carries
+    CPython's own argument-order semantics (``min(1.0, nan)`` answers
+    ``1.0`` — the running first argument survives because the
+    comparison is false) and so reads ``1.0`` exactly on both
+    backends. The D-Bus property machinery, the callback scheduling
+    and the PropertiesChanged emission stay with the callers.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.mpris_clamp_volume``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return max(0.0, min(1.0, volume))
+
+
+def _volume_is_echo(volume: float, current: float) -> bool:
+    """The D-Bus-echo gate — the ``echo`` engine.
+
+    The pure core of ``MPRISService.update_volume``'s skip: a pushed
+    volume whose distance from the value the ``Volume`` setter already
+    stored — ``abs(volume - current) < 1e-6`` — is the echo of a
+    D-Bus-initiated set, and re-emitting it would ping-pong with the
+    client. The comparison is CPython's own strict ``<``, so an
+    exactly-``1e-6`` distance is not an echo. The clamp feeding both
+    operands, the stored-value read and the PropertiesChanged emission
+    stay with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.mpris_volume_is_echo``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return abs(volume - current) < 1e-6
+
+
 try:
     if not _DBUS_AVAILABLE:
         raise ImportError("dbus-fast not available")
@@ -150,7 +189,11 @@ try:
 
         @Volume.setter  # type: ignore[attr-defined]
         def Volume(self, value: "d"):  # type: ignore[override]
-            self._volume = max(0.0, min(1.0, value))
+            # The domain write is resolved by the ``_clamp_volume``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise); the callback
+            # scheduling stays here.
+            self._volume = _clamp_volume(value)
             # Forward the write to the actual player (dbus-fast invokes
             # property setters synchronously on the event loop, so the
             # async callback must be scheduled, not awaited).
@@ -286,7 +329,10 @@ try:
             self._position_us = position_us
 
         def set_volume(self, volume: float) -> None:
-            self._volume = max(0.0, min(1.0, volume))
+            # The domain write is resolved by the ``_clamp_volume``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            self._volume = _clamp_volume(volume)
 
 except (ImportError, ValueError, TypeError):
     # TypeError: a broken dbus-fast build can blow up while the interface
@@ -403,10 +449,15 @@ class MPRISService:
         if not self._running or self._player_iface is None:
             return
 
-        volume = max(0.0, min(1.0, volume))
+        # The clamp and the echo verdict are resolved by the
+        # ``_clamp_volume`` / ``_volume_is_echo`` engines (native when
+        # the Rust extension is built, the pure-Python transcriptions
+        # otherwise); the stored-value read and the PropertiesChanged
+        # emission stay here.
+        volume = _clamp_volume(volume)
         # Skip the echo of a D-Bus-initiated set (setter already stored
         # the value) — re-emitting would ping-pong with the client.
-        if abs(volume - self._player_iface._volume) < 1e-6:
+        if _volume_is_echo(volume, self._player_iface._volume):
             return
         self._player_iface.set_volume(volume)
         self._emit_properties_changed(
@@ -441,3 +492,31 @@ class MPRISService:
             return
 
         self._player_iface.emit_properties_changed(changed)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same volume engines; these
+# bindings override the pure-Python transcriptions above when the
+# extension is importable. The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        mpris_clamp_volume as _native_mpris_clamp_volume,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        mpris_volume_is_echo as _native_mpris_volume_is_echo,
+    )
+except ImportError:
+    pass
+else:
+
+    def _clamp_volume(volume: float) -> float:  # noqa: F811
+        """The volume clamp (native Rust engine)."""
+        return _native_mpris_clamp_volume(volume)
+
+    def _volume_is_echo(volume: float, current: float) -> bool:  # noqa: F811
+        """The D-Bus-echo gate (native Rust engine)."""
+        return _native_mpris_volume_is_echo(volume, current)
