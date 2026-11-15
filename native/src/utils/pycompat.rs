@@ -1,46 +1,11 @@
 //! Cross-module CPython/PyO3 semantics helpers — `str.lower`/isspace
-//! semantics, `str()` coercion and optional-field extraction. No direct
-//! Python counterpart; consumed throughout the crate.
+//! semantics and `str()` coercion. No direct Python counterpart;
+//! consumed throughout the crate.
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Get an optional string value from a dict.
-pub(crate) fn get_optional_string<'py>(
-    _py: Python<'py>,
-    dict: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<String>> {
-    match dict.get_item(key)? {
-        Some(v) => {
-            if v.is_none() {
-                return Ok(None);
-            }
-            let s: String = v.extract()?;
-            if s.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(s))
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Get an optional PyAny value from a dict (alias for clarity).
-pub(crate) fn get_optional_any<'py>(
-    dict: &Bound<'py, PyDict>,
-    key: &str,
-) -> PyResult<Option<Bound<'py, PyAny>>> {
-    dict.get_item(key)
-}
-
-// ---------------------------------------------------------------------------
-// Key-name normalisation (mirrors app/_keys.py's _normalize_key)
+// CPython string semantics
 // ---------------------------------------------------------------------------
 
 /// CPython's `str.isspace()` acceptance set for a single character.
@@ -74,7 +39,7 @@ pub(crate) fn py_str(obj: &Bound<'_, PyAny>) -> PyResult<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Playlist panel view engine (mirrors ui/sidebars/playlist_sidebar.py)
+// CPython case mapping
 // ---------------------------------------------------------------------------
 
 /// Python's `str.lower()`: the Unicode section-3.13 default lowercase

@@ -3,13 +3,43 @@
 //! shelf-title cleaning.
 
 use crate::ui::pages::help::py_capitalize;
-use crate::utils::pycompat::get_optional_any;
-use crate::utils::pycompat::get_optional_string;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyAny, PyDict, PyList, PyString};
 use regex::Regex;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Get an optional string value from a dict — `None`, a `None` value or
+/// an empty string all read as absent (the reference's truthiness gates
+/// on ingested fields).
+fn get_optional_string<'py>(
+    _py: Python<'py>,
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<String>> {
+    match dict.get_item(key)? {
+        Some(v) => {
+            if v.is_none() {
+                return Ok(None);
+            }
+            let s: String = v.extract()?;
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Get an optional PyAny value from a dict (clarity alias for `get_item`).
+fn get_optional_any<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    dict.get_item(key)
+}
 
 /// Regex for validating YouTube video IDs.
 static VALID_VIDEO_ID_RE: LazyLock<Regex> =
