@@ -872,6 +872,15 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         module
     )?)?;
 
+    // Path table (config/paths.py equivalent): the platform-aware
+    // computation behind every filesystem constant the module exports —
+    // the win32 APPDATA/LOCALAPPDATA bases with their home-tree
+    // fallbacks, the XDG base gates (empty reads as unset) and the
+    // derived files under CONFIG_DIR; a pure function of
+    // (platform, home, env) so the win32 branch is exercisable from
+    // any host. ensure_dirs/secure_chmod's I/O stays Python-side.
+    module.add_function(pyo3::wrap_pyfunction!(config::paths::paths_core, module)?)?;
+
     // Actions-popup menu builder (ui/popups/actions.py equivalent): the
     // context-menu assembly behind every track/album/artist/playlist
     // action menu — the per-type catalog walk with the queue-membership

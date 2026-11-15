@@ -57,12 +57,13 @@ src/ytm_player/
 
 ```text
 native/src/
-├── lib.rs          # the #[pymodule]: registers all 314 pyfunctions + 4 pyclasses (qualified paths)
+├── lib.rs          # the #[pymodule]: registers all 315 pyfunctions + 4 pyclasses (qualified paths)
 ├── cli.rs          # `ytm` subcommand cores (stats, cache status, config editor plan)
 ├── ipc.rs          # the Unix-socket request gate
 ├── json.rs         # the JSON codec behind `ytm --json` and the auth records
 ├── app/            # _keys, _navigation, _session, _sidebar, _track_actions, _ipc, _playback, _commands
-├── config/         # keymap (incl. the KeyMatcher bridge class), settings
+├── config/         # keymap (incl. the KeyMatcher bridge class), settings, paths (the
+│                   #   platform-aware path table)
 ├── services/       # auth, cache, history, player, queue, stream, ytmusic, …
 │                   #   (platform_media.rs carries the mpris + macOS media cores)
 ├── ui/             # pages/, popups, sidebars, widgets/, theme, header_bar, …
