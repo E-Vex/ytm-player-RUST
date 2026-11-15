@@ -51,6 +51,26 @@ src/ytm_player/
 └── utils/              # Terminal detection, formatting, BiDi text, transliteration
 ```
 
+## Native extension
+
+`native/` is the Rust/PyO3 extension that runs the ported computation cores natively, exposed to Python as `_ytm_player_native` (each engine keeps a pure-Python fallback for installs without the extension; the two are pinned together by the parity tests). The crate's module tree mirrors the Python package, so every engine lives next to the Python module it serves — each file's `//!` header lists its exact coverage:
+
+```text
+native/src/
+├── lib.rs          # the #[pymodule]: registers all 314 pyfunctions + 4 pyclasses (qualified paths)
+├── cli.rs          # `ytm` subcommand cores (stats, cache status, config editor plan)
+├── ipc.rs          # the Unix-socket request gate
+├── json.rs         # the JSON codec behind `ytm --json` and the auth records
+├── app/            # _keys, _navigation, _session, _sidebar, _track_actions, _ipc, _playback, _commands
+├── config/         # keymap (incl. the KeyMatcher bridge class), settings
+├── services/       # auth, cache, history, player, queue, stream, ytmusic, …
+│                   #   (platform_media.rs carries the mpris + macOS media cores)
+├── ui/             # pages/, popups, sidebars, widgets/, theme, header_bar, …
+└── utils/          # formatting, bidi, doctor, pycompat, terminal, transliteration
+```
+
+When porting a new core, place it in the module that mirrors its Python home and register it in the `#[pymodule]` with a qualified path (`wrap_pyfunction!(services::ytmusic::ytm_auth_expired, module)`). The CI `native` job builds the extension with `native/build.sh` and re-runs the full test suite with it loaded, alongside `cargo fmt --check` and `cargo clippy -D warnings`.
+
 ## Stack
 
 | Library | Purpose |
