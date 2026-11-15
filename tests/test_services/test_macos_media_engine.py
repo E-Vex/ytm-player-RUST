@@ -114,12 +114,25 @@ class TestPlaybackStateMapping:
     def test_without_the_framework_the_constants_are_none(self):
         """The table's entries are None without the MediaPlayer
         bindings — the setPlaybackState_ write then skips exactly as
-        the reference's None returns did."""
+        the reference's None returns did.
+
+        On a real macOS host the bindings are present, so the module's
+        import-time table carries the framework's ints there. The
+        no-bindings shape is then pinned by patching the table to the
+        values the module would have had without them — the same
+        contract the import-time branch guarantees where the bindings
+        are actually absent."""
         svc = MacOSMediaService()
         svc._is_playing = True
-        assert macos_media._PLAYBACK_STATES["playing"] is None
-        assert svc._playback_state("playing") is None
-        assert svc._playback_state(None) is None
+        if macos_media._MEDIA_PLAYER_AVAILABLE:
+            none_table = {"playing": None, "paused": None, "stopped": None}
+            with patch.object(macos_media, "_PLAYBACK_STATES", none_table):
+                assert svc._playback_state("playing") is None
+                assert svc._playback_state(None) is None
+        else:
+            assert macos_media._PLAYBACK_STATES["playing"] is None
+            assert svc._playback_state("playing") is None
+            assert svc._playback_state(None) is None
 
 
 # ── Native vs fallback parity ─────────────────────────────────────────
