@@ -1,5 +1,7 @@
 //! Native cores for `src/ytm_player/ui/pages/search.py` — result
-//! formatting, panel labels and categorisation.
+//! formatting, panel labels and categorisation, the result-item
+//! navigation decisions behind the panel click handlers, and the
+//! music-mode worker merge.
 
 use crate::ui::pages::browse::field_get;
 use crate::ui::pages::browse::first_truthy_get;
@@ -8,7 +10,7 @@ use crate::utils::formatting::extract_artist;
 use crate::utils::formatting::truncate_str;
 use crate::utils::pycompat::py_str;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 /// Build the human-readable label for one search-result item.
 ///
@@ -238,4 +240,203 @@ pub(crate) fn categorize_search_results<'py>(
     results.set_item("artists", artists)?;
     results.set_item("playlists", playlists)?;
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Result-item navigation decisions and the music-mode merge
+// (mirrors ui/pages/search.py)
+// ---------------------------------------------------------------------------
+
+/// The left-click navigation decision behind
+/// `SearchPage.on_search_result_panel_item_selected` from
+/// `ui/pages/search.py`: which context page a clicked Albums/Artists/
+/// Playlists row opens.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// result_type = item.get("resultType", "")
+/// if panel_id == "albums-panel" or result_type == "album":
+///     browse_id = item.get("browseId") or item.get("album_id")
+///     if browse_id:
+///         navigate("context", context_type="album", context_id=browse_id)
+/// elif ...
+/// ```
+///
+/// The panel id match — Python `==` on the widget's own id string — or
+/// the item's type tag (the `resultType` read, defaulting to `""`, the
+/// nested default evaluated before the outer lookup exactly like the
+/// reference) picks the branch; the browse id is the first truthy of
+/// the branch's key pair (`browseId`, then `album_id` / `artist_id` /
+/// `playlistId`), and a branch that resolves no truthy id answers
+/// `None` so the handler ignores the click — the reference's nested
+/// `if browse_id:` gate, which also means a panel-matched branch with
+/// no id never falls through to a later branch.
+///
+/// The answer is `None` or `{"context_type": ..., "context_id": ...}`
+/// with the context id the raw stored object. Field reads resolve
+/// exactly like the reference's `.get` calls (see `field_get`), so
+/// dict subclasses steer the branch and the id chain like they steer
+/// the reference. Where the reference would raise — a `.get`-less
+/// item (`AttributeError`) — the engine stays total and answers
+/// `None`, the same stance the label engine takes.
+#[pyfunction]
+pub(crate) fn search_item_navigation<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+    panel_id: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let empty = PyString::new(py, "").into_any();
+    let result_type = field_get(py, item, "resultType", Some(empty))?;
+
+    // The if/elif ladder in the reference's order: a panel match or the
+    // item's own type tag (Python `==` on both) picks the branch.
+    let branch: (&str, &[&str]) =
+        if panel_id.eq("albums-panel")? || eq_any_str(&result_type, &["album"])? {
+            ("album", &["browseId", "album_id"])
+        } else if panel_id.eq("artists-panel")? || eq_any_str(&result_type, &["artist"])? {
+            ("artist", &["browseId", "artist_id"])
+        } else if panel_id.eq("playlists-panel")? || eq_any_str(&result_type, &["playlist"])? {
+            ("playlist", &["browseId", "playlistId"])
+        } else {
+            return Ok(None);
+        };
+
+    // browse_id = item.get("browseId") or item.get(<branch fallback>) —
+    // the first truthy; no truthy id answers None (no navigation).
+    let browse_id = match first_truthy_get(py, item, branch.1)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("context_type", branch.0)?;
+    out.set_item("context_id", browse_id)?;
+    Ok(Some(out))
+}
+
+/// The panel→item-type mapping behind
+/// `SearchPage.on_search_result_panel_item_right_clicked` from
+/// `ui/pages/search.py`: the right-clicked row's panel id picks the
+/// item type the ActionsPopup is opened with — `albums-panel` →
+/// `album`, `artists-panel` → `artist`, `playlists-panel` → `playlist`,
+/// anything else (the songs table's rows and junk ids both) → `track`.
+///
+/// Mirrors the reference's `type_map.get(panel_id, "track")` through
+/// Python `==` against the three keys, so a str subclass panel id
+/// classifies like it does against the reference's dict lookup. Where
+/// the reference's lookup would raise — an unhashable panel_id — the
+/// engine stays total and answers the `track` default (unreachable
+/// through the panels, whose ids are plain strs).
+#[pyfunction]
+pub(crate) fn search_panel_item_type(panel_id: &Bound<'_, PyAny>) -> PyResult<String> {
+    if panel_id.eq("albums-panel")? {
+        Ok("album".to_string())
+    } else if panel_id.eq("artists-panel")? {
+        Ok("artist".to_string())
+    } else if panel_id.eq("playlists-panel")? {
+        Ok("playlist".to_string())
+    } else {
+        Ok("track".to_string())
+    }
+}
+
+/// The subscribe-id resolution behind the right-click ActionsPopup's
+/// `toggle_subscribe` arm in
+/// `SearchPage.on_search_result_panel_item_right_clicked` from
+/// `ui/pages/search.py`: `item.get("browseId") or item.get("artist_id")
+/// or ""` — the first truthy id, raw, the empty string when neither
+/// reads truthy (the handler's no-id warning branch).
+#[pyfunction]
+pub(crate) fn search_subscribe_browse_id<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    match first_truthy_get(py, item, &["browseId", "artist_id"])? {
+        Some(id) => Ok(id),
+        None => Ok(PyString::new(py, "").into_any()),
+    }
+}
+
+/// The copy-link URL behind the right-click ActionsPopup's `copy_link`
+/// arm in `SearchPage.on_search_result_panel_item_right_clicked` from
+/// `ui/pages/search.py`: the browse-id fallback chain — `browseId`,
+/// then `album_id`, `playlistId`, `artist_id`, the first truthy —
+/// interpolated into `https://music.youtube.com/browse/<id>`, the
+/// reference's f-string `str()` conversion (so a truthy non-str id
+/// stringifies exactly like the reference's interpolation), or `None`
+/// when no id resolves (the handler's silent no-id branch).
+#[pyfunction]
+pub(crate) fn search_browse_link<'py>(
+    py: Python<'py>,
+    item: &Bound<'py, PyAny>,
+) -> PyResult<Option<String>> {
+    let keys = ["browseId", "album_id", "playlistId", "artist_id"];
+    let browse_id = match first_truthy_get(py, item, &keys)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    Ok(Some(format!(
+        "https://music.youtube.com/browse/{}",
+        py_str(&browse_id)?
+    )))
+}
+
+/// The `_search_music` merge — the classification loop behind
+/// `SearchPage._search_music`'s gathered concurrent fetches from
+/// `ui/pages/search.py`.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
+/// for category, result in zip(tasks.keys(), gathered):
+///     if isinstance(result, Exception):
+///         logger.error("Search for %s failed: %s", category, result)
+///     elif isinstance(result, list):
+///         results[category] = result
+/// ```
+///
+/// Returned keys:
+///
+/// - `results` — the four-bucket dict (always present, the empty ones
+///   as empty lists, in the reference's insertion order) with every
+///   gathered list assigned under its category — the original list
+///   objects themselves, in arrival order.
+/// - `failed` — the `(category, exception)` pairs whose logging stays
+///   in the coroutine (I/O side of the seam). A gathered entry that is
+///   neither an `Exception` nor a list — unreachable through
+///   `asyncio.gather`'s return-exceptions contract — is silently
+///   dropped, exactly like the reference's elif ladder.
+///
+/// The pairs stop at the shorter list, like the reference's `zip`.
+#[pyfunction]
+pub(crate) fn music_search_results<'py>(
+    py: Python<'py>,
+    categories: &Bound<'py, PyList>,
+    gathered: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let results = PyDict::new(py);
+    results.set_item("songs", PyList::empty(py))?;
+    results.set_item("albums", PyList::empty(py))?;
+    results.set_item("artists", PyList::empty(py))?;
+    results.set_item("playlists", PyList::empty(py))?;
+
+    let failed = PyList::empty(py);
+    // zip(tasks.keys(), gathered) — pairs up to the shorter list.
+    let pairs = categories.len().min(gathered.len());
+    for index in 0..pairs {
+        let category = categories.get_item(index)?;
+        let result = gathered.get_item(index)?;
+        if result.is_instance_of::<pyo3::exceptions::PyException>() {
+            failed.append(PyTuple::new(py, [category, result])?)?;
+        } else if result.is_instance_of::<PyList>() {
+            results.set_item(category, result)?;
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("results", results)?;
+    out.set_item("failed", failed)?;
+    Ok(out)
 }

@@ -7,8 +7,12 @@ behind the discography expansion) — plus the decision core of the
 artist songs worker merge (the first-batch plan and remaining-fetch
 decision behind ``_fetch_full_artist_songs``' swap of the artist's
 full song list, and the tail plan for the chained remaining-tracks
-fetch) are implemented by the Rust extension
-(``_ytm_player_native``) when it is built and by the
+fetch), the worker-end failure copies (the log-pointing failure
+message and the empty-load branch's message pick), and the
+header-button resolutions (the Add-to-Library id chain with its VL
+strip, the Start-Radio item assembly) plus the discography swap
+applying the fetched see-all lists are implemented by the Rust
+extension (``_ytm_player_native``) when it is built and by the
 pure-Python transcriptions in this module otherwise; the
 bottom-of-module seam rebinds the engine to the native functions when
 the extension is importable. The builders below only do I/O and
@@ -53,6 +57,10 @@ def _load_failure_message(context_type: str) -> str:
     """Failure-state message shown when fetching album/artist/playlist
     data fails. Points the user at the log file so they can self-diagnose
     instead of guessing whether the network is down or the page is broken.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.load_failure_message``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
     """
     return (
         f"Couldn't load this {context_type}. Check the log at "
@@ -260,6 +268,87 @@ def artist_songs_tail(remaining: Any) -> dict[str, Any]:
     return {"tracks": tracks, "append": bool(tracks)}
 
 
+def _empty_load_message(load_failed: bool, context_type: str) -> str:
+    """The empty-data branch's message choice — the pure core of the
+    worker-state handler's ``SUCCESS``-with-no-data arm.
+
+    The load-failed flag ``_fetch_data`` sets when it caught an
+    expected API exception picks the failure copy that points at the
+    log file (``_load_failure_message``) over the genuine empty-data
+    copy ``"No data found."`` — an empty payload and a failed fetch
+    render different messages.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.empty_load_message``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if load_failed:
+        return _load_failure_message(context_type)
+    return "No data found."
+
+
+def library_playlist_id(data: dict[str, Any], context_id: str) -> Any:
+    """The Add-to-Library id resolution — the pure core of the id half
+    of ``_add_to_library``.
+
+    The first truthy of the four-operand ``or`` chain wins — the
+    page's fetched payload first (``playlistId``, then
+    ``audioPlaylistId``, then ``id``), the page's own context id when
+    the payload carries none of them, the empty string when nothing
+    reads truthy (the caller's no-id notify branch). A ``VL``-prefixed
+    id drops the prefix — the raw playlist id ``rate_playlist``
+    needs, the same strip the reference applies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.library_playlist_id``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    playlist_id = (
+        data.get("playlistId") or data.get("audioPlaylistId") or data.get("id") or context_id or ""
+    )
+    if playlist_id and playlist_id.startswith("VL"):
+        playlist_id = playlist_id[2:]
+    return playlist_id
+
+
+def radio_item(data: dict[str, Any], context_id: str) -> dict[str, Any]:
+    """The Start-Radio item assembly — the pure core of
+    ``_start_radio``: the dict the host's ``_start_playlist_radio``
+    receives.
+
+    A fresh dict — the fetched payload spread first, then the
+    ``playlistId`` key set to the payload's own truthy id or the
+    page's context id (set unconditionally, so a falsy resolution
+    overrides whatever the spread left under the key).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.radio_item``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    return {**data, "playlistId": data.get("playlistId") or context_id}
+
+
+def apply_expanded_sections(sections: list[Any], full_lists: list[Any]) -> None:
+    """The discography swap — the pure core of the mutation half of
+    ``_expand_artist_discography``, applied once the concurrent
+    see-all fetches have answered.
+
+    Each ``(section, full)`` pair — the pairs stopping at the shorter
+    list, like the reference's ``zip`` — swaps the section's
+    ``results`` for the fetched list when that list is truthy; an
+    empty or error-y fetch keeps the 10-item preview in place. The
+    swap lands on the very section objects ``expandable_sections``
+    answered — the originals inside the fetched payload.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.apply_expanded_sections``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    for section, full in zip(sections, full_lists):
+        if full:
+            section["results"] = full
+
+
 class _ArtistAlbumList(DataTable):
     """Lightweight DataTable for artist album/single listings."""
 
@@ -455,10 +544,11 @@ class ContextPage(TrackFilterHost, Widget):
 
         get_artist returns only the first page of each section; a section
         that carries ``browseId`` + ``params`` has a "see all" page (#138)
-        — the section selection runs through the (native-backed) engine,
-        the concurrent fetch stays here because it is I/O. Sections
-        without them, and fetches that come back empty, keep the
-        preview.
+        — the section selection and the swap of the fetched lists back
+        into the original sections run through the (native-backed)
+        engines, the concurrent fetch stays here because it is I/O.
+        Sections without them, and fetches that come back empty, keep
+        the preview.
         """
         sections = expandable_sections(data)
         if not sections:
@@ -466,9 +556,7 @@ class ContextPage(TrackFilterHost, Widget):
         full_lists = await asyncio.gather(
             *(ytmusic.get_artist_albums(s["browseId"], s["params"]) for s in sections)
         )
-        for section, full in zip(sections, full_lists):
-            if full:
-                section["results"] = full
+        apply_expanded_sections(sections, full_lists)
 
     async def _fetch_data(self) -> dict[str, Any]:
         """Fetch data from ytmusic based on context_type.
@@ -506,13 +594,11 @@ class ContextPage(TrackFilterHost, Widget):
                 self.loading = False
                 if not self._data:
                     # ``_fetch_data`` flips ``_load_failed`` when it
-                    # caught an expected API exception — distinguish
-                    # that path (network failure, point at log) from
-                    # the genuine "API returned empty" path.
-                    if self._load_failed:
-                        self.error_message = _load_failure_message(self.context_type)
-                    else:
-                        self.error_message = "No data found."
+                    # caught an expected API exception — the empty-load
+                    # engine (native-backed when the extension is built)
+                    # picks between the log-pointing failure copy and the
+                    # genuine "API returned empty" copy.
+                    self.error_message = _empty_load_message(self._load_failed, self.context_type)
                 else:
                     self._build_content()
             elif event.state == WorkerState.ERROR:
@@ -755,18 +841,14 @@ class ContextPage(TrackFilterHost, Widget):
             )
 
     async def _add_to_library(self) -> None:
-        """Add the current album or playlist to the user's library."""
+        """Add the current album or playlist to the user's library.
+
+        The id resolution — the playlistId/audioPlaylistId/id/context_id
+        fallback chain with the VL prefix strip — runs through the
+        (native-backed) engine.
+        """
         ytmusic = self.app.ytmusic  # type: ignore[attr-defined]
-        playlist_id = (
-            self._data.get("playlistId")
-            or self._data.get("audioPlaylistId")
-            or self._data.get("id")
-            or self.context_id
-            or ""
-        )
-        # Strip "VL" prefix — rate_playlist needs the raw playlist ID.
-        if playlist_id and playlist_id.startswith("VL"):
-            playlist_id = playlist_id[2:]
+        playlist_id = library_playlist_id(self._data, self.context_id)
         if not playlist_id:
             self.app.notify("Cannot add — no playlist ID found", severity="error", timeout=3)
             return
@@ -793,8 +875,12 @@ class ContextPage(TrackFilterHost, Widget):
             self.app.notify(f"Failed to add to library — {suffix}", severity="error", timeout=4)
 
     def _start_radio(self) -> Coroutine[Any, Any, None]:
-        """Start radio seeded from the current playlist."""
-        item = {**self._data, "playlistId": self._data.get("playlistId") or self.context_id}
+        """Start radio seeded from the current playlist.
+
+        The item assembly — the payload spread with the playlistId
+        resolution — runs through the (native-backed) engine.
+        """
+        item = radio_item(self._data, self.context_id)
         return cast("YTMHostBase", self.app)._start_playlist_radio(item)
 
     async def on_track_table_track_selected(self, event: TrackTable.TrackSelected) -> None:
@@ -876,8 +962,9 @@ class ContextPage(TrackFilterHost, Widget):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same view-model assembly and the
-# artist songs worker merge's decision core; these bindings replace the
+# The Rust extension implements the same view-model assembly, the
+# artist songs worker merge's decision core, the worker-end failure
+# copies and the header-button resolutions; these bindings replace the
 # pure-Python transcriptions above when the extension is importable.
 # The rebinding must happen AFTER the definitions above — assigning the
 # native functions any earlier would be clobbered by the ``def``
@@ -889,6 +976,9 @@ try:
         album_header as _native_album_header,
     )
     from ytm_player.utils._ytm_player_native import (
+        apply_expanded_sections as _native_apply_expanded_sections,
+    )
+    from ytm_player.utils._ytm_player_native import (
         artist_discography as _native_artist_discography,
     )
     from ytm_player.utils._ytm_player_native import (
@@ -898,10 +988,22 @@ try:
         artist_songs_tail as _native_artist_songs_tail,
     )
     from ytm_player.utils._ytm_player_native import (
+        empty_load_message as _native_empty_load_message,
+    )
+    from ytm_player.utils._ytm_player_native import (
         expandable_sections as _native_expandable_sections,
     )
     from ytm_player.utils._ytm_player_native import (
+        library_playlist_id as _native_library_playlist_id,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        load_failure_message as _native_load_failure_message,
+    )
+    from ytm_player.utils._ytm_player_native import (
         playlist_header as _native_playlist_header,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        radio_item as _native_radio_item,
     )
 except ImportError:
     pass
@@ -912,3 +1014,14 @@ else:
     expandable_sections = _native_expandable_sections  # type: ignore[assignment]
     artist_songs_first_batch = _native_artist_songs_first_batch  # type: ignore[assignment]
     artist_songs_tail = _native_artist_songs_tail  # type: ignore[assignment]
+    library_playlist_id = _native_library_playlist_id  # type: ignore[assignment]
+    radio_item = _native_radio_item  # type: ignore[assignment]
+    apply_expanded_sections = _native_apply_expanded_sections  # type: ignore[assignment]
+
+    def _load_failure_message(context_type: str) -> str:  # noqa: F811
+        """Load-failure copy (native Rust engine)."""
+        return _native_load_failure_message(context_type)
+
+    def _empty_load_message(load_failed: bool, context_type: str) -> str:  # noqa: F811
+        """Empty-load message choice (native Rust engine)."""
+        return _native_empty_load_message(load_failed, context_type)

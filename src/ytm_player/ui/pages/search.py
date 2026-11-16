@@ -3,9 +3,13 @@
 The search-page label glue — ``_format_search_result``, the item-to-label
 composer behind the Albums/Artists/Playlists panels of the results area,
 plus the panel count label, the mode indicator label, the
-suggestion-overlay pick decision, the recent-searches label pass and
-the ``_search_all`` categorization — is implemented by the Rust
-extension (``_ytm_player_native``) when it is built and by the
+suggestion-overlay pick decision, the recent-searches label pass, the
+``_search_all`` categorization, the result-item navigation decisions
+behind the panel click handlers (the left-click context-page pick, the
+right-click item type, the subscribe-id and copy-link resolutions),
+and the ``_search_music`` merge classifying the gathered concurrent
+fetches — is implemented by the Rust extension
+(``_ytm_player_native``) when it is built and by the
 pure-Python transcriptions in this module otherwise; the
 bottom-of-module seam rebinds the engines to the native functions when
 the extension is importable. The widgets below only do I/O and rendering.
@@ -193,6 +197,134 @@ def categorize_search_results(raw: list[dict[str, Any]]) -> dict[str, list[dict[
         elif result_type == "playlist":
             results["playlists"].append(item)
     return results
+
+
+def _item_navigation(item: dict[str, Any], panel_id: str) -> dict[str, Any] | None:
+    """The left-click navigation decision behind
+    ``on_search_result_panel_item_selected`` — which context page a
+    clicked Albums/Artists/Playlists row opens.
+
+    The panel id — ``"albums-panel"`` / ``"artists-panel"`` /
+    ``"playlists-panel"`` — or the item's own ``resultType`` picks the
+    branch (the panel match first, exactly the reference's
+    ``or``-joined conditions); the browse id is the first truthy of the
+    branch's key pair — ``browseId`` then ``album_id`` / ``artist_id``
+    / ``playlistId``. A branch that resolves no truthy id answers
+    ``None`` so the handler ignores the click, and a panel-matched
+    branch never falls through to a later one.
+
+    The answer is ``None`` or ``{"context_type": ...,
+    "context_id": ...}`` — the context id the raw stored value.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_item_navigation``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    result_type = item.get("resultType", "")
+    if panel_id == "albums-panel" or result_type == "album":
+        browse_id = item.get("browseId") or item.get("album_id")
+        if browse_id:
+            return {"context_type": "album", "context_id": browse_id}
+    elif panel_id == "artists-panel" or result_type == "artist":
+        browse_id = item.get("browseId") or item.get("artist_id")
+        if browse_id:
+            return {"context_type": "artist", "context_id": browse_id}
+    elif panel_id == "playlists-panel" or result_type == "playlist":
+        browse_id = item.get("browseId") or item.get("playlistId")
+        if browse_id:
+            return {"context_type": "playlist", "context_id": browse_id}
+    return None
+
+
+def _panel_item_type(panel_id: str) -> str:
+    """The panel→item-type mapping behind
+    ``on_search_result_panel_item_right_clicked`` — the item type the
+    right-clicked row's ActionsPopup is opened with.
+
+    ``albums-panel`` → ``"album"``, ``artists-panel`` → ``"artist"``,
+    ``playlists-panel`` → ``"playlist"``; anything else (the songs
+    table's rows and junk ids both) → ``"track"``, the map's
+    ``.get`` default.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_panel_item_type``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    type_map = {
+        "albums-panel": "album",
+        "artists-panel": "artist",
+        "playlists-panel": "playlist",
+    }
+    return type_map.get(panel_id, "track")
+
+
+def _subscribe_browse_id(item: dict[str, Any]) -> Any:
+    """The subscribe-id resolution behind the right-click
+    ActionsPopup's ``toggle_subscribe`` arm: ``item.get("browseId")
+    or item.get("artist_id") or ""`` — the first truthy id, raw, the
+    empty string when neither reads truthy (the handler's no-id
+    warning branch).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_subscribe_browse_id``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return item.get("browseId") or item.get("artist_id") or ""
+
+
+def _browse_link(item: dict[str, Any]) -> str | None:
+    """The copy-link URL behind the right-click ActionsPopup's
+    ``copy_link`` arm: the browse-id fallback chain — ``browseId``,
+    then ``album_id``, ``playlistId``, ``artist_id``, the first truthy
+    — interpolated into ``https://music.youtube.com/browse/<id>``, or
+    ``None`` when no id resolves (the handler's silent no-id branch).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_browse_link``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    browse_id = (
+        item.get("browseId")
+        or item.get("album_id")
+        or item.get("playlistId")
+        or item.get("artist_id")
+        or ""
+    )
+    if not browse_id:
+        return None
+    return f"https://music.youtube.com/browse/{browse_id}"
+
+
+def music_search_results(categories: list[str], gathered: list[Any]) -> dict[str, Any]:
+    """The ``_search_music`` merge — the classification loop behind the
+    worker's gathered concurrent fetches.
+
+    Each ``(category, result)`` pair — the pairs stopping at the
+    shorter list, like the reference's ``zip`` — classifies by type: an
+    exception lands in ``failed`` (the pairs whose logging stays in the
+    coroutine), a list lands under its category in ``results`` (the
+    four buckets always present, the empty ones as empty lists, holding
+    the original list objects), and anything else — unreachable
+    through ``asyncio.gather``'s return-exceptions contract — is
+    silently dropped, exactly like the reference's ``elif`` ladder.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.music_search_results``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    results: dict[str, list[Any]] = {
+        "songs": [],
+        "albums": [],
+        "artists": [],
+        "playlists": [],
+    }
+    failed: list[Any] = []
+    for category, result in zip(categories, gathered):
+        if isinstance(result, Exception):
+            failed.append((category, result))
+        elif isinstance(result, list):
+            results[category] = result
+    return {"results": results, "failed": failed}
 
 
 class SearchResultPanel(Widget):
@@ -892,14 +1024,13 @@ class SearchPage(Widget):
             self.is_loading = False
 
     async def _search_music(self, query: str) -> dict[str, list[dict[str, Any]]]:
-        """Execute filtered searches for each category (music-only mode)."""
-        results: dict[str, list[dict[str, Any]]] = {
-            "songs": [],
-            "albums": [],
-            "artists": [],
-            "playlists": [],
-        }
+        """Execute filtered searches for each category (music-only mode).
 
+        The merge — which gathered results land in which bucket, and
+        which fetches failed — runs through the (native-backed)
+        engine; this coroutine only does the concurrent I/O and the
+        failure logging.
+        """
         ytmusic = cast("YTMHostBase", self.app).ytmusic
         assert ytmusic is not None
         # Run all four searches concurrently.
@@ -910,13 +1041,10 @@ class SearchPage(Widget):
 
         gathered = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-        for category, result in zip(tasks.keys(), gathered):
-            if isinstance(result, Exception):
-                logger.error("Search for %s failed: %s", category, result)
-            elif isinstance(result, list):
-                results[category] = result
-
-        return results
+        merged = music_search_results(list(tasks.keys()), gathered)
+        for category, failure in merged["failed"]:
+            logger.error("Search for %s failed: %s", category, failure)
+        return merged["results"]
 
     async def _search_all(self, query: str) -> dict[str, list[dict[str, Any]]]:
         """Execute a single unfiltered search and categorize results.
@@ -1032,44 +1160,36 @@ class SearchPage(Widget):
     async def on_search_result_panel_item_selected(
         self, event: SearchResultPanel.ItemSelected
     ) -> None:
-        """Navigate to the context page for the selected album/artist/playlist."""
-        item = event.item_data
-        panel_id = event.panel_id
-        result_type = item.get("resultType", "")
+        """Navigate to the context page for the selected album/artist/playlist.
+
+        The navigation decision — the panel/type branch and the browse-id
+        fallback chain — runs through the (native-backed) engine; a
+        ``None`` answer (no branch, or a branch with no truthy id)
+        leaves the click unacted-on, exactly the reference's gates.
+        """
         host = cast("YTMHostBase", self.app)
-
-        if panel_id == "albums-panel" or result_type == "album":
-            browse_id = item.get("browseId") or item.get("album_id")
-            if browse_id:
-                await host.navigate_to("context", context_type="album", context_id=browse_id)
-
-        elif panel_id == "artists-panel" or result_type == "artist":
-            browse_id = item.get("browseId") or item.get("artist_id")
-            if browse_id:
-                await host.navigate_to("context", context_type="artist", context_id=browse_id)
-
-        elif panel_id == "playlists-panel" or result_type == "playlist":
-            browse_id = item.get("browseId") or item.get("playlistId")
-            if browse_id:
-                await host.navigate_to("context", context_type="playlist", context_id=browse_id)
+        nav = _item_navigation(event.item_data, event.panel_id)
+        if nav is not None:
+            await host.navigate_to(
+                "context", context_type=nav["context_type"], context_id=nav["context_id"]
+            )
 
     def on_search_result_panel_item_right_clicked(
         self, event: SearchResultPanel.ItemRightClicked
     ) -> None:
-        """Open context menu for right-clicked album/artist/playlist."""
+        """Open context menu for right-clicked album/artist/playlist.
+
+        The panel→item-type mapping for the ActionsPopup, and the
+        browse-id resolutions behind its ``toggle_subscribe`` and
+        ``copy_link`` arms, run through the (native-backed) engines.
+        """
         from ytm_player.ui.popups.actions import ActionsPopup
 
         item = event.item_data
         panel_id = event.panel_id
         host = cast("YTMHostBase", self.app)
 
-        # Map panel ID to item type for ActionsPopup.
-        type_map = {
-            "albums-panel": "album",
-            "artists-panel": "artist",
-            "playlists-panel": "playlist",
-        }
-        item_type = type_map.get(panel_id, "track")
+        item_type = _panel_item_type(panel_id)
 
         def _handle_action(action_id: str | None) -> None:
             if action_id is None:
@@ -1080,7 +1200,7 @@ class SearchPage(Widget):
                 return
 
             if action_id == "toggle_subscribe":
-                browse_id = item.get("browseId") or item.get("artist_id") or ""
+                browse_id = _subscribe_browse_id(item)
                 if not browse_id:
                     host.notify("No ID available for this item.", severity="warning", timeout=2)
                 else:
@@ -1088,15 +1208,8 @@ class SearchPage(Widget):
                 return
 
             if action_id == "copy_link":
-                browse_id = (
-                    item.get("browseId")
-                    or item.get("album_id")
-                    or item.get("playlistId")
-                    or item.get("artist_id")
-                    or ""
-                )
-                if browse_id:
-                    link = f"https://music.youtube.com/browse/{browse_id}"
+                link = _browse_link(item)
+                if link is not None:
                     if copy_to_clipboard(link):
                         host.notify("Link copied", timeout=2)
                     else:
@@ -1180,13 +1293,28 @@ try:
         format_search_result as _native_format_search_result,
     )
     from ytm_player.utils._ytm_player_native import (
+        music_search_results as _native_music_search_results,
+    )
+    from ytm_player.utils._ytm_player_native import (
         recent_search_labels as _native_recent_search_labels,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_browse_link as _native_search_browse_link,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_item_navigation as _native_search_item_navigation,
     )
     from ytm_player.utils._ytm_player_native import (
         search_mode_label as _native_search_mode_label,
     )
     from ytm_player.utils._ytm_player_native import (
         search_panel_count_label as _native_search_panel_count_label,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_panel_item_type as _native_search_panel_item_type,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        search_subscribe_browse_id as _native_search_subscribe_browse_id,
     )
     from ytm_player.utils._ytm_player_native import (
         search_suggestion_pick as _native_search_suggestion_pick,
@@ -1199,8 +1327,25 @@ else:
         """Search-result label formatting (native Rust engine)."""
         return _native_format_search_result(item)
 
+    def _item_navigation(item: dict[str, Any], panel_id: str) -> dict[str, Any] | None:  # noqa: F811
+        """Result-item navigation decision (native Rust engine)."""
+        return _native_search_item_navigation(item, panel_id)
+
+    def _panel_item_type(panel_id: str) -> str:  # noqa: F811
+        """Panel→item-type mapping (native Rust engine)."""
+        return _native_search_panel_item_type(panel_id)
+
+    def _subscribe_browse_id(item: dict[str, Any]) -> Any:  # noqa: F811
+        """Subscribe-id resolution (native Rust engine)."""
+        return _native_search_subscribe_browse_id(item)
+
+    def _browse_link(item: dict[str, Any]) -> str | None:  # noqa: F811
+        """Copy-link URL assembly (native Rust engine)."""
+        return _native_search_browse_link(item)
+
     _panel_count_label = _native_search_panel_count_label  # type: ignore[assignment]
     _mode_label = _native_search_mode_label  # type: ignore[assignment]
     _suggestion_pick = _native_search_suggestion_pick  # type: ignore[assignment]
     _recent_search_labels = _native_recent_search_labels  # type: ignore[assignment]
     categorize_search_results = _native_categorize_search_results  # type: ignore[assignment]
+    music_search_results = _native_music_search_results  # type: ignore[assignment]

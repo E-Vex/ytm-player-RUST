@@ -1,7 +1,10 @@
 //! Native cores for `src/ytm_player/ui/pages/context.py` — artist/album/
-//! playlist headers, discography and progressive artist-songs batches.
+//! playlist headers, discography and progressive artist-songs batches,
+//! the worker-end failure copies, and the header-button id and
+//! radio-item resolutions plus the discography swap.
 
 use crate::ui::pages::browse::field_get;
+use crate::ui::pages::browse::first_truthy_get;
 use crate::utils::formatting::extract_artist;
 use crate::utils::formatting::normalize_tracks;
 use crate::utils::pycompat::py_str;
@@ -541,4 +544,195 @@ pub(crate) fn artist_songs_tail<'py>(
     out.set_item("tracks", tracks)?;
     out.set_item("append", append)?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Worker-end failure copies and header-button resolutions
+// (mirrors ui/pages/context.py)
+// ---------------------------------------------------------------------------
+
+/// The failure-state message shown when fetching album/artist/playlist
+/// data fails, from `ContextPage._load_failure_message` in
+/// `ui/pages/context.py` — the copy that points the user at the log
+/// file so they can self-diagnose instead of guessing whether the
+/// network is down or the page is broken.
+///
+/// The context type interpolates through the reference's f-string
+/// `str()` conversion, so a non-str type stringifies exactly like the
+/// reference's interpolation.
+#[pyfunction]
+pub(crate) fn load_failure_message(context_type: &str) -> String {
+    format!(
+        "Couldn't load this {context_type}. Check the log at \
+         ~/.config/ytm-player/logs/ytm.log for details."
+    )
+}
+
+/// The empty-data branch's message choice — the pure core of the
+/// worker-state handler's `SUCCESS`-with-no-data arm in
+/// `ContextPage.on_worker_state_changed` from `ui/pages/context.py`:
+/// the load-failed flag the worker set when it caught an expected API
+/// exception picks the failure copy that points at the log file
+/// (see `load_failure_message`) over the genuine empty-data copy
+/// `"No data found."` — the same distinction the liked-songs page's
+/// empty-state engine makes.
+#[pyfunction]
+pub(crate) fn empty_load_message(load_failed: bool, context_type: &str) -> String {
+    if load_failed {
+        load_failure_message(context_type)
+    } else {
+        "No data found.".to_string()
+    }
+}
+
+/// The Add-to-Library id resolution — the pure core of the id half of
+/// `ContextPage._add_to_library` from `ui/pages/context.py`.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// playlist_id = (
+///     self._data.get("playlistId")
+///     or self._data.get("audioPlaylistId")
+///     or self._data.get("id")
+///     or self.context_id
+///     or ""
+/// )
+/// if playlist_id and playlist_id.startswith("VL"):
+///     playlist_id = playlist_id[2:]
+/// ```
+///
+/// The first truthy of the four-operand `or` chain wins — the page's
+/// fetched payload first (`playlistId`, then `audioPlaylistId`, then
+/// `id`), the page's own context id when the payload carries none of
+/// them, the empty string when nothing reads truthy (the caller's
+/// no-id notify branch). A `VL`-prefixed id drops the prefix: the raw
+/// playlist id `rate_playlist` needs, the same strip the reference
+/// applies — only for a truthy str(-like) id; where the reference's
+/// `.startswith` would raise `AttributeError` on a truthy non-str id
+/// the engine stays total and answers it unstripped, and the answer is
+/// the raw object so the caller's truthiness gate and the API call see
+/// the very value the reference's would have.
+#[pyfunction]
+pub(crate) fn library_playlist_id<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    context_id: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // The or-chain: the payload's three keys, then the context id, then
+    // the empty-string tail.
+    let playlist_id = match first_truthy_get(py, data, &["playlistId", "audioPlaylistId", "id"])? {
+        Some(id) => id,
+        None => {
+            if context_id.is_truthy()? {
+                context_id.clone()
+            } else {
+                PyString::new(py, "").into_any()
+            }
+        }
+    };
+
+    // if playlist_id and playlist_id.startswith("VL"):
+    //     playlist_id = playlist_id[2:]
+    // — the `strip_prefix` form of the reference's gate-then-slice. The
+    // truthiness arm only ever gates the empty-string tail (every other
+    // operand the or-chain answers survived a truthiness gate), and the
+    // prefix check only ever strips a str(-like) id — a truthy non-str
+    // id, where the reference's `.startswith` would raise
+    // `AttributeError`, passes through unstripped (the total stance).
+    if playlist_id.is_truthy()? {
+        if let Ok(s) = playlist_id.downcast::<PyString>() {
+            if let Ok(contents) = s.to_str() {
+                if let Some(stripped) = contents.strip_prefix("VL") {
+                    return Ok(PyString::new(py, stripped).into_any());
+                }
+            }
+        }
+    }
+    Ok(playlist_id)
+}
+
+/// The Start-Radio item assembly — the pure core of
+/// `ContextPage._start_radio` from `ui/pages/context.py`: the dict the
+/// host's `_start_playlist_radio` receives.
+///
+/// Mirrors the reference's
+/// `item = {**self._data, "playlistId": self._data.get("playlistId")
+/// or self.context_id}`: a fresh dict — the fetched payload spread
+/// first (the exact `dict.update` merge the reference's `{**...}`
+/// compiles to, so dict subclasses with their own `keys`/`__getitem__`
+/// steer like they steer the reference), then the `playlistId` key set
+/// to the payload's own truthy id or the page's context id — set
+/// unconditionally, so a falsy resolution overrides whatever the
+/// spread left under the key exactly like the reference's literal.
+///
+/// Where the reference would raise — a non-mapping `data` the spread
+/// rejects (`TypeError`) — the engine stays total and starts from the
+/// empty dict, the id resolution still reading the mapping-protocol
+/// `get` the reference's would.
+#[pyfunction]
+pub(crate) fn radio_item<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    context_id: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let item = PyDict::new(py);
+    // {**data} — the spread half, through the update the opcode itself
+    // resolves to; a non-mapping contributes no entries (total).
+    let _ = item.call_method1("update", (data,));
+
+    // "playlistId": data.get("playlistId") or context_id
+    let playlist_id = match first_truthy_get(py, data, &["playlistId"])? {
+        Some(id) => id,
+        None => context_id.clone(),
+    };
+    item.set_item("playlistId", playlist_id)?;
+    Ok(item)
+}
+
+/// The discography swap — the pure core of the mutation half of
+/// `ContextPage._expand_artist_discography` from
+/// `ui/pages/context.py`, applied once the concurrent see-all fetches
+/// have answered.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// for section, full in zip(sections, full_lists):
+///     if full:
+///         section["results"] = full
+/// ```
+///
+/// The `results` swap lands on the very section objects
+/// `expandable_sections` answered — the original objects inside the
+/// fetched payload, whose `results` the reference's own build then
+/// reads — and only for a truthy fetched list; an empty or error-y
+/// fetch keeps the 10-item preview in place. The assignment goes
+/// through the item-assignment protocol (`PyObject_SetItem`), so a
+/// dict subclass's own `__setitem__` steers exactly like the
+/// reference's subscript store; where the reference would raise — a
+/// non-assignable section (`TypeError`, unreachable through the
+/// sections the selection engine answers) — the engine stays total
+/// and skips the store. The pairs stop at the shorter list, like the
+/// reference's `zip`.
+#[pyfunction]
+pub(crate) fn apply_expanded_sections(
+    sections: &Bound<'_, PyList>,
+    full_lists: &Bound<'_, PyList>,
+) -> PyResult<()> {
+    // for section, full in zip(sections, full_lists):
+    let pairs = sections.len().min(full_lists.len());
+    for index in 0..pairs {
+        let section = sections.get_item(index)?;
+        let full = full_lists.get_item(index)?;
+        // if full: section["results"] = full
+        if full.is_truthy()? {
+            // Through PyObject_SetItem — the protocol the reference's
+            // subscript store dispatches; a failing store (an
+            // unassignable section, unreachable through the dicts the
+            // selection engine answers) is skipped, the total stance.
+            let _ = section.set_item("results", full);
+        }
+    }
+    Ok(())
 }
