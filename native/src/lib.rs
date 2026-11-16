@@ -1890,6 +1890,43 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         module
     )?)?;
 
+    // The liked-songs page's decision cores (the last page without
+    // native engines of its own): the empty-state copy
+    // (`liked_empty_state` — the load-failed flag picking the failure
+    // message that points at the log over the genuine empty-state
+    // copy), the footer text (`liked_footer_text` — the count through
+    // CPython's own str, the loading-more suffix under the truthiness
+    // gate), the restore-cursor bounds gate
+    // (`liked_cursor_restore_row` — the saved nav row in the half-open
+    // bounds, else None), the nav-state gate (`liked_nav_state` — the
+    // row remembered only when not None and > 0) and the Start-Radio
+    // seed draw (`radio_seed_sample` — the five-track sample the
+    // recently-played page's own Start Radio shares, routed through
+    // the Python random module so a seed or a monkeypatched sample
+    // steers both backends identically). The workers, the table
+    // loads, the tail fetch and the radio fetch stay Python-side in
+    // the pages.
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::liked_songs::liked_empty_state,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::liked_songs::liked_footer_text,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::liked_songs::liked_cursor_restore_row,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::liked_songs::liked_nav_state,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::liked_songs::radio_seed_sample,
+        module
+    )?)?;
+
     // Discord presence engine (services/discord_rpc.py equivalent):
     // the presence-kwargs assembly behind update's rpc.update(**kwargs)
     // — the seven-key dict in the reference's own key order:

@@ -224,6 +224,27 @@ def merge_pending_account_plays(
     return merged
 
 
+def _radio_seeds(tracks: Any) -> list:
+    """The Start-Radio seed draw — the five-track sample a recently
+    played radio is seeded from.
+
+    The draw size ``min(5, len(tracks))`` — capped at five and at the
+    pool's own length — then ``random.sample`` routed through the
+    ``random`` module, so ``random.seed(...)`` before the call and a
+    monkeypatched ``random.sample`` steer this exactly like the native
+    engine. The liked-songs page's own Start Radio draws its seeds
+    through the identical expression. The empty-tracks guard and the
+    radio fetch stay in the pages.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.radio_seed_sample``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    import random
+
+    return random.sample(tracks, min(5, len(tracks)))
+
+
 class RecentTab(Static):
     """A focusable tab label (All / Local / YT Music).
 
@@ -779,25 +800,23 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
                 return
 
     async def _start_radio(self) -> None:
-        import random
-
         table = self.query_one("#recent-table", TrackTable)
         tracks = table.tracks
         if not tracks:
             return
-        seeds = random.sample(tracks, min(5, len(tracks)))
+        seeds = _radio_seeds(tracks)
         host = cast("YTMHostBase", self.app)
         source = "YT Music" if self._active_tab == _TAB_YTM else "Recently Played"
         await host._fetch_and_play_radio(seeds, label=f"Radio: {source}")
 
 
 # ── Native (Rust/PyO3) override, if available ──────────────────────────
-# The Rust extension implements the same history-merge engine; these
-# bindings override the pure-Python reference above when the extension is
-# importable.  The rebinding must happen AFTER the definitions above —
-# assigning the native function any earlier would be clobbered by the
-# ``def`` statements (the lesson that produced formatting.py's dead
-# native bindings).
+# The Rust extension implements the same history-merge engines and the
+# Start-Radio seed draw; these bindings override the pure-Python
+# references above when the extension is importable.  The rebinding must
+# happen AFTER the definitions above — assigning the native functions
+# any earlier would be clobbered by the ``def`` statements (the lesson
+# that produced formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -814,6 +833,9 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         park_pending_play as _native_park_pending_play,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        radio_seed_sample as _native_radio_seed_sample,
     )
     from ytm_player.utils._ytm_player_native import (
         stamp_track as _native_stamp_track,
@@ -867,3 +889,7 @@ else:
     ) -> list[dict]:
         """Fold *pending* accepted plays into *feed* (native Rust engine)."""
         return _native_merge_pending_account_plays(feed, fetch_seq, pending)
+
+    def _radio_seeds(tracks: Any) -> list:  # noqa: F811
+        """The Start-Radio seed draw (native Rust engine)."""
+        return _native_radio_seed_sample(tracks)
