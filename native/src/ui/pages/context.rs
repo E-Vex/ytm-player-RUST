@@ -1,7 +1,8 @@
 //! Native cores for `src/ytm_player/ui/pages/context.py` — artist/album/
 //! playlist headers, discography and progressive artist-songs batches,
-//! the worker-end failure copies, and the header-button id and
-//! radio-item resolutions plus the discography swap.
+//! the worker-end failure copies, the artist album-list row assembly, and
+//! the header-button id and radio-item resolutions plus the discography
+//! swap.
 
 use crate::ui::pages::browse::field_get;
 use crate::ui::pages::browse::first_truthy_get;
@@ -9,7 +10,7 @@ use crate::utils::formatting::extract_artist;
 use crate::utils::formatting::normalize_tracks;
 use crate::utils::pycompat::py_str;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyInt, PyList, PyString};
+use pyo3::types::{PyBool, PyDict, PyInt, PyList, PyString, PyTuple};
 
 // ---------------------------------------------------------------------------
 // Context-page view-model assembly (mirrors ui/pages/context.py)
@@ -735,4 +736,63 @@ pub(crate) fn apply_expanded_sections(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The artist album-list row assembly (mirrors ui/pages/context.py)
+// ---------------------------------------------------------------------------
+
+/// The artist album-list row assembly — the pure core of
+/// `_ArtistAlbumList.load_albums` from `ui/pages/context.py`: the
+/// `(title, year)` display pair for every album of an artist's
+/// discography, one row per feed entry.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// for album in self._albums:
+///     title = album.get("title", "Unknown")
+///     year = str(album.get("year", ""))
+///     self.add_row(Text(str(title)), Text(year))
+/// ```
+///
+/// Each row's title is the album's `title` — `"Unknown"` when the key
+/// is *absent*, a stored `None` staying `None` (the `.get` default only
+/// substitutes an absent key) — and its year the album's `year`
+/// (`""` when absent), both through CPython's own `str` — the
+/// conversion the reference's `Text(...)` calls apply — so
+/// markup-looking metadata lands as literal text and a present-`None`
+/// year renders as `"None"`, exactly like the fallback. The rows stay
+/// one per entry — feed entries can repeat IDs/titles, and the cursor
+/// position (not the generated row key) selects the source album —
+/// and feed order is preserved. The `clear()`, the `_albums` copy and
+/// the `add_row` calls stay Python-side in the widget.
+///
+/// Field reads resolve exactly like the reference's `.get` calls (see
+/// `field_get`), so dict subclasses steer like they steer the reference.
+/// Where the reference would raise — a `.get`-less album (an
+/// `AttributeError`, unreachable through the discography's dict rows) —
+/// the engine stays total: the album reads as field-less and its row
+/// is the defaults pair, the same stance the label engine takes. A
+/// `str()` whose `__str__` itself raises propagates, exactly like the
+/// reference's own conversion would.
+#[pyfunction]
+pub(crate) fn artist_album_rows<'py>(
+    py: Python<'py>,
+    albums: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut rows: Vec<Bound<'py, PyTuple>> = Vec::with_capacity(albums.len());
+    for album in albums.iter() {
+        let title = field_get(
+            py,
+            &album,
+            "title",
+            Some(PyString::new(py, "Unknown").into_any()),
+        )?;
+        let year = field_get(py, &album, "year", Some(PyString::new(py, "").into_any()))?;
+        // str(title) / str(year) — the conversions the reference's
+        // Text(...) calls apply, through CPython's own PyObject_Str.
+        rows.push(PyTuple::new(py, [title.str()?, year.str()?])?);
+    }
+    PyList::new(py, rows)
 }

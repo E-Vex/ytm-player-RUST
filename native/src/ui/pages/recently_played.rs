@@ -1,8 +1,12 @@
 //! Native cores for `src/ytm_player/ui/pages/recently_played.py` —
-//! occurrence stamping, accepted-play merges and row composition.
+//! occurrence stamping, accepted-play merges and row composition, plus
+//! the page's own display tails: the empty-state copy pick, the footer
+//! line and the nav-state remember-gates.
 
 use crate::utils::formatting::get_video_id;
+use crate::utils::pycompat::py_str;
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -418,4 +422,156 @@ pub(crate) fn compose_all_rows<'py>(
         }
     }
     PyList::new(py, rows)
+}
+
+// ---------------------------------------------------------------------------
+// The page's display tails (mirrors ui/pages/recently_played.py)
+// ---------------------------------------------------------------------------
+
+/// The recently-played empty-state copy pick — the pure core of
+/// `RecentlyPlayedPage._empty_message` from
+/// `ui/pages/recently_played.py`: the message the loading label shows
+/// when the active tab rendered no rows, naming only the ACTIVE tab's
+/// own failure so the other tabs' never leak in.
+///
+/// Mirrors the reference: the tab — compared through CPython's own
+/// `==` protocol, so the int-like shapes the page's tab index can take
+/// steer like they steer the reference — picks the branch. The YT
+/// Music tab distinguishes its three empty states (auth missing, load
+/// failed, genuinely empty); the Local tab picks between the
+/// log-pointing failure copy and the genuine empty copy; and the All
+/// tab, drawn from both sources, names every missing source instead of
+/// claiming an empty history the user may well have — the problems
+/// joined by `"; "` with a trailing period, and the log pointer
+/// appended whenever a source actually *failed* (a signed-in user with
+/// an empty account history has no problem to report). The widget
+/// queries and the visibility flips stay Python-side in the page.
+#[pyfunction]
+#[pyo3(signature = (active_tab, load_failed, ytm_auth_required, ytm_load_failed))]
+pub(crate) fn recent_empty_message(
+    active_tab: &Bound<'_, PyAny>,
+    load_failed: &Bound<'_, PyAny>,
+    ytm_auth_required: &Bound<'_, PyAny>,
+    ytm_load_failed: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    // if active_tab == _TAB_YTM: — the tab through CPython's own ==
+    if active_tab.rich_compare(2i64, CompareOp::Eq)?.is_truthy()? {
+        if ytm_auth_required.is_truthy()? {
+            return Ok("Sign in to YT Music to see your account play history.".to_string());
+        }
+        if ytm_load_failed.is_truthy()? {
+            return Ok("Couldn't load YT Music history. Check the log for details.".to_string());
+        }
+        return Ok("No YT Music play history found.".to_string());
+    }
+    // if active_tab == _TAB_LOCAL:
+    if active_tab.rich_compare(1i64, CompareOp::Eq)?.is_truthy()? {
+        return Ok(if load_failed.is_truthy()? {
+            "Couldn't load history. Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        } else {
+            "No play history yet. Start listening!"
+        }
+        .to_string());
+    }
+    // All: name every source that is missing instead of claiming an
+    // empty history the user may well have.
+    let mut problems: Vec<&str> = Vec::new();
+    if load_failed.is_truthy()? {
+        problems.push("Couldn't load local history");
+    }
+    if ytm_auth_required.is_truthy()? {
+        problems.push("sign in to YT Music to include your account history");
+    } else if ytm_load_failed.is_truthy()? {
+        problems.push("couldn't load YT Music history");
+    }
+    if problems.is_empty() {
+        return Ok("No play history yet. Start listening!".to_string());
+    }
+    let mut message = problems.join("; ");
+    message.push('.');
+    if load_failed.is_truthy()? || ytm_load_failed.is_truthy()? {
+        message.push_str(" Check the log at ~/.config/ytm-player/logs/ytm.log for details.");
+    }
+    Ok(message)
+}
+
+/// The recently-played footer line — the pure core of
+/// `RecentlyPlayedPage._footer_text` from
+/// `ui/pages/recently_played.py`: the one-line count under the table.
+///
+/// Mirrors the reference: the tab — CPython's own `==` again — picks
+/// the Local and YT Music branches, the count interpolating through
+/// CPython's own `str` (the f-string's conversion). On the All tab the
+/// partial-result notices are said out loud, and first — a missing
+/// source is not an empty one, and the notice must survive a narrow
+/// terminal — through the same flag ladder the reference walks, with
+/// the em dash the reference's f-strings interpolate; the clean-history
+/// line names the two-group composition instead. The widget query and
+/// the footer update stay Python-side in the page.
+#[pyfunction]
+#[pyo3(signature = (active_tab, count, load_failed, ytm_auth_required, ytm_load_failed))]
+pub(crate) fn recent_footer_text(
+    active_tab: &Bound<'_, PyAny>,
+    count: &Bound<'_, PyAny>,
+    load_failed: &Bound<'_, PyAny>,
+    ytm_auth_required: &Bound<'_, PyAny>,
+    ytm_load_failed: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    let count = py_str(count)?;
+    // if active_tab == _TAB_LOCAL:
+    if active_tab.rich_compare(1i64, CompareOp::Eq)?.is_truthy()? {
+        return Ok(format!("{count} recently played tracks (local)"));
+    }
+    // if active_tab == _TAB_YTM:
+    if active_tab.rich_compare(2i64, CompareOp::Eq)?.is_truthy()? {
+        return Ok(format!("{count} recently played tracks (YT Music)"));
+    }
+    // Partial results are said out loud, and first: a missing source is
+    // not an empty one, and the notice must survive a narrow terminal.
+    let notice = if load_failed.is_truthy()? {
+        "Local history couldn't be loaded; showing YT Music history only"
+    } else if ytm_auth_required.is_truthy()? {
+        "Sign in to YT Music to include your account history; showing local history only"
+    } else if ytm_load_failed.is_truthy()? {
+        "YT Music history couldn't be loaded; showing local history only"
+    } else {
+        return Ok(format!(
+            "{count} tracks \u{2014} local history first, then additional account history"
+        ));
+    };
+    Ok(format!("{notice} \u{2014} {count} tracks"))
+}
+
+/// The nav-state remember-gates behind
+/// `RecentlyPlayedPage.get_nav_state` from
+/// `ui/pages/recently_played.py` — the state the page preserves when
+/// navigating away.
+///
+/// Mirrors the reference exactly, every comparison through CPython's
+/// own protocol: the active tab is remembered only when it differs
+/// from the All default (a user on the default tab needs no restore),
+/// riding home as the very object it is; and the cursor row is
+/// remembered only when it is not `None` and above zero — a cursor
+/// still resting on the first row (or not laid out yet) needs no
+/// restore. The `query_one` and its broad catch stay Python-side in
+/// the page (a failed capture answering no cursor row, the same shape a
+/// cursorless table answers).
+#[pyfunction]
+#[pyo3(signature = (active_tab, cursor_row))]
+pub(crate) fn recent_nav_state<'py>(
+    py: Python<'py>,
+    active_tab: &Bound<'py, PyAny>,
+    cursor_row: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // if active_tab != _DEFAULT_TAB: state["active_tab"] = active_tab
+    if active_tab.rich_compare(0i64, CompareOp::Ne)?.is_truthy()? {
+        out.set_item("active_tab", active_tab)?;
+    }
+    // if cursor_row is not None and cursor_row > 0:
+    //     state["cursor_row"] = cursor_row
+    if !cursor_row.is_none() && cursor_row.rich_compare(0i64, CompareOp::Gt)?.is_truthy()? {
+        out.set_item("cursor_row", cursor_row)?;
+    }
+    Ok(out)
 }

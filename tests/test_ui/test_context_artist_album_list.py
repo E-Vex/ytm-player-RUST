@@ -6,6 +6,7 @@ import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
 
+from ytm_player.ui.pages import context as ctx
 from ytm_player.ui.pages.context import _ArtistAlbumList
 
 
@@ -58,6 +59,45 @@ async def test_album_metadata_is_literal_text():
         title, year = table.get_row_at(0)
         assert isinstance(title, Text) and title.plain == "[/] [bold]Album[/bold]"
         assert isinstance(year, Text) and year.plain == "[/]"
+
+
+async def test_load_albums_consults_the_row_engine(monkeypatch):
+    """``load_albums`` renders whatever pairs the row-assembly engine
+    answers — the (title, year) strings come from the engine, the
+    ``Text`` wrapping and the row insertion stay in the widget."""
+    calls: list[list[dict]] = []
+
+    def recording(albums):
+        calls.append(albums)
+        return [("Engine A", "2001"), ("Engine B", "")]
+
+    monkeypatch.setattr(ctx, "artist_album_rows", recording)
+
+    albums = [
+        {"title": "Ignored", "year": "9999", "browseId": "MPREb_1"},
+        {"title": "Ignored too", "year": "2024", "browseId": "MPREb_2"},
+    ]
+
+    class Host(_Host):
+        def compose(self):
+            yield _ArtistAlbumList()
+
+    app = Host()
+    async with app.run_test() as pilot:
+        table = app.query_one(_ArtistAlbumList)
+        table.load_albums(albums)
+        await pilot.pause()
+
+        # The engine was consulted exactly once, with the copied list.
+        assert len(calls) == 1
+        assert calls[0] == albums
+        assert calls[0] is not albums
+
+        first, second = table.get_row_at(0), table.get_row_at(1)
+        assert first[0].plain == "Engine A" and first[1].plain == "2001"
+        assert second[0].plain == "Engine B" and second[1].plain == ""
+        # The source albums still ride along for the cursor's selection.
+        assert table.selected_album is albums[0]
 
 
 async def test_load_albums_immediately_after_construction():

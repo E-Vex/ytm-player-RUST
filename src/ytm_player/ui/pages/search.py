@@ -7,8 +7,9 @@ suggestion-overlay pick decision, the recent-searches label pass, the
 ``_search_all`` categorization, the result-item navigation decisions
 behind the panel click handlers (the left-click context-page pick, the
 right-click item type, the subscribe-id and copy-link resolutions),
-and the ``_search_music`` merge classifying the gathered concurrent
-fetches — is implemented by the Rust extension
+the ``_search_music`` merge classifying the gathered concurrent
+fetches, and the nav-state remember-gates behind ``get_nav_state`` —
+is implemented by the Rust extension
 (``_ytm_player_native``) when it is built and by the
 pure-Python transcriptions in this module otherwise; the
 bottom-of-module seam rebinds the engines to the native functions when
@@ -325,6 +326,40 @@ def music_search_results(categories: list[str], gathered: list[Any]) -> dict[str
         elif isinstance(result, list):
             results[category] = result
     return {"results": results, "failed": failed}
+
+
+def _nav_state(last_query: Any, search_mode: Any, results: Any, cursor_row: Any) -> dict[str, Any]:
+    """The nav-state remember-gates — the pure core of
+    ``SearchPage.get_nav_state``, the state the page preserves when
+    navigating away.
+
+    Which of the four keys ride home: the last query under its own
+    truthiness (an empty query needs no restore); the search mode only
+    when it differs from ``"music"`` — the fresh-entry default, so the
+    restore only carries a mode the user actually changed; the results
+    dict only when any of its buckets holds something (a search that
+    landed nothing restores as none); and the songs table's cursor row
+    whenever it is not ``None`` — unlike the liked-songs gate, a cursor
+    resting on the first row IS worth restoring (the page restore
+    skips a row past the table's end, not a row at the top). The
+    ``query_one`` and its broad catch stay in the page (a failed query
+    answering ``None``, the same shape a laid-out-but-cursorless table
+    answers, so both leave the key out).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.search_nav_state``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    state: dict[str, Any] = {}
+    if last_query:
+        state["last_query"] = last_query
+    if search_mode != "music":
+        state["search_mode"] = search_mode
+    if any(results.values()):
+        state["search_results"] = results
+    if cursor_row is not None:
+        state["cursor_row"] = cursor_row
+    return state
 
 
 class SearchResultPanel(Widget):
@@ -756,21 +791,18 @@ class SearchPage(Widget):
         }
 
     def get_nav_state(self) -> dict[str, Any]:
-        """Return state to preserve when navigating away."""
-        state: dict[str, Any] = {}
-        if self._last_query:
-            state["last_query"] = self._last_query
-        if self.search_mode != "music":
-            state["search_mode"] = self.search_mode
-        if any(self._search_results.values()):
-            state["search_results"] = self._search_results
+        """Return state to preserve when navigating away.
+
+        The remember-gates — which of the four keys ride home — run
+        through the (native-backed) engine; the widget query and its
+        broad catch stay here.
+        """
         try:
-            table = self.query_one("#songs-table", TrackTable)
-            if table.cursor_row is not None:
-                state["cursor_row"] = table.cursor_row
+            cursor_row = self.query_one("#songs-table", TrackTable).cursor_row
         except Exception:
-            pass
-        return state
+            logger.debug("Failed to capture cursor for nav state", exc_info=True)
+            cursor_row = None
+        return _nav_state(self._last_query, self.search_mode, self._search_results, cursor_row)
 
     # ------------------------------------------------------------------
     # Input handling
@@ -1308,6 +1340,9 @@ try:
         search_mode_label as _native_search_mode_label,
     )
     from ytm_player.utils._ytm_player_native import (
+        search_nav_state as _native_search_nav_state,
+    )
+    from ytm_player.utils._ytm_player_native import (
         search_panel_count_label as _native_search_panel_count_label,
     )
     from ytm_player.utils._ytm_player_native import (
@@ -1347,5 +1382,6 @@ else:
     _mode_label = _native_search_mode_label  # type: ignore[assignment]
     _suggestion_pick = _native_search_suggestion_pick  # type: ignore[assignment]
     _recent_search_labels = _native_recent_search_labels  # type: ignore[assignment]
+    _nav_state = _native_search_nav_state  # type: ignore[assignment]
     categorize_search_results = _native_categorize_search_results  # type: ignore[assignment]
     music_search_results = _native_music_search_results  # type: ignore[assignment]

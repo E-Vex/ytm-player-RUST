@@ -12,6 +12,18 @@ Three tabs:
 - **YT Music** — the account's play history from any device, via the
   unofficial ytmusicapi ``get_history()``, in the server's order. Requires
   authentication.
+
+The module's pure decision cores are dual-implemented: the Rust
+extension (``_ytm_player_native``) implements them when it is built,
+and the pure-Python transcriptions below run otherwise — the
+history-merge engines behind the page's caches (stamping and
+occurrence identity, the accepted-play supersessions, the pending-play
+parking and merge, the All-tab composition), the page's own display
+tails (the empty-state copy pick, the footer line) and the nav-state
+remember-gates, plus the Start-Radio seed draw. The bottom-of-module
+seam rebinds each to the native function when the extension is
+importable. The workers, the cache plumbing and the rendering stay
+Python-side in the page.
 """
 
 from __future__ import annotations
@@ -222,6 +234,110 @@ def merge_pending_account_plays(
             continue
         merged = _with_accepted_play(merged, track)
     return merged
+
+
+def _recent_empty_message(
+    active_tab: Any, load_failed: Any, ytm_auth_required: Any, ytm_load_failed: Any
+) -> str:
+    """The empty-state copy pick — the pure core of the page's
+    ``_empty_message``, the message the loading label shows when the
+    active tab rendered no rows.
+
+    The tab picks the branch, and only the ACTIVE tab's own failures
+    ever leak into its copy. The YT Music tab distinguishes its three
+    empty states — auth missing, load failed, genuinely empty; the
+    Local tab picks between the log-pointing failure copy and the
+    genuine empty copy; and the All tab, drawn from both sources,
+    names every missing source instead of claiming an empty history
+    the user may well have — the problems joined on ``"; "``, with the
+    log pointer appended whenever a source actually *failed* (a
+    signed-in user with an empty account history has no problem to
+    report).
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.recent_empty_message``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if active_tab == _TAB_YTM:
+        if ytm_auth_required:
+            return _YTM_AUTH_REQUIRED_MSG
+        if ytm_load_failed:
+            return _YTM_LOAD_FAILED_MSG
+        return "No YT Music play history found."
+    if active_tab == _TAB_LOCAL:
+        return _HISTORY_LOAD_FAILED_MSG if load_failed else "No play history yet. Start listening!"
+    problems = []
+    if load_failed:
+        problems.append("Couldn't load local history")
+    if ytm_auth_required:
+        problems.append("sign in to YT Music to include your account history")
+    elif ytm_load_failed:
+        problems.append("couldn't load YT Music history")
+    if not problems:
+        return "No play history yet. Start listening!"
+    message = "; ".join(problems) + "."
+    if load_failed or ytm_load_failed:
+        message += " Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+    return message
+
+
+def _recent_footer_text(
+    active_tab: Any,
+    count: Any,
+    load_failed: Any,
+    ytm_auth_required: Any,
+    ytm_load_failed: Any,
+) -> str:
+    """The footer line — the pure core of the page's ``_footer_text``
+    (the count under the table, interpolated through ``str``).
+
+    The Local and YT Music tabs state their own counts; on All the
+    partial-result notices are said out loud, and first — a missing
+    source is not an empty one, and the notice must survive a narrow
+    terminal — through the same flag ladder the reference walks, with
+    the clean-history line naming the two-group composition instead.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.recent_footer_text``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if active_tab == _TAB_LOCAL:
+        return f"{count} recently played tracks (local)"
+    if active_tab == _TAB_YTM:
+        return f"{count} recently played tracks (YT Music)"
+    if load_failed:
+        notice = "Local history couldn't be loaded; showing YT Music history only"
+    elif ytm_auth_required:
+        notice = "Sign in to YT Music to include your account history; showing local history only"
+    elif ytm_load_failed:
+        notice = "YT Music history couldn't be loaded; showing local history only"
+    else:
+        return f"{count} tracks — local history first, then additional account history"
+    return f"{notice} — {count} tracks"
+
+
+def _recent_nav_state(active_tab: Any, cursor_row: Any) -> dict[str, Any]:
+    """The nav-state remember-gates — the pure core of the page's
+    ``get_nav_state``, the state the page preserves when navigating
+    away.
+
+    The active tab is remembered only when it differs from the All
+    default (a user on the default tab needs no restore), riding home
+    as the very object it is; the cursor row only when it is not
+    ``None`` and above zero — a cursor still resting on the first row
+    (or not laid out yet) needs no restore. The ``query_one`` and its
+    broad catch stay in the page.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.recent_nav_state``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    state: dict[str, Any] = {}
+    if active_tab != _DEFAULT_TAB:
+        state["active_tab"] = active_tab
+    if cursor_row is not None and cursor_row > 0:
+        state["cursor_row"] = cursor_row
+    return state
 
 
 def _radio_seeds(tracks: Any) -> list:
@@ -641,66 +757,42 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
             table.focus()
 
     def _empty_message(self) -> str:
-        """Empty-state copy for the ACTIVE tab; the other tabs' failures never leak in."""
-        if self._active_tab == _TAB_YTM:
-            if self._ytm_auth_required:
-                return _YTM_AUTH_REQUIRED_MSG
-            if self._ytm_load_failed:
-                return _YTM_LOAD_FAILED_MSG
-            return "No YT Music play history found."
-        if self._active_tab == _TAB_LOCAL:
-            return (
-                _HISTORY_LOAD_FAILED_MSG
-                if self._load_failed
-                else "No play history yet. Start listening!"
-            )
-        # All: name every source that is missing instead of claiming an empty
-        # history the user may well have.
-        problems = []
-        if self._load_failed:
-            problems.append("Couldn't load local history")
-        if self._ytm_auth_required:
-            problems.append("sign in to YT Music to include your account history")
-        elif self._ytm_load_failed:
-            problems.append("couldn't load YT Music history")
-        if not problems:
-            return "No play history yet. Start listening!"
-        message = "; ".join(problems) + "."
-        if self._load_failed or self._ytm_load_failed:
-            message += " Check the log at ~/.config/ytm-player/logs/ytm.log for details."
-        return message
+        """Empty-state copy for the ACTIVE tab; the other tabs' failures never leak in.
+
+        The copy pick — the tab first, then the failure flags — runs
+        through the (native-backed) engine; the widget queries and the
+        visibility flips stay here.
+        """
+        return _recent_empty_message(
+            self._active_tab, self._load_failed, self._ytm_auth_required, self._ytm_load_failed
+        )
 
     def _footer_text(self, count: int) -> str:
-        if self._active_tab == _TAB_LOCAL:
-            return f"{count} recently played tracks (local)"
-        if self._active_tab == _TAB_YTM:
-            return f"{count} recently played tracks (YT Music)"
-        # Partial results are said out loud, and first: a missing source is
-        # not an empty one, and the notice must survive a narrow terminal.
-        if self._load_failed:
-            notice = "Local history couldn't be loaded; showing YT Music history only"
-        elif self._ytm_auth_required:
-            notice = (
-                "Sign in to YT Music to include your account history; showing local history only"
-            )
-        elif self._ytm_load_failed:
-            notice = "YT Music history couldn't be loaded; showing local history only"
-        else:
-            return f"{count} tracks — local history first, then additional account history"
-        return f"{notice} — {count} tracks"
+        """The footer line — the count (and the partial-result notice on
+        All) through the (native-backed) engine; the widget query and
+        the footer update stay here.
+        """
+        return _recent_footer_text(
+            self._active_tab,
+            count,
+            self._load_failed,
+            self._ytm_auth_required,
+            self._ytm_load_failed,
+        )
 
     def get_nav_state(self) -> dict[str, Any]:
-        """Return state to preserve when navigating away."""
-        state: dict[str, Any] = {}
-        if self._active_tab != _DEFAULT_TAB:
-            state["active_tab"] = self._active_tab
+        """Return state to preserve when navigating away.
+
+        The remember-gates — the non-default tab, the above-first row —
+        run through the (native-backed) engine; the widget query and
+        its catch stay here, a failed capture answering no cursor row.
+        """
         try:
-            table = self.query_one("#recent-table", TrackTable)
-            if table.cursor_row is not None and table.cursor_row > 0:
-                state["cursor_row"] = table.cursor_row
+            cursor_row = self.query_one("#recent-table", TrackTable).cursor_row
+            return _recent_nav_state(self._active_tab, cursor_row)
         except Exception:
             logger.debug("Failed to capture cursor for nav state", exc_info=True)
-        return state
+            return _recent_nav_state(self._active_tab, None)
 
     _CONTEXT_ID = "__RECENTLY_PLAYED__"
 
@@ -811,12 +903,14 @@ class RecentlyPlayedPage(TrackFilterHost, Widget):
 
 
 # ── Native (Rust/PyO3) override, if available ──────────────────────────
-# The Rust extension implements the same history-merge engines and the
-# Start-Radio seed draw; these bindings override the pure-Python
-# references above when the extension is importable.  The rebinding must
-# happen AFTER the definitions above — assigning the native functions
-# any earlier would be clobbered by the ``def`` statements (the lesson
-# that produced formatting.py's dead native bindings).
+# The Rust extension implements the same history-merge engines, the
+# page's display tails (the empty-state copy pick, the footer line, the
+# nav-state remember-gates) and the Start-Radio seed draw; these
+# bindings override the pure-Python references above when the
+# extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements (the lesson that produced
+# formatting.py's dead native bindings).
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -836,6 +930,15 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         radio_seed_sample as _native_radio_seed_sample,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        recent_empty_message as _native_recent_empty_message,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        recent_footer_text as _native_recent_footer_text,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        recent_nav_state as _native_recent_nav_state,
     )
     from ytm_player.utils._ytm_player_native import (
         stamp_track as _native_stamp_track,
@@ -889,6 +992,30 @@ else:
     ) -> list[dict]:
         """Fold *pending* accepted plays into *feed* (native Rust engine)."""
         return _native_merge_pending_account_plays(feed, fetch_seq, pending)
+
+    def _recent_empty_message(  # noqa: F811
+        active_tab: Any, load_failed: Any, ytm_auth_required: Any, ytm_load_failed: Any
+    ) -> str:
+        """The empty-state copy pick (native Rust engine)."""
+        return _native_recent_empty_message(
+            active_tab, load_failed, ytm_auth_required, ytm_load_failed
+        )
+
+    def _recent_footer_text(  # noqa: F811
+        active_tab: Any,
+        count: Any,
+        load_failed: Any,
+        ytm_auth_required: Any,
+        ytm_load_failed: Any,
+    ) -> str:
+        """The footer line (native Rust engine)."""
+        return _native_recent_footer_text(
+            active_tab, count, load_failed, ytm_auth_required, ytm_load_failed
+        )
+
+    def _recent_nav_state(active_tab: Any, cursor_row: Any) -> dict[str, Any]:  # noqa: F811
+        """The nav-state remember-gates (native Rust engine)."""
+        return _native_recent_nav_state(active_tab, cursor_row)
 
     def _radio_seeds(tracks: Any) -> list:  # noqa: F811
         """The Start-Radio seed draw (native Rust engine)."""

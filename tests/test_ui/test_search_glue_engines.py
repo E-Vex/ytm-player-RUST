@@ -8,11 +8,15 @@ shared by ``compose``, ``on_mount`` and ``_toggle_search_mode``), the
 suggestion-overlay pick decision (``_suggestion_pick`` — the index
 bounds check behind the suggestion-list's selection handling), the
 recent-searches label pass (``_recent_search_labels`` — the history rows
-becoming suggestion labels), and the ``_search_all`` categorization
+becoming suggestion labels), the ``_search_all`` categorization
 (``categorize_search_results`` — bucketing one unfiltered search into
-the four result panels by ``resultType``). The pure-Python references
-live in ``ui/pages/search.py``; when the Rust extension is built the
-same engines run natively (``_ytm_player_native.search_panel_count_label``
+the four result panels by ``resultType``), and the nav-state
+remember-gates (``_nav_state`` — the four keys behind
+``get_nav_state``: the query under truthiness, the mode only off the
+music default, the results when any bucket holds something, the cursor
+row whenever not ``None``). The pure-Python references live in
+``ui/pages/search.py``; when the Rust extension is built the same
+engines run natively (``_ytm_player_native.search_panel_count_label``
 & co).
 
 The unit tests below assert the engines' contract on whichever backend
@@ -44,6 +48,7 @@ from ytm_player.ui.pages.search import (
     SearchResultPanel,
     SuggestionList,
     _mode_label,
+    _nav_state,
     _panel_count_label,
     _recent_search_labels,
     _suggestion_pick,
@@ -267,6 +272,77 @@ class TestTotalityEngine:
 
         assert _recent_search_labels([Overriding(nope=1)]) == ["synthetic"]
 
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_a_values_less_results_object_is_not_remembered(self) -> None:
+        # The reference's ``any(results.values())`` would raise
+        # AttributeError on a list / int / str results object; the
+        # engine stays total and reads the gate closed.
+        for results in ([], 5, "x", None):
+            state = _nav_state("q", "all", results, 3)
+            assert state == {"last_query": "q", "search_mode": "all", "cursor_row": 3}
+
+
+# ── The nav-state remember-gates ───────────────────────────────────
+
+
+class TestNavState:
+    """``_nav_state``'s remember gates, on whichever backend."""
+
+    _EMPTY = {"songs": [], "albums": [], "artists": [], "playlists": []}
+
+    def test_nothing_to_remember(self) -> None:
+        assert _nav_state("", "music", self._EMPTY, None) == {}
+
+    def test_the_query_is_remembered_under_truthiness(self) -> None:
+        assert _nav_state("", "music", self._EMPTY, None) == {}
+        assert _nav_state(None, "music", self._EMPTY, None) == {}
+        assert _nav_state("q", "music", self._EMPTY, None) == {"last_query": "q"}
+
+    def test_the_mode_is_remembered_only_off_the_default(self) -> None:
+        assert "search_mode" not in _nav_state("", "music", self._EMPTY, None)
+        assert _nav_state("", "all", self._EMPTY, None) == {"search_mode": "all"}
+        # Anything but "music" — the empty string included.
+        assert _nav_state("", "", self._EMPTY, None) == {"search_mode": ""}
+
+    def test_the_mode_comparison_goes_through_python_equality(self) -> None:
+        class S(str):
+            pass
+
+        assert "search_mode" not in _nav_state("", S("music"), self._EMPTY, None)
+        assert _nav_state("", S("all"), self._EMPTY, None) == {"search_mode": S("all")}
+
+    def test_the_results_are_remembered_when_any_bucket_holds_something(self) -> None:
+        assert "search_results" not in _nav_state("", "music", self._EMPTY, None)
+        results = {**self._EMPTY, "songs": [{"videoId": "v1"}]}
+        state = _nav_state("", "music", results, None)
+        assert state["search_results"] is results
+
+    def test_the_results_gate_goes_through_values(self) -> None:
+        class Overriding(dict):
+            def values(self):
+                return ["truthy"]
+
+        state = _nav_state("", "music", Overriding(), None)
+        assert state["search_results"].values() == ["truthy"]
+
+    def test_the_cursor_row_is_remembered_whenever_not_none(self) -> None:
+        # Unlike the liked-songs gate, row 0 IS worth restoring — the
+        # page restore skips a row past the table's end, not row 0.
+        assert "cursor_row" not in _nav_state("", "music", self._EMPTY, None)
+        assert _nav_state("", "music", self._EMPTY, 0) == {"cursor_row": 0}
+        assert _nav_state("", "music", self._EMPTY, 3) == {"cursor_row": 3}
+        assert _nav_state("", "music", self._EMPTY, 2.5) == {"cursor_row": 2.5}
+
+    def test_all_four_keys_ride_home(self) -> None:
+        results = {"songs": [{"videoId": "v"}], "albums": [], "artists": [], "playlists": []}
+        state = _nav_state("q", "all", results, 7)
+        assert state == {
+            "last_query": "q",
+            "search_mode": "all",
+            "search_results": results,
+            "cursor_row": 7,
+        }
+
 
 # ── Native vs fallback parity ────────────────────────────────────────
 
@@ -320,6 +396,36 @@ _CATEGORIZE_CASES: list[list[dict[str, Any]]] = [
     [{"resultType": "artist", "n": n} for n in range(5)],
 ]
 
+# Nav-state cases: [last_query, search_mode, results, cursor_row].
+_NAV_CASES: list[list[Any]] = [
+    ["", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, None],
+    ["q", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, None],
+    ["", "all", {"songs": [], "albums": [], "artists": [], "playlists": []}, None],
+    ["", "", {"songs": [], "albums": [], "artists": [], "playlists": []}, None],
+    [
+        "",
+        "music",
+        {"songs": [{"videoId": "v"}], "albums": [], "artists": [], "playlists": []},
+        None,
+    ],
+    ["", "music", {"songs": [], "albums": [{}], "artists": [], "playlists": []}, None],
+    ["", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, 0],
+    ["", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, 3],
+    ["", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, 2.5],
+    ["", "music", {"songs": [], "albums": [], "artists": [], "playlists": []}, True],
+    [
+        "nightdrive",
+        "all",
+        {
+            "songs": [{"videoId": "v1"}, {"videoId": "v2"}],
+            "albums": [{"browseId": "b1"}],
+            "artists": [],
+            "playlists": [],
+        },
+        7,
+    ],
+]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -328,6 +434,7 @@ sys.modules['ytm_player.utils._ytm_player_native'] = None
 
 from ytm_player.ui.pages.search import (
     _mode_label,
+    _nav_state,
     _panel_count_label,
     _recent_search_labels,
     _suggestion_pick,
@@ -351,6 +458,10 @@ out = {
     "categorize": [
         categorize_search_results(raw) for raw in payload["categorize_cases"]
     ],
+    "nav": [
+        _nav_state(query, mode, results, cursor_row)
+        for query, mode, results, cursor_row in payload["nav_cases"]
+    ],
 }
 json.dump(out, sys.stdout, ensure_ascii=False)
 """
@@ -367,6 +478,10 @@ def _native_results(payload: dict) -> dict:
         ],
         "recent": [_recent_search_labels(entries) for entries in payload["recent_cases"]],
         "categorize": [categorize_search_results(raw) for raw in payload["categorize_cases"]],
+        "nav": [
+            _nav_state(query, mode, results, cursor_row)
+            for query, mode, results, cursor_row in payload["nav_cases"]
+        ],
     }
 
 
@@ -399,6 +514,7 @@ class TestNativeParity:
             "pick_cases": _PICK_CASES,
             "recent_cases": _RECENT_CASES,
             "categorize_cases": _CATEGORIZE_CASES,
+            "nav_cases": _NAV_CASES,
         }
         native = _native_results(payload)
         fallback = _fallback_results(payload)
@@ -604,3 +720,50 @@ class TestSearchPageGlue:
             assert str(content) in ("▶ Music", "▶ All")
             (span,) = content.spans
             assert str(span.style) == get_theme().primary
+
+
+class TestNavStateWiring:
+    """``get_nav_state`` consults the nav engine with the page's own
+    state — the query, the mode, the results and the table's cursor row."""
+
+    def _page(self) -> MagicMock:
+        page = MagicMock()
+        page._last_query = "nightdrive"
+        page.search_mode = "all"
+        page._search_results = {"songs": [{"videoId": "v1"}], "albums": [], "artists": []}
+        page.query_one.return_value.cursor_row = 3
+        return page
+
+    def test_the_engine_is_consulted_with_the_pages_own_state(self, monkeypatch) -> None:
+        from ytm_player.ui.pages import search as search_module
+
+        calls: list[tuple[Any, Any, Any, Any]] = []
+
+        def recording(last_query, search_mode, results, cursor_row):
+            calls.append((last_query, search_mode, results, cursor_row))
+            return {"last_query": last_query, "cursor_row": cursor_row}
+
+        monkeypatch.setattr(search_module, "_nav_state", recording)
+        page = self._page()
+
+        assert SearchPage.get_nav_state(page) == {"last_query": "nightdrive", "cursor_row": 3}
+        assert calls == [
+            ("nightdrive", "all", page._search_results, 3)
+        ]  # the very objects the page holds
+
+    def test_a_raising_query_answers_no_cursor_row(self, monkeypatch) -> None:
+        from ytm_player.ui.pages import search as search_module
+
+        calls: list[tuple[Any, Any, Any, Any]] = []
+
+        def recording(last_query, search_mode, results, cursor_row):
+            calls.append((last_query, search_mode, results, cursor_row))
+            return {}
+
+        monkeypatch.setattr(search_module, "_nav_state", recording)
+        page = self._page()
+        page.query_one.side_effect = RuntimeError("table not mounted")
+
+        assert SearchPage.get_nav_state(page) == {}
+        # A failed capture and a cursorless table both answer None.
+        assert calls == [("nightdrive", "all", page._search_results, None)]

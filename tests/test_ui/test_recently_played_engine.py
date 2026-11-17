@@ -3,7 +3,13 @@
 The engine behind the Recently Played page's caches: occurrence stamping
 and identity (``_stamp`` / ``_occurrence_key``), the accepted-play
 supersession (``_with_accepted_play``) and its local-tab and pending-play
-counterparts, and the All-tab local+account composition (``_compose_all``).
+counterparts, and the All-tab local+account composition (``_compose_all``)
+— plus the page's own display tails: the empty-state copy pick
+(``_recent_empty_message`` — the active tab naming only its own failure,
+the All tab naming every missing source), the footer line
+(``_recent_footer_text`` — the count, and the partial-result notices
+said out loud and first) and the nav-state remember-gates
+(``_recent_nav_state`` — the non-default tab, the above-first row).
 The pure-Python reference lives in ``ui/pages/recently_played.py``; when
 the Rust extension is built the same engine runs natively
 (``_ytm_player_native.with_accepted_play`` & co).
@@ -25,14 +31,23 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from ytm_player.ui.pages.recently_played import (
+    _DEFAULT_TAB,
     _MAX_TRACKS,
+    _TAB_ALL,
+    _TAB_LOCAL,
+    _TAB_YTM,
     _compose_all,
     _enrich,
     _occurrence_key,
+    _recent_empty_message,
+    _recent_footer_text,
+    _recent_nav_state,
     _stamp,
     _with_accepted_play,
     merge_pending_account_plays,
@@ -373,6 +388,171 @@ class TestComposeAllIdentity:
         assert _compose_all([{"video_id": "a"}], [{"video_id": "b"}], cap=0) == []
 
 
+# ── The empty-state copy pick ─────────────────────────────────────
+
+
+class TestRecentEmptyMessage:
+    """``_recent_empty_message``'s copy picks, on whichever backend."""
+
+    def test_the_ytm_tab_distinguishes_its_three_empty_states(self):
+        assert _recent_empty_message(_TAB_YTM, False, True, False) == (
+            "Sign in to YT Music to see your account play history."
+        )
+        assert _recent_empty_message(_TAB_YTM, False, False, True) == (
+            "Couldn't load YT Music history. Check the log for details."
+        )
+        assert _recent_empty_message(_TAB_YTM, False, False, False) == (
+            "No YT Music play history found."
+        )
+        # The other tabs' failures never leak in.
+        assert _recent_empty_message(_TAB_YTM, True, False, False) == (
+            "No YT Music play history found."
+        )
+
+    def test_the_local_tab_picks_between_failure_and_empty_copies(self):
+        assert _recent_empty_message(_TAB_LOCAL, True, False, False) == (
+            "Couldn't load history. Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+        assert _recent_empty_message(_TAB_LOCAL, False, True, True) == (
+            "No play history yet. Start listening!"
+        )
+
+    def test_the_all_tab_names_every_missing_source(self):
+        assert _recent_empty_message(_TAB_ALL, False, False, False) == (
+            "No play history yet. Start listening!"
+        )
+        # A failed source appends the log pointer on top of its problem.
+        assert _recent_empty_message(_TAB_ALL, True, False, False) == (
+            "Couldn't load local history. "
+            "Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+        # An auth-missing source has not failed — no log pointer.
+        assert _recent_empty_message(_TAB_ALL, False, True, False) == (
+            "sign in to YT Music to include your account history."
+        )
+
+    def test_the_all_tab_joins_two_problems_with_the_log_pointer(self):
+        assert _recent_empty_message(_TAB_ALL, True, True, False) == (
+            "Couldn't load local history; sign in to YT Music to include "
+            "your account history. "
+            "Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+        assert _recent_empty_message(_TAB_ALL, True, False, True) == (
+            "Couldn't load local history; couldn't load YT Music history. "
+            "Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+
+    def test_the_all_tab_ladder_skips_the_ytm_failure_when_auth_is_missing(self):
+        # The elif — an auth-missing user is told to sign in, not that
+        # the history failed to load. The ytm-failure flag still opens
+        # the log-pointer gate, though: that fetch genuinely failed.
+        assert _recent_empty_message(_TAB_ALL, False, True, True) == (
+            "sign in to YT Music to include your account history. "
+            "Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+
+    def test_a_signed_in_user_with_an_empty_account_history_has_no_problem(self):
+        # Only a source that actually failed appends the log pointer.
+        assert _recent_empty_message(_TAB_ALL, False, False, True) == (
+            "couldn't load YT Music history. "
+            "Check the log at ~/.config/ytm-player/logs/ytm.log for details."
+        )
+
+    def test_the_flag_gates_are_truthiness(self):
+        assert _recent_empty_message(_TAB_LOCAL, 1, "x", 0) == _recent_empty_message(
+            _TAB_LOCAL, True, True, False
+        )
+        assert _recent_empty_message(_TAB_LOCAL, 0, None, []) == _recent_empty_message(
+            _TAB_LOCAL, False, False, False
+        )
+
+
+# ── The footer line ──────────────────────────────────────────────
+
+
+class TestRecentFooterText:
+    """``_recent_footer_text``'s lines, on whichever backend."""
+
+    def test_the_local_and_ytm_tabs_state_their_own_counts(self):
+        assert _recent_footer_text(_TAB_LOCAL, 12, True, True, True) == (
+            "12 recently played tracks (local)"
+        )
+        assert _recent_footer_text(_TAB_YTM, 3, True, True, True) == (
+            "3 recently played tracks (YT Music)"
+        )
+
+    def test_the_count_interpolates_through_str(self):
+        assert _recent_footer_text(_TAB_LOCAL, "7", False, False, False) == (
+            "7 recently played tracks (local)"
+        )
+        assert _recent_footer_text(_TAB_LOCAL, 2.5, False, False, False) == (
+            "2.5 recently played tracks (local)"
+        )
+        assert _recent_footer_text(_TAB_LOCAL, 0, False, False, False) == (
+            "0 recently played tracks (local)"
+        )
+
+    def test_a_clean_all_tab_names_the_two_group_composition(self):
+        assert _recent_footer_text(_TAB_ALL, 5, False, False, False) == (
+            "5 tracks — local history first, then additional account history"
+        )
+
+    def test_partial_results_are_said_out_loud_and_first(self):
+        assert _recent_footer_text(_TAB_ALL, 4, True, False, False) == (
+            "Local history couldn't be loaded; showing YT Music history only — 4 tracks"
+        )
+        assert _recent_footer_text(_TAB_ALL, 4, False, True, False) == (
+            "Sign in to YT Music to include your account history; "
+            "showing local history only — 4 tracks"
+        )
+        assert _recent_footer_text(_TAB_ALL, 4, False, False, True) == (
+            "YT Music history couldn't be loaded; showing local history only — 4 tracks"
+        )
+
+    def test_the_flag_gates_are_truthiness(self):
+        assert _recent_footer_text(_TAB_ALL, 1, 1, 0, 0) == _recent_footer_text(
+            _TAB_ALL, 1, True, False, False
+        )
+        assert _recent_footer_text(_TAB_ALL, 1, None, "x", []) == _recent_footer_text(
+            _TAB_ALL, 1, False, True, False
+        )
+
+
+# ── The nav-state remember-gates ─────────────────────────────────
+
+
+class TestRecentNavState:
+    """``_recent_nav_state``'s remember gates, on whichever backend."""
+
+    def test_the_default_tab_is_not_remembered(self):
+        assert _recent_nav_state(_DEFAULT_TAB, 4) == {"cursor_row": 4}
+
+    def test_a_non_default_tab_rides_home_as_itself(self):
+        assert _recent_nav_state(_TAB_YTM, None) == {"active_tab": _TAB_YTM}
+        assert _recent_nav_state(_TAB_LOCAL, 0) == {"active_tab": _TAB_LOCAL}
+
+    def test_a_cursor_on_the_first_row_is_not_remembered(self):
+        assert _recent_nav_state(_DEFAULT_TAB, 0) == {}
+        assert _recent_nav_state(_TAB_YTM, 0) == {"active_tab": _TAB_YTM}
+
+    def test_none_and_negative_rows_are_not_remembered(self):
+        assert _recent_nav_state(_DEFAULT_TAB, None) == {}
+        assert _recent_nav_state(_DEFAULT_TAB, -1) == {}
+
+    def test_a_positive_row_is_remembered_as_itself(self):
+        assert _recent_nav_state(_DEFAULT_TAB, 2) == {"cursor_row": 2}
+        assert _recent_nav_state(_TAB_LOCAL, 4) == {"active_tab": _TAB_LOCAL, "cursor_row": 4}
+
+    def test_a_float_row_compares_like_python(self):
+        assert _recent_nav_state(_DEFAULT_TAB, 2.5) == {"cursor_row": 2.5}
+        assert _recent_nav_state(_DEFAULT_TAB, 0.5) == {"cursor_row": 0.5}
+        assert _recent_nav_state(_DEFAULT_TAB, -0.5) == {}
+
+    def test_a_bool_row_compares_like_python(self):
+        assert _recent_nav_state(_DEFAULT_TAB, True) == {"cursor_row": True}
+        assert _recent_nav_state(_DEFAULT_TAB, False) == {}
+
+
 # ── Native / fallback parity ─────────────────────────────────────────
 #
 # When the Rust extension is built, the engine above IS the native one;
@@ -529,6 +709,64 @@ _COMPOSE_CASES = [
     ),
 ]
 
+# Empty-message cases: [active_tab, load_failed, ytm_auth_required,
+# ytm_load_failed].
+_EMPTY_CASES = [
+    [0, False, False, False],
+    [0, True, False, False],
+    [0, False, True, False],
+    [0, False, False, True],
+    [0, True, True, False],
+    [0, True, False, True],
+    [0, False, True, True],
+    [0, True, True, True],
+    [1, True, True, True],
+    [1, False, True, True],
+    [2, False, True, False],
+    [2, False, False, True],
+    [2, True, False, False],
+    [2, False, False, False],
+    [1, 0, None, []],
+    [2, 1, "x", 0],
+    [0, 0, "", 1],
+]
+
+# Footer cases: [active_tab, count, load_failed, ytm_auth_required,
+# ytm_load_failed].
+_FOOTER_CASES = [
+    [0, 12, False, False, False],
+    [0, 4, True, False, False],
+    [0, 4, False, True, False],
+    [0, 4, False, False, True],
+    [0, 0, True, False, False],
+    [1, 12, True, True, True],
+    [2, 3, True, True, True],
+    [1, "7", False, False, False],
+    [2, 2.5, False, False, False],
+    [0, None, False, False, False],
+    [0, 1, 1, 0, 0],
+    [0, 1, None, "x", []],
+]
+
+# Nav-state cases: [active_tab, cursor_row].
+_NAV_STATE_CASES = [
+    [0, None],
+    [0, 0],
+    [0, 1],
+    [0, -1],
+    [0, 2.5],
+    [0, 0.5],
+    [0, -0.5],
+    [0, True],
+    [0, False],
+    [1, None],
+    [1, 0],
+    [1, 4],
+    [2, None],
+    [2, 4],
+    ["x", 3],
+]
+
 _CASES = {
     "stamp": _STAMP_CASES,
     "key": _KEY_CASES,
@@ -538,6 +776,9 @@ _CASES = {
     "merge": _MERGE_CASES,
     "enrich": _ENRICH_CASES,
     "compose": _COMPOSE_CASES,
+    "empty": _EMPTY_CASES,
+    "footer": _FOOTER_CASES,
+    "nav_state": _NAV_STATE_CASES,
 }
 
 # The child interpreter runs this program with the case list on stdin and
@@ -552,6 +793,9 @@ from ytm_player.ui.pages.recently_played import (
     _compose_all,
     _enrich,
     _occurrence_key,
+    _recent_empty_message,
+    _recent_footer_text,
+    _recent_nav_state,
     _stamp,
     _with_accepted_play,
     merge_pending_account_plays,
@@ -572,6 +816,17 @@ out = {
     "merge": [merge_pending_account_plays(f, fs, p) for f, fs, p in cases["merge"]],
     "enrich": [_enrich(t, e) for t, e in cases["enrich"]],
     "compose": [_compose_all(loc, acc, cap) for loc, acc, cap in cases["compose"]],
+    "empty": [
+        _recent_empty_message(tab, lf, ar, fl)
+        for tab, lf, ar, fl in cases["empty"]
+    ],
+    "footer": [
+        _recent_footer_text(tab, count, lf, ar, fl)
+        for tab, count, lf, ar, fl in cases["footer"]
+    ],
+    "nav_state": [
+        _recent_nav_state(tab, row) for tab, row in cases["nav_state"]
+    ],
 }
 json.dump(out, sys.stdout)
 """
@@ -588,6 +843,12 @@ def _native_results(cases: dict) -> dict:
         "merge": [merge_pending_account_plays(f, fs, p) for f, fs, p in cases["merge"]],
         "enrich": [_enrich(t, e) for t, e in cases["enrich"]],
         "compose": [_compose_all(loc, acc, cap) for loc, acc, cap in cases["compose"]],
+        "empty": [_recent_empty_message(tab, lf, ar, fl) for tab, lf, ar, fl in cases["empty"]],
+        "footer": [
+            _recent_footer_text(tab, count, lf, ar, fl)
+            for tab, count, lf, ar, fl in cases["footer"]
+        ],
+        "nav_state": [_recent_nav_state(tab, row) for tab, row in cases["nav_state"]],
     }
 
 
@@ -656,3 +917,98 @@ class TestNativeParity:
                 assert _normalized(native[group][i]) == _normalized(fallback[group][i]), (
                     f"native and fallback {group} results differ for case {i}"
                 )
+
+
+# ── Wiring: the page consults the engines with its own state ────────
+
+
+class TestEmptyMessageWiring:
+    """``_empty_message`` consults the empty-state engine with the
+    page's own tab and failure flags."""
+
+    def test_the_engine_is_consulted_with_the_flags(self, monkeypatch):
+        from ytm_player.ui.pages import recently_played as rp
+        from ytm_player.ui.pages.recently_played import RecentlyPlayedPage
+
+        calls: list[tuple[int, bool, bool, bool]] = []
+
+        def recording(active_tab, load_failed, ytm_auth_required, ytm_load_failed):
+            calls.append((active_tab, load_failed, ytm_auth_required, ytm_load_failed))
+            return "the copy"
+
+        monkeypatch.setattr(rp, "_recent_empty_message", recording)
+        page = MagicMock()
+        page._active_tab = _TAB_YTM
+        page._load_failed = True
+        page._ytm_auth_required = False
+        page._ytm_load_failed = True
+
+        assert RecentlyPlayedPage._empty_message(page) == "the copy"
+        assert calls == [(_TAB_YTM, True, False, True)]
+
+
+class TestFooterWiring:
+    """``_footer_text`` consults the footer engine with the page's own
+    tab, flags and the row count."""
+
+    def test_the_engine_is_consulted_with_the_tab_flags_and_count(self, monkeypatch):
+        from ytm_player.ui.pages import recently_played as rp
+        from ytm_player.ui.pages.recently_played import RecentlyPlayedPage
+
+        calls: list[tuple[int, int, bool, bool, bool]] = []
+
+        def recording(active_tab, count, load_failed, ytm_auth_required, ytm_load_failed):
+            calls.append((active_tab, count, load_failed, ytm_auth_required, ytm_load_failed))
+            return "the footer"
+
+        monkeypatch.setattr(rp, "_recent_footer_text", recording)
+        page = MagicMock()
+        page._active_tab = _TAB_ALL
+        page._load_failed = False
+        page._ytm_auth_required = True
+        page._ytm_load_failed = False
+
+        assert RecentlyPlayedPage._footer_text(page, 9) == "the footer"
+        assert calls == [(_TAB_ALL, 9, False, True, False)]
+
+
+class TestNavStateWiring:
+    """``get_nav_state`` consults the nav engine with the table's own
+    cursor row."""
+
+    def test_the_engine_is_consulted_with_the_cursor_row(self, monkeypatch):
+        from ytm_player.ui.pages import recently_played as rp
+        from ytm_player.ui.pages.recently_played import RecentlyPlayedPage
+
+        calls: list[tuple[int, int]] = []
+
+        def recording(active_tab, cursor_row):
+            calls.append((active_tab, cursor_row))
+            return {"active_tab": active_tab, "cursor_row": cursor_row}
+
+        monkeypatch.setattr(rp, "_recent_nav_state", recording)
+        page = MagicMock()
+        page._active_tab = _TAB_YTM
+        page.query_one.return_value.cursor_row = 4
+
+        assert RecentlyPlayedPage.get_nav_state(page) == {"active_tab": _TAB_YTM, "cursor_row": 4}
+        assert calls == [(_TAB_YTM, 4)]
+
+    def test_a_raising_capture_answers_no_cursor_row(self, monkeypatch):
+        from ytm_player.ui.pages import recently_played as rp
+        from ytm_player.ui.pages.recently_played import RecentlyPlayedPage
+
+        calls: list[tuple[int, Any]] = []
+
+        def recording(active_tab, cursor_row):
+            calls.append((active_tab, cursor_row))
+            return {"active_tab": active_tab}
+
+        monkeypatch.setattr(rp, "_recent_nav_state", recording)
+        page = MagicMock()
+        page._active_tab = _TAB_LOCAL
+        page.query_one.side_effect = RuntimeError("table not mounted")
+
+        assert RecentlyPlayedPage.get_nav_state(page) == {"active_tab": _TAB_LOCAL}
+        # A failed capture and a cursorless table both answer None.
+        assert calls == [(_TAB_LOCAL, None)]

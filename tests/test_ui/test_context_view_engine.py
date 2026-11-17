@@ -3,13 +3,15 @@
 The engine behind the album, artist and playlist detail pages — the
 album and playlist header compositions (``album_header`` /
 ``playlist_header``: title, subtitle, unavailable count, the playlist's
-owned flag and remaining-tail fetch gate) and the artist discography
+owned flag and remaining-tail fetch gate), the artist discography
 (``artist_discography``: top songs, the albums+singles concatenation,
 subscribers and the similar-artists bar, plus ``expandable_sections``,
-the see-all section selection behind the discography expansion). The
-pure-Python reference lives in ``ui/pages/context.py``; when the Rust
-extension is built the same engines run natively
-(``_ytm_player_native``).
+the see-all section selection behind the discography expansion) and the
+artist album-list row assembly (``artist_album_rows``: the
+``(title, year)`` display pairs behind ``_ArtistAlbumList.load_albums``,
+one row per feed entry through ``str``). The pure-Python reference
+lives in ``ui/pages/context.py``; when the Rust extension is built the
+same engines run natively (``_ytm_player_native``).
 
 The unit tests below assert the engines' contract on whichever backend is
 loaded. When the extension is built, the parity tests additionally compare
@@ -30,6 +32,7 @@ import pytest
 
 from ytm_player.ui.pages.context import (
     album_header,
+    artist_album_rows,
     artist_discography,
     expandable_sections,
     playlist_header,
@@ -401,6 +404,49 @@ class TestExpandableSections:
         assert expandable_sections({"singles": singles}) == [singles]
 
 
+# ── Artist album-list rows ─────────────────────────────────────────
+
+
+class TestArtistAlbumRows:
+    """``artist_album_rows``'s (title, year) pairs, on whichever backend."""
+
+    def test_full_rows(self) -> None:
+        albums = [
+            {"title": "LP", "year": "2024", "browseId": "MPREb_1"},
+            {"title": "Single", "year": "2023"},
+        ]
+        assert artist_album_rows(albums) == [("LP", "2024"), ("Single", "2023")]
+
+    def test_defaults_for_absent_keys(self) -> None:
+        assert artist_album_rows([{}]) == [("Unknown", "")]
+        assert artist_album_rows([{"browseId": "MPREb"}]) == [("Unknown", "")]
+
+    def test_a_present_none_is_not_the_default(self) -> None:
+        # ``.get``'s default only substitutes an ABSENT key — a stored
+        # ``None`` stays, and renders through ``str`` as "None".
+        assert artist_album_rows([{"title": None, "year": None}]) == [("None", "None")]
+
+    def test_values_interpolate_through_str(self) -> None:
+        assert artist_album_rows([{"title": 42, "year": 2024}]) == [("42", "2024")]
+        assert artist_album_rows([{"title": True, "year": 2.5}]) == [("True", "2.5")]
+
+    def test_markup_stays_literal(self) -> None:
+        title = "[/] [bold]Album[/bold]"
+        assert artist_album_rows([{"title": title, "year": "[/]"}]) == [(title, "[/]")]
+
+    def test_one_row_per_entry_in_feed_order(self) -> None:
+        # Feed entries can repeat IDs and titles; every entry keeps its
+        # own row, in order.
+        albums = [
+            {"title": "Same", "year": "2024", "browseId": "MPRE_duplicate"},
+            {"title": "Same", "year": "2025", "browseId": "MPRE_duplicate"},
+        ]
+        assert artist_album_rows(albums) == [("Same", "2024"), ("Same", "2025")]
+
+    def test_empty_list(self) -> None:
+        assert artist_album_rows([]) == []
+
+
 # ── Dict protocol ─────────────────────────────────────────────────────
 
 
@@ -431,6 +477,19 @@ class TestDictProtocol:
 
         view = playlist_header({"author": Overriding({}), "tracks": []})
         assert view["subtitle"].startswith("Overridden ·")
+
+
+def test_album_rows_field_reads_go_through_get() -> None:
+    # The album-list row assembly reads the same `.get` fields the
+    # header engines do — a dict subclass steering the row exactly like
+    # it steers the reference.
+    class Overriding(dict):
+        def get(self, key: str, default: Any = None) -> Any:
+            if key == "title":
+                return "Overridden"
+            return super().get(key, default)
+
+    assert artist_album_rows([Overriding({"year": 2024})]) == [("Overridden", "2024")]
 
 
 # ── Native-only totality ──────────────────────────────────────────────
@@ -495,6 +554,12 @@ class TestTotalityEngine:
         # The reference's str.join on an int name would raise TypeError.
         view = artist_discography({"related": {"results": [{"name": 7}, {"name": ""}]}})
         assert view["related_text"] == "Similar Artists: 7"
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_a_get_less_album_row_reads_as_the_defaults(self) -> None:
+        # The reference's ``album.get`` would raise AttributeError on a
+        # non-dict row; the engine stays total and reads it field-less.
+        assert artist_album_rows(["nope", 7]) == [("Unknown", ""), ("Unknown", "")]
 
 
 # ── Native vs fallback parity ─────────────────────────────────────────
@@ -641,11 +706,30 @@ _SECTIONS_CASES: list[dict[str, Any]] = [
     {"singles": {"browseId": "MPAD_2", "params": "p"}},
 ]
 
+# The album-list row-assembly cases: lists of discography feed rows.
+_ROWS_CASES: list[list[dict[str, Any]]] = [
+    [{"title": "LP", "year": "2024", "browseId": "MPREb_1"}],
+    [
+        {"title": "Same", "year": "2024", "browseId": "MPRE_duplicate"},
+        {"title": "Same", "year": "2025", "browseId": "MPRE_duplicate"},
+    ],
+    [{"title": "No Year"}],
+    [{"year": 2024}],
+    [{"title": None, "year": None}],
+    [{"title": 42, "year": 2.5}],
+    [{"title": True, "year": ""}],
+    [{"title": "[/] [bold]Album[/bold]", "year": "[/]"}],
+    [{"browseId": "MPREb", "params": "p"}],
+    [{}, {"title": "a"}, {"year": "2024"}],
+    [],
+]
+
 _PARITY_CASES: dict[str, list[Any]] = {
     "album": _ALBUM_CASES,
     "playlist": _PLAYLIST_CASES,
     "artist": _ARTIST_CASES,
     "sections": _SECTIONS_CASES,
+    "rows": _ROWS_CASES,
 }
 
 _CHILD_PROG = r"""
@@ -656,6 +740,7 @@ sys.modules['ytm_player.utils._ytm_player_native'] = None
 
 from ytm_player.ui.pages.context import (
     album_header,
+    artist_album_rows,
     artist_discography,
     expandable_sections,
     playlist_header,
@@ -667,6 +752,7 @@ out = {
     "playlist": [playlist_header(c) for c in data["playlist_cases"]],
     "artist": [artist_discography(c) for c in data["artist_cases"]],
     "sections": [expandable_sections(c) for c in data["sections_cases"]],
+    "rows": [artist_album_rows(c) for c in data["rows_cases"]],
 }
 json.dump(out, sys.stdout, ensure_ascii=False)
 """
@@ -681,6 +767,7 @@ def _native_outcomes() -> dict:
         "playlist": [playlist_header(c) for c in _PLAYLIST_CASES],
         "artist": [artist_discography(c) for c in _ARTIST_CASES],
         "sections": [expandable_sections(c) for c in _SECTIONS_CASES],
+        "rows": [artist_album_rows(c) for c in _ROWS_CASES],
     }
 
 
@@ -693,6 +780,7 @@ def _fallback_outcomes() -> dict:
             "playlist_cases": _PLAYLIST_CASES,
             "artist_cases": _ARTIST_CASES,
             "sections_cases": _SECTIONS_CASES,
+            "rows_cases": _ROWS_CASES,
         }
     )
     out = subprocess.run(
@@ -715,7 +803,11 @@ class TestNativeParity:
 
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     def test_engines_match_fallback(self) -> None:
-        native = _native_outcomes()
+        # The native outcomes go through the same JSON round-trip the
+        # child's fallback outcomes do — the row pairs are tuples on the
+        # native side and lists after the child's JSON hop, and both
+        # spellings of a pair must compare equal.
+        native = json.loads(json.dumps(_native_outcomes()))
         fallback = _fallback_outcomes()
         assert native.keys() == fallback.keys()
         for key, cases in _PARITY_CASES.items():

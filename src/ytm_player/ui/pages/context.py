@@ -8,15 +8,16 @@ artist songs worker merge (the first-batch plan and remaining-fetch
 decision behind ``_fetch_full_artist_songs``' swap of the artist's
 full song list, and the tail plan for the chained remaining-tracks
 fetch), the worker-end failure copies (the log-pointing failure
-message and the empty-load branch's message pick), and the
-header-button resolutions (the Add-to-Library id chain with its VL
-strip, the Start-Radio item assembly) plus the discography swap
-applying the fetched see-all lists are implemented by the Rust
-extension (``_ytm_player_native``) when it is built and by the
-pure-Python transcriptions in this module otherwise; the
-bottom-of-module seam rebinds the engine to the native functions when
-the extension is importable. The builders below only do I/O and
-rendering.
+message and the empty-load branch's message pick), the artist
+album-list row assembly (the ``(title, year)`` display strings behind
+``_ArtistAlbumList.load_albums``), and the header-button resolutions
+(the Add-to-Library id chain with its VL strip, the Start-Radio item
+assembly) plus the discography swap applying the fetched see-all lists
+are implemented by the Rust extension (``_ytm_player_native``) when it
+is built and by the pure-Python transcriptions in this module
+otherwise; the bottom-of-module seam rebinds the engine to the native
+functions when the extension is importable. The builders below only
+do I/O and rendering.
 """
 
 from __future__ import annotations
@@ -349,6 +350,34 @@ def apply_expanded_sections(sections: list[Any], full_lists: list[Any]) -> None:
             section["results"] = full
 
 
+def artist_album_rows(albums: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """The artist album-list row assembly — the pure core of
+    ``_ArtistAlbumList.load_albums``.
+
+    The ``(title, year)`` display pair for every album of an artist's
+    discography: each row's title is the album's ``title``
+    (``"Unknown"`` when the key is *absent* — a stored ``None`` stays
+    ``None``, the ``.get`` default only substituting an absent key) and
+    its year the album's ``year`` (``""`` when absent), both through
+    ``str`` — the conversion the reference's ``Text(...)`` calls apply
+    — so markup-looking metadata lands as literal text and a
+    present-``None`` year renders as ``"None"``. The rows stay one per
+    entry — feed entries can repeat IDs/titles — and feed order is
+    preserved; the ``clear()``, the ``_albums`` copy and the
+    ``add_row`` calls stay in the widget.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.artist_album_rows``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    rows: list[tuple[str, str]] = []
+    for album in albums:
+        title = album.get("title", "Unknown")
+        year = str(album.get("year", ""))
+        rows.append((str(title), year))
+    return rows
+
+
 class _ArtistAlbumList(DataTable):
     """Lightweight DataTable for artist album/single listings."""
 
@@ -375,12 +404,12 @@ class _ArtistAlbumList(DataTable):
     def load_albums(self, albums: list[dict]) -> None:
         self.clear()
         self._albums = list(albums)
-        for album in self._albums:
-            title = album.get("title", "Unknown")
-            year = str(album.get("year", ""))
-            # Feed entries can repeat IDs/titles. Generated keys identify rows;
-            # cursor position still selects the corresponding source album.
-            self.add_row(Text(str(title)), Text(year))
+        # Feed entries can repeat IDs/titles. Generated keys identify rows;
+        # cursor position still selects the corresponding source album.
+        # The (title, year) display strings come from the (native-backed)
+        # row-assembly engine.
+        for title, year in artist_album_rows(self._albums):
+            self.add_row(Text(title), Text(year))
 
     @property
     def selected_album(self) -> dict | None:
@@ -963,10 +992,11 @@ class ContextPage(TrackFilterHost, Widget):
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
 # The Rust extension implements the same view-model assembly, the
-# artist songs worker merge's decision core, the worker-end failure
-# copies and the header-button resolutions; these bindings replace the
-# pure-Python transcriptions above when the extension is importable.
-# The rebinding must happen AFTER the definitions above — assigning the
+# artist songs worker merge's decision core, the artist album-list row
+# assembly, the worker-end failure copies and the header-button
+# resolutions; these bindings replace the pure-Python transcriptions
+# above when the extension is importable. The rebinding must happen
+# AFTER the definitions above — assigning the
 # native functions any earlier would be clobbered by the ``def``
 # statements (the lesson that produced formatting.py's dead native
 # bindings).
@@ -977,6 +1007,9 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         apply_expanded_sections as _native_apply_expanded_sections,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        artist_album_rows as _native_artist_album_rows,
     )
     from ytm_player.utils._ytm_player_native import (
         artist_discography as _native_artist_discography,
@@ -1017,6 +1050,7 @@ else:
     library_playlist_id = _native_library_playlist_id  # type: ignore[assignment]
     radio_item = _native_radio_item  # type: ignore[assignment]
     apply_expanded_sections = _native_apply_expanded_sections  # type: ignore[assignment]
+    artist_album_rows = _native_artist_album_rows  # type: ignore[assignment]
 
     def _load_failure_message(context_type: str) -> str:  # noqa: F811
         """Load-failure copy (native Rust engine)."""

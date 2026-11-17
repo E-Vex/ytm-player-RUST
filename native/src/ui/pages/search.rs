@@ -1,7 +1,8 @@
 //! Native cores for `src/ytm_player/ui/pages/search.py` — result
 //! formatting, panel labels and categorisation, the result-item
-//! navigation decisions behind the panel click handlers, and the
-//! music-mode worker merge.
+//! navigation decisions behind the panel click handlers, the
+//! music-mode worker merge, and the nav-state remember-gates behind
+//! `get_nav_state`.
 
 use crate::ui::pages::browse::field_get;
 use crate::ui::pages::browse::first_truthy_get;
@@ -10,6 +11,7 @@ use crate::utils::formatting::extract_artist;
 use crate::utils::formatting::truncate_str;
 use crate::utils::pycompat::py_str;
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 /// Build the human-readable label for one search-result item.
@@ -438,5 +440,107 @@ pub(crate) fn music_search_results<'py>(
     let out = PyDict::new(py);
     out.set_item("results", results)?;
     out.set_item("failed", failed)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// The nav-state remember-gates (mirrors ui/pages/search.py)
+// ---------------------------------------------------------------------------
+
+/// `any(mapping.values())` — the results key's remember-gate: the
+/// results ride home only when one of the buckets holds something.
+/// An exact dict iterates its own values; anything else resolves
+/// `values()` through the attribute protocol exactly like the
+/// reference (a mapping whose own `values` answers anything iterable
+/// steers the gate like it steers the reference). Where the reference
+/// would raise `AttributeError` — a `.values`-less results object,
+/// unreachable through the page's own always-a-plain-dict results —
+/// the engine stays total and the gate reads closed.
+fn any_value_truthy(py: Python<'_>, results: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if results.is_exact_instance_of::<PyDict>() {
+        let dict = results.downcast::<PyDict>().unwrap();
+        for (_key, value) in dict.iter() {
+            if value.is_truthy()? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    match results.call_method0("values") {
+        Ok(values) => {
+            for item in values.try_iter()? {
+                if item?.is_truthy()? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// The nav-state remember-gates behind `SearchPage.get_nav_state` from
+/// `ui/pages/search.py` — which of the four preserved keys ride home
+/// when the page is navigated away from.
+///
+/// Mirrors the reference:
+///
+/// ```python
+/// state = {}
+/// if self._last_query:
+///     state["last_query"] = self._last_query
+/// if self.search_mode != "music":
+///     state["search_mode"] = self.search_mode
+/// if any(self._search_results.values()):
+///     state["search_results"] = self._search_results
+/// if table.cursor_row is not None:
+///     state["cursor_row"] = table.cursor_row
+/// ```
+///
+/// Every gate keeps its reference shape: the query remembered under
+/// truthiness (an empty query needs no restore); the mode remembered
+/// only when it differs from `"music"` — the comparison through
+/// CPython's own `!=` protocol, so a str subclass steers like it
+/// steers the reference — the default music mode being the fresh-entry
+/// default; the results remembered when any bucket holds something
+/// (the reference's `any(values())`, see `any_value_truthy`) and riding
+/// home as the very dict object they are; and the cursor row remembered
+/// whenever it is not `None` — a cursor resting on the first row IS
+/// worth restoring (unlike the liked-songs gate, which skips row 0)
+/// because the page restore skips a row past the table's end, not a
+/// row at the top. The `query_one` and its broad catch stay
+/// Python-side in the page (a failed query answers `None`, the same
+/// shape a laid-out-but-cursorless table answers, so both leave the
+/// key out).
+#[pyfunction]
+#[pyo3(signature = (last_query, search_mode, results, cursor_row))]
+pub(crate) fn search_nav_state<'py>(
+    py: Python<'py>,
+    last_query: &Bound<'py, PyAny>,
+    search_mode: &Bound<'py, PyAny>,
+    results: &Bound<'py, PyAny>,
+    cursor_row: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // if last_query: state["last_query"] = last_query
+    if last_query.is_truthy()? {
+        out.set_item("last_query", last_query)?;
+    }
+    // if search_mode != "music": state["search_mode"] = search_mode
+    if search_mode
+        .rich_compare("music", CompareOp::Ne)?
+        .is_truthy()?
+    {
+        out.set_item("search_mode", search_mode)?;
+    }
+    // if any(results.values()): state["search_results"] = results
+    if any_value_truthy(py, results)? {
+        out.set_item("search_results", results)?;
+    }
+    // if cursor_row is not None: state["cursor_row"] = cursor_row
+    if !cursor_row.is_none() {
+        out.set_item("cursor_row", cursor_row)?;
+    }
     Ok(out)
 }

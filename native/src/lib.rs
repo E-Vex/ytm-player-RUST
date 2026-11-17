@@ -341,7 +341,9 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // Recently Played history-merge engine (ui/pages/recently_played.py
     // equivalent): the account-history cache view model — occurrence
     // stamping/identity, accepted-play supersession, pending-play parking
-    // and merging, and the All-tab local+account composition.
+    // and merging, and the All-tab local+account composition — plus the
+    // page's own display tails: the empty-state copy pick, the footer
+    // line and the nav-state remember-gates.
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::recently_played::stamp_track,
         module
@@ -372,6 +374,18 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::recently_played::compose_all_rows,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::recently_played::recent_empty_message,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::recently_played::recent_footer_text,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::recently_played::recent_nav_state,
         module
     )?)?;
 
@@ -466,9 +480,9 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // categorization bucketing one unfiltered search into the four
     // panels, the result-item navigation decisions behind the panel
     // click handlers (the left-click context-page pick, the right-click
-    // item type, the subscribe-id and copy-link resolutions), and the
+    // item type, the subscribe-id and copy-link resolutions), the
     // music-mode worker merge classifying the gathered concurrent
-    // fetches.
+    // fetches, and the nav-state remember-gates behind get_nav_state.
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::search::format_search_result,
         module
@@ -511,6 +525,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::search::music_search_results,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::search::search_nav_state,
         module
     )?)?;
 
@@ -609,10 +627,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // song list into the top-songs table, plus the tail plan for the
     // chained remaining-tracks fetch — the worker-end failure copies
     // (the log-pointing failure message and the empty-load branch's
-    // message pick), and the header-button resolutions (the
-    // Add-to-Library id chain with its VL strip, the Start-Radio item
-    // assembly) plus the discography swap applying the fetched see-all
-    // lists.
+    // message pick), the artist album-list row assembly, and the
+    // header-button resolutions (the Add-to-Library id chain with its
+    // VL strip, the Start-Radio item assembly) plus the discography
+    // swap applying the fetched see-all lists.
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::context::album_header,
         module
@@ -655,6 +673,10 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         ui::pages::context::apply_expanded_sections,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::pages::context::artist_album_rows,
         module
     )?)?;
 
