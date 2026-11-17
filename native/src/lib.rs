@@ -140,6 +140,32 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         ui::sidebars::convert_lyric_lines,
         module
     )?)?;
+    // The synced view's scroll math — the current-line bisect behind
+    // _on_position_change (CPython's own < comparisons, so exotic
+    // timestamp objects steer the search like they steer the
+    // reference), the restyle pass behind the current_line_index
+    // reactive (which rows change class, to which of
+    // played/current/upcoming), the follow-mode verdict (still on, or
+    // resumed once the manual-scroll pause has lapsed — the monotonic
+    // clock and the resume delay travel in as plain values) and the
+    // centering target (max(0, y - viewport//2 + h//2)); the reactive
+    // gates, the geometry reads and the widget calls stay Python-side.
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::sidebars::lyrics_line_for_position,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::sidebars::lyrics_highlight_changes,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::sidebars::lyrics_scroll_follows,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::sidebars::lyrics_scroll_target,
+        module
+    )?)?;
 
     // Transliteration (ytm_player.utils.transliteration equivalent).
     module.add_function(pyo3::wrap_pyfunction!(
@@ -328,13 +354,20 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
 
     // Session-state validation engine (app/_session.py equivalent):
     // the one-pass validation + coercion of the parsed session.json
-    // object, plus the resume-point scan over the restored queue.
+    // object, the resume-point scan over the restored queue, and the
+    // resume-staging plan — which track comes back, from which
+    // playlist, at which position (the float() coercion through
+    // CPython's own call).
     module.add_function(pyo3::wrap_pyfunction!(
         app::session::coerce_session_state,
         module
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         app::session::find_track_index,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::session::resume_staging_plan,
         module
     )?)?;
 

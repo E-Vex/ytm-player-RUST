@@ -165,6 +165,71 @@ class TestResumeOnLaunch:
         assert h._pending_resume_video_id == "abc"
         assert h._pending_resume_position == 42.5
 
+    async def test_resume_stages_the_playlist_id(self, tmp_path, monkeypatch):
+        """The resume arm's playlist id lands on _active_library_playlist_id."""
+        h = _fresh_session_host()
+        h.settings.playback.resume_on_launch = True
+        sample_track = {"video_id": "abc", "title": "X", "duration": 200}
+        h.queue.tracks = [sample_track]
+        h.queue.current_track = sample_track
+        h._pending_resume_video_id = None
+
+        good = tmp_path / "session.json"
+        good.write_text(
+            '{"schema_version": 1, "volume": 80, "repeat": "off", '
+            '"shuffle": false, "queue_tracks": [{"video_id": "abc", "title": "X"}], '
+            '"queue_index": 0, "resume": {"video_id": "abc", "position": 10, '
+            '"playlist_id": "PL42"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("ytm_player.config.paths.SESSION_STATE_FILE", good, raising=False)
+        await h._restore_session_state()
+        assert h._active_library_playlist_id == "PL42"
+        assert h._pending_resume_position == 10.0
+
+    async def test_resume_rejected_position_stages_zero(self, tmp_path, monkeypatch):
+        """A position float() rejects stages 0.0, not a crash."""
+        h = _fresh_session_host()
+        h.settings.playback.resume_on_launch = True
+        sample_track = {"video_id": "abc", "title": "X", "duration": 200}
+        h.queue.tracks = [sample_track]
+        h.queue.current_track = sample_track
+        h._pending_resume_video_id = None
+        h._pending_resume_position = 0.0
+
+        good = tmp_path / "session.json"
+        good.write_text(
+            '{"schema_version": 1, "volume": 80, "repeat": "off", '
+            '"shuffle": false, "queue_tracks": [{"video_id": "abc", "title": "X"}], '
+            '"queue_index": 0, "resume": {"video_id": "abc", "position": "not a number"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("ytm_player.config.paths.SESSION_STATE_FILE", good, raising=False)
+        await h._restore_session_state()
+        assert h._pending_resume_video_id == "abc"
+        assert h._pending_resume_position == 0.0
+
+    async def test_resume_string_position_stages_parsed(self, tmp_path, monkeypatch):
+        """A numeric string position parses through float() — the
+        interpreter's own call, on whichever backend is loaded."""
+        h = _fresh_session_host()
+        h.settings.playback.resume_on_launch = True
+        sample_track = {"video_id": "abc", "title": "X", "duration": 200}
+        h.queue.tracks = [sample_track]
+        h.queue.current_track = sample_track
+        h._pending_resume_video_id = None
+
+        good = tmp_path / "session.json"
+        good.write_text(
+            '{"schema_version": 1, "volume": 80, "repeat": "off", '
+            '"shuffle": false, "queue_tracks": [{"video_id": "abc", "title": "X"}], '
+            '"queue_index": 0, "resume": {"video_id": "abc", "position": "42.5"}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("ytm_player.config.paths.SESSION_STATE_FILE", good, raising=False)
+        await h._restore_session_state()
+        assert h._pending_resume_position == 42.5
+
 
 def _save_session_host(tmp_path):
     """Build a session host wired up enough to call _save_session_state."""

@@ -1,6 +1,8 @@
 //! Native cores for `src/ytm_player/app/_session.py` — session state
-//! coercion (volume clamps) and track-index lookup.
+//! coercion (volume clamps), the track-index lookup and the
+//! resume-staging plan.
 
+use crate::ui::pages::browse::field_get;
 use crate::utils::formatting::normalize_tracks;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
@@ -291,4 +293,76 @@ pub(crate) fn find_track_index(
         }
     }
     Ok(None)
+}
+
+/// The resume-staging plan — the pure core of the resume arm
+/// `SessionMixin._restore_session_state` runs after the queue is
+/// restored: which track comes back, from which playlist, at which
+/// position.
+///
+/// A *resume* that is `None`, or whose `video_id` reads falsy (the
+/// `.get` protocol, `""` substituting only an absent key), stages
+/// nothing — the answer is `None`. Otherwise the plan carries the
+/// `video_id` and the `playlist_id` exactly as read (raw objects: the
+/// mixin assigns the playlist id straight onto
+/// `_active_library_playlist_id`, and the `find_track_index` scan
+/// compares the very video_id object), plus the `position` through
+/// CPython's own `float()` — `float("1.5")` parses, `float(True)` is
+/// 1.0, and anything the call rejects as a `TypeError` or `ValueError`
+/// (None, lists, non-numeric strings — the shapes the reference's own
+/// `except (TypeError, ValueError)` arm swallows) reads as 0.0;
+/// anything else (a huge int's `OverflowError`, say) escapes to the
+/// same caller the reference's would.
+///
+/// The plan reads the playlist id and position up front, where the
+/// reference reads them after the queue jump — the only observable
+/// difference is which side effects, if any, preceded a raising read on
+/// a dict subclass steering its own `get`; through the real flow the
+/// dict is `json.loads`'s own plain product and every read lands. The
+/// `resume_on_launch` settings gate stays in the mixin (its early
+/// return also marks the session restored).
+#[pyfunction]
+pub(crate) fn resume_staging_plan<'py>(
+    py: Python<'py>,
+    resume: &Bound<'py, PyAny>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    if resume.is_none() {
+        return Ok(None);
+    }
+    // resume.get("video_id", "") — the .get protocol, then the
+    // truthiness gate.
+    let empty = PyString::new(py, "").into_any();
+    let video_id = field_get(py, resume, "video_id", Some(empty))?;
+    if !video_id.is_truthy()? {
+        return Ok(None);
+    }
+    // resume.get("playlist_id") — no default, a missing key reads None.
+    let playlist_id = field_get(py, resume, "playlist_id", None)?;
+    // float(resume.get("position", 0)) — the read and the conversion
+    // both inside the reference's except (TypeError, ValueError) arm;
+    // the float is CPython's own, fetched from builtins at call time
+    // (the json.rs str() precedent), so string positions parse and
+    // exotic __float__ implementations run exactly as they would in
+    // the reference.
+    let zero = 0i64.into_pyobject(py)?.into_any();
+    let raw_position = field_get(py, resume, "position", Some(zero))?;
+    let position: f64 = match py
+        .import("builtins")?
+        .getattr("float")?
+        .call1((raw_position,))
+    {
+        Ok(value) => value.extract::<f64>()?,
+        Err(err)
+            if err.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+                || err.is_instance_of::<pyo3::exceptions::PyValueError>(py) =>
+        {
+            0.0
+        }
+        Err(err) => return Err(err),
+    };
+    let out = PyDict::new(py);
+    out.set_item("video_id", video_id)?;
+    out.set_item("playlist_id", playlist_id)?;
+    out.set_item("position", position)?;
+    Ok(Some(out))
 }

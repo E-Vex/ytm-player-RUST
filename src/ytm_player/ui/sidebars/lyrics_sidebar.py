@@ -109,6 +109,105 @@ def _compose_lyric_rows(
     return rows
 
 
+def _line_for_position(timestamps: Sequence[float], position: float) -> int:
+    """The current-line lookup — which synced line the play position has
+    reached.
+
+    The pure core of ``LyricsSidebar._on_position_change``:
+    ``bisect.bisect_right(timestamps, position) - 1``, the index of the
+    last line whose timestamp sits at or before *position* (the row the
+    view should be highlighting), or ``-1`` while nothing has been sung
+    yet. The comparison is the bisect's own ``<``, so an int or Decimal
+    timestamp steers the search and a str one raises the comparison's
+    own ``TypeError``; the hidden-sidebar gate and the
+    reactive-assignment gate stay in the sidebar.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.lyrics_line_for_position``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return bisect.bisect_right(timestamps, position) - 1
+
+
+def _highlight_changes(old_index: int, new_index: int, count: int) -> list[tuple[int, str]]:
+    """The highlight changes — which rows change class, and to what.
+
+    The pure core of ``LyricsSidebar._apply_line_highlight``, the
+    restyling pass behind the ``current_line_index`` reactive: the old
+    row, the new row and (when both rest at or after the top) every row
+    between them — the reference's set walk — each verdict decided per
+    row: ``lyrics-played`` before the new line, ``lyrics-current`` on
+    it, ``lyrics-upcoming`` after it. Out-of-range endpoints drop out
+    (the ``0 <= i < count`` bounds checks); an old equal to the new
+    answers nothing. The pairs come back in ascending index order — a
+    canonical spelling of the reference's set walk, whose order never
+    mattered because each row's verdict is decided per row; the
+    ``remove_class``/``add_class`` calls themselves stay in the sidebar.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.lyrics_highlight_changes``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if old_index == new_index:
+        return []
+    changed: set[int] = set()
+    if 0 <= old_index < count:
+        changed.add(old_index)
+    if 0 <= new_index < count:
+        changed.add(new_index)
+    if old_index >= 0 and new_index >= 0:
+        for i in range(min(old_index, new_index), max(old_index, new_index) + 1):
+            if 0 <= i < count:
+                changed.add(i)
+    pairs: list[tuple[int, str]] = []
+    for i in sorted(changed):
+        if i < new_index:
+            cls = "lyrics-played"
+        elif i == new_index:
+            cls = "lyrics-current"
+        else:
+            cls = "lyrics-upcoming"
+        pairs.append((i, cls))
+    return pairs
+
+
+def _scroll_follows(
+    auto_scroll: bool, last_manual_scroll: float, now: float, resume_delay: float
+) -> bool:
+    """The follow-mode verdict — still on, or back on once the
+    manual-scroll pause has lapsed.
+
+    The auto-scroll half of ``LyricsSidebar._apply_line_highlight``: a
+    follow already on stays on, and one paused by a manual scroll
+    resumes only once ``now - last_manual_scroll`` outlasts the resume
+    delay. The ``time.monotonic`` read and the delay constant stay at
+    the call site — the clock travels in as *now* and the module's
+    ``_AUTO_SCROLL_RESUME_DELAY`` as *resume_delay*, the single source
+    of truth on both backends.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.lyrics_scroll_follows``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return auto_scroll or (now - last_manual_scroll) > resume_delay
+
+
+def _scroll_target(widget_y: int, widget_h: int, viewport_h: int) -> int:
+    """The centering target — the y that puts the current line's middle
+    at the viewport's middle, never above the top.
+
+    ``_apply_line_highlight``'s scroll math:
+    ``max(0, widget_y - viewport_h // 2 + widget_h // 2)``. The
+    geometry reads and the ``scroll_to`` call stay in the sidebar's own
+    try.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.lyrics_scroll_target``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return max(0, widget_y - (viewport_h // 2) + (widget_h // 2))
+
+
 class _LyricLine(Static):
     """A single line of lyrics with state-driven styling."""
 
@@ -279,8 +378,9 @@ class LyricsSidebar(Widget):
                 return
             if not self._is_synced or not self._synced_lines:
                 return
-            idx = bisect.bisect_right(self._synced_timestamps, position)
-            new_index = idx - 1
+            # Which line the position has reached — the bisect resolves
+            # in the engine (Rust when the extension is built).
+            new_index = _line_for_position(self._synced_timestamps, position)
             if new_index != self.current_line_index:
                 self.current_line_index = new_index
         except Exception:
@@ -495,30 +595,24 @@ class LyricsSidebar(Widget):
         if old_index == new_index:
             return
 
-        changed = set()
-        if 0 <= old_index < len(self._lyric_widgets):
-            changed.add(old_index)
-        if 0 <= new_index < len(self._lyric_widgets):
-            changed.add(new_index)
-        if old_index >= 0 and new_index >= 0:
-            for i in range(min(old_index, new_index), max(old_index, new_index) + 1):
-                if 0 <= i < len(self._lyric_widgets):
-                    changed.add(i)
+        # Which rows change class, and to what — the whole restyle pass
+        # decided in one engine call (Rust when the extension is built);
+        # the widget calls stay here.
+        for index, cls in _highlight_changes(old_index, new_index, len(self._lyric_widgets)):
+            widget = self._lyric_widgets[index]
+            widget.remove_class("lyrics-played", "lyrics-current", "lyrics-upcoming")
+            widget.add_class(cls)
 
-        for i in changed:
-            w = self._lyric_widgets[i]
-            w.remove_class("lyrics-played", "lyrics-current", "lyrics-upcoming")
-            if i < new_index:
-                w.add_class("lyrics-played")
-            elif i == new_index:
-                w.add_class("lyrics-current")
-            else:
-                w.add_class("lyrics-upcoming")
-
-        now = time.monotonic()
-        if not self._auto_scroll:
-            if now - self._last_manual_scroll > _AUTO_SCROLL_RESUME_DELAY:
-                self._auto_scroll = True
+        # The follow-mode verdict — still on, or resumed once the
+        # manual-scroll pause has lapsed — decided in the engine and
+        # assigned here, exactly the flip the reference performs in
+        # place (the clock and the delay constant travel in as values).
+        self._auto_scroll = _scroll_follows(
+            self._auto_scroll,
+            self._last_manual_scroll,
+            time.monotonic(),
+            _AUTO_SCROLL_RESUME_DELAY,
+        )
 
         if self._auto_scroll and 0 <= new_index < len(self._lyric_widgets):
             widget = self._lyric_widgets[new_index]
@@ -527,9 +621,10 @@ class LyricsSidebar(Widget):
                 widget_y = widget.virtual_region.y
                 widget_h = widget.virtual_region.height
                 viewport_h = scroll.scrollable_content_region.height
-                # Center the current line vertically in the viewport
-                target_y = widget_y - (viewport_h // 2) + (widget_h // 2)
-                scroll.scroll_to(y=max(0, target_y), animate=True)
+                # Center the current line vertically in the viewport —
+                # the target math resolves in the engine (Rust when the
+                # extension is built).
+                scroll.scroll_to(y=_scroll_target(widget_y, widget_h, viewport_h), animate=True)
             except Exception:
                 logger.debug("Failed to auto-scroll lyrics sidebar", exc_info=True)
 
@@ -674,3 +769,47 @@ else:
         return _native_lyrics_view_rows(
             list(lines), wrap_width, transliteration_enabled, _get_reorder_enabled()
         )
+
+
+# The scroll math — the current-line bisect, the restyle pass, the
+# follow-mode verdict and the centering target — rebinds straight to
+# the native engines (the signatures already line up; only the row
+# engine above needs its wrapper for the cached bidi-mode verdict).
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        lyrics_line_for_position as _native_lyrics_line_for_position,
+    )
+except ImportError:
+    pass
+else:
+    _line_for_position = _native_lyrics_line_for_position  # type: ignore[assignment]
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        lyrics_highlight_changes as _native_lyrics_highlight_changes,
+    )
+except ImportError:
+    pass
+else:
+    _highlight_changes = _native_lyrics_highlight_changes  # type: ignore[assignment]
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        lyrics_scroll_follows as _native_lyrics_scroll_follows,
+    )
+except ImportError:
+    pass
+else:
+    _scroll_follows = _native_lyrics_scroll_follows  # type: ignore[assignment]
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        lyrics_scroll_target as _native_lyrics_scroll_target,
+    )
+except ImportError:
+    pass
+else:
+    _scroll_target = _native_lyrics_scroll_target  # type: ignore[assignment]

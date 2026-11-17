@@ -7,8 +7,10 @@ clamp and fallback decided before any app state is touched. The
 pure-Python reference lives in ``app/_session.py``; when the Rust
 extension is built the same engine runs natively
 (``_ytm_player_native.coerce_session_state``). ``find_track_index`` is
-the resume-point scan over the restored queue, with the same dual
-implementation.
+the resume-point scan over the restored queue, and
+``_resume_staging_plan`` is the resume arm's decision core — which
+track comes back, from which playlist, at which position — with the
+same dual implementation.
 
 The unit tests below assert the engine's contract on whichever backend is
 loaded. When the extension is built, the parity tests additionally compare
@@ -25,7 +27,11 @@ import sys
 
 import pytest
 
-from ytm_player.app._session import coerce_session_state, find_track_index
+from ytm_player.app._session import (
+    _resume_staging_plan,
+    coerce_session_state,
+    find_track_index,
+)
 
 try:
     from ytm_player.utils import _ytm_player_native  # type: ignore[import-not-found]
@@ -323,6 +329,84 @@ class TestFindTrackIndex:
         assert find_track_index([{"title": "none"}], "a") is None
 
 
+class TestResumeStagingPlan:
+    """The resume arm's decision core — which track comes back, from
+    which playlist, at which position (``None`` stages nothing).
+    """
+
+    def test_none_stages_nothing(self):
+        assert _resume_staging_plan(None) is None
+
+    @pytest.mark.parametrize("resume", [{}, {"video_id": ""}, {"video_id": None}, {"video_id": 0}])
+    def test_falsy_video_id_stages_nothing(self, resume):
+        assert _resume_staging_plan(resume) is None
+
+    def test_full_plan(self):
+        plan = _resume_staging_plan({"video_id": "abc", "position": 42.5, "playlist_id": "PL1"})
+        assert plan == {"video_id": "abc", "playlist_id": "PL1", "position": 42.5}
+
+    def test_missing_keys_read_their_defaults(self):
+        assert _resume_staging_plan({"video_id": "abc"}) == {
+            "video_id": "abc",
+            "playlist_id": None,
+            "position": 0.0,
+        }
+
+    def test_playlist_id_passes_through_raw(self):
+        # No isinstance gate: whatever object the read produced rides
+        # home, assigned straight onto _active_library_playlist_id.
+        plan = _resume_staging_plan({"video_id": "abc", "playlist_id": 5})
+        assert plan["playlist_id"] == 5
+
+    def test_video_id_passes_through_raw(self):
+        # Any truthy JSON value is the comparison operand for
+        # find_track_index — the very object it is.
+        plan = _resume_staging_plan({"video_id": 7})
+        assert plan["video_id"] == 7
+
+    @pytest.mark.parametrize(
+        ("stored", "expected"),
+        [
+            (42, 42.0),
+            (42.5, 42.5),
+            ("42.5", 42.5),
+            (" 7 ", 7.0),
+            ("1_000", 1000.0),
+            (True, 1.0),
+            (False, 0.0),
+        ],
+    )
+    def test_positions_parse_through_cpython_float(self, stored, expected):
+        # float() parses strings (whitespace and underscores included)
+        # and bools count as numbers — the interpreter's own call, on
+        # whichever backend is loaded.
+        plan = _resume_staging_plan({"video_id": "a", "position": stored})
+        assert plan["position"] == expected
+
+    @pytest.mark.parametrize("stored", [None, "nope", "", [1], {"s": 1}, "12abc"])
+    def test_rejected_positions_read_zero(self, stored):
+        # TypeError / ValueError — the reference's own except arm.
+        plan = _resume_staging_plan({"video_id": "a", "position": stored})
+        assert plan["position"] == 0.0
+
+    def test_huge_int_position_escapes_like_the_reference(self):
+        # float(10**400) raises OverflowError, which is NOT one of the
+        # swallowed types — on either backend.
+        with pytest.raises(OverflowError):
+            _resume_staging_plan({"video_id": "a", "position": 10**400})
+
+    def test_dict_subclass_get_steers_the_reads(self):
+        class _Steered(dict):
+            def get(self, key, default=None):
+                return "steered" if key == "position" else super().get(key, default)
+
+        # The .get protocol: a subclass's own get steers the reads on
+        # both backends (the steered position string is float()-rejected
+        # to 0.0; the video_id read still lands).
+        plan = _resume_staging_plan(_Steered(video_id="abc"))
+        assert plan == {"video_id": "abc", "playlist_id": None, "position": 0.0}
+
+
 # ── Native / fallback parity ────────────────────────────────────────────
 #
 # Cases model session.json as json.loads produces it: dicts with str keys,
@@ -478,6 +562,34 @@ _PARITY_SCANS = [
     ([{"video_id": "夜に駆ける"}], "夜に駆ける"),
 ]
 
+# The resume dicts _resume_staging_plan decides over — json.loads shapes
+# plus the falsy/absent edges that stage nothing.
+_PARITY_PLANS = [
+    None,
+    {},
+    {"video_id": ""},
+    {"video_id": None},
+    {"video_id": 0},
+    {"video_id": "abc"},
+    {"video_id": "abc", "position": 42.5, "playlist_id": "PL1"},
+    {"video_id": "abc", "position": 42, "playlist_id": None},
+    {"video_id": "abc", "position": "42.5"},
+    {"video_id": "abc", "position": " 7 "},
+    {"video_id": "abc", "position": "1_000"},
+    {"video_id": "abc", "position": True},
+    {"video_id": "abc", "position": False},
+    {"video_id": "abc", "position": None},
+    {"video_id": "abc", "position": "nope"},
+    {"video_id": "abc", "position": ""},
+    {"video_id": "abc", "position": [1]},
+    {"video_id": "abc", "position": {"s": 1}},
+    {"video_id": "abc", "position": "12abc"},
+    {"video_id": 7, "playlist_id": 9},
+    {"video_id": "abc", "playlist_id": ""},
+    {"playlist_id": "PL"},
+    {"video_id": "夜に駆ける", "position": 12.5, "playlist_id": "PL9"},
+]
+
 # The child interpreter runs this program with the case list on stdin and
 # prints the reference engine's outputs as JSON.
 _CHILD_PROG = """
@@ -486,7 +598,7 @@ import sys
 
 sys.modules['ytm_player.utils._ytm_player_native'] = None
 
-from ytm_player.app._session import coerce_session_state, find_track_index
+from ytm_player.app._session import _resume_staging_plan, coerce_session_state, find_track_index
 
 payload = json.load(sys.stdin)
 states = [
@@ -497,14 +609,15 @@ indices = [
     find_track_index(tracks, video_id)
     for tracks, video_id in payload["scans"]
 ]
-json.dump({"states": states, "indices": indices}, sys.stdout)
+plans = [_resume_staging_plan(resume) for resume in payload["plans"]]
+json.dump({"states": states, "indices": indices, "plans": plans}, sys.stdout)
 """
 
 
 def _fallback_results() -> dict:
     """Run the pure-Python reference engine over the parity cases in a
     child interpreter with the native extension import blocked."""
-    payload = json.dumps({"states": _PARITY_STATES, "scans": _PARITY_SCANS})
+    payload = json.dumps({"states": _PARITY_STATES, "scans": _PARITY_SCANS, "plans": _PARITY_PLANS})
     out = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
         input=payload,
@@ -542,10 +655,26 @@ class TestNativeParity:
             )
 
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_resume_staging_plan_matches_fallback(self):
+        fallback = _fallback_results()
+        for i, resume in enumerate(_PARITY_PLANS):
+            native = _resume_staging_plan(resume)
+            assert native == fallback["plans"][i], (
+                f"native and fallback resume plans differ for {resume!r}:\n"
+                f"{native!r}\n{fallback['plans'][i]!r}"
+            )
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     def test_nan_volume_matches_fallback(self):
         """NaN clamps to 100 on both backends (json.dumps writes NaN, so
         this case can't live in the JSON-shared matrix above)."""
-        payload = json.dumps({"states": [[{"volume": float("nan")}, 80]], "scans": []})
+        payload = json.dumps(
+            {
+                "states": [[{"volume": float("nan")}, 80]],
+                "scans": [],
+                "plans": [],
+            }
+        )
         out = subprocess.run(
             [sys.executable, "-c", _CHILD_PROG],
             input=payload,

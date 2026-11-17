@@ -1,7 +1,8 @@
 //! Native cores for the sidebars — `ui/sidebars/lyrics_sidebar.py`
-//! (LRC parsing, lyric-line conversion and view rows) and
-//! `ui/sidebars/playlist_sidebar.py` (panel items, count updates,
-//! auto-select matching).
+//! (LRC parsing, lyric-line conversion, view rows and the scroll math —
+//! the current-line lookup, the highlight changes, the follow verdict
+//! and the centering target) and `ui/sidebars/playlist_sidebar.py`
+//! (panel items, count updates, auto-select matching).
 
 use crate::app::keys::nd_digit_value;
 use crate::ui::pages::browse::field_get;
@@ -39,8 +40,8 @@ use std::sync::LazyLock;
 /// non-string raises the reference's own `TypeError`. Only the cached
 /// `bidi_mode` verdict stays Python-side, travelling in as a plain
 /// bool read once per rebuild instead of once per line; the widget
-/// mounting, the class lists and the auto-scroll stay Python-side in
-/// the sidebar.
+/// mounting and the class/scroll calls stay Python-side in the sidebar
+/// (the scroll engines below decide what they apply).
 #[pyfunction]
 #[pyo3(signature = (lines, wrap_width, transliteration_enabled, reorder_enabled))]
 pub(crate) fn lyrics_view_rows(
@@ -531,4 +532,154 @@ pub(crate) fn parse_synced_lyrics(raw: &str) -> Vec<(f64, String)> {
     // the reference's ordering exactly.
     lines.sort_by(|a, b| a.0.total_cmp(&b.0));
     lines
+}
+
+// ---------------------------------------------------------------------------
+// Synced-view scroll math
+// ---------------------------------------------------------------------------
+
+/// The current-line lookup — the pure core of `LyricsSidebar`'s
+/// `_on_position_change` position handler: which synced line the play
+/// position has reached.
+///
+/// `bisect.bisect_right(timestamps, position) - 1` — the index of the
+/// last line whose timestamp sits at or before *position* (the row the
+/// view should be highlighting), or `-1` while nothing has been sung
+/// yet. Every comparison is CPython's own `<` — the very comparison the
+/// reference's `bisect_right` applies (`position < timestamps[mid]`),
+/// so an int or `Decimal` timestamp steers the search exactly like it
+/// steers the reference and a str timestamp raises the comparison's own
+/// `TypeError`. A NaN position falls through to the last line: every
+/// NaN comparison is false, so the search keeps walking right — the
+/// same verdict the reference's own bisect reaches. The hidden-sidebar
+/// gate and the reactive-assignment gate stay in the sidebar.
+#[pyfunction]
+pub(crate) fn lyrics_line_for_position(
+    timestamps: &Bound<'_, PyList>,
+    position: &Bound<'_, PyAny>,
+) -> PyResult<isize> {
+    // The CPython bisect_right loop, verbatim: `x < a[mid]` narrows
+    // left, anything else (>=, or a pair whose `<` answers false)
+    // narrows right.
+    let mut lo: isize = 0;
+    let mut hi: isize = timestamps.len() as isize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let item = timestamps.get_item(mid as usize)?;
+        if position.lt(&item)? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok(lo - 1)
+}
+
+/// The highlight changes — the pure core of `_apply_line_highlight`,
+/// the restyling pass behind the `current_line_index` reactive: which
+/// rows change class, and to what.
+///
+/// The old row, the new row and (when both rest at or after the top)
+/// every row between them — the reference's set walk — each verdict
+/// decided per row: `lyrics-played` before the new line,
+/// `lyrics-current` on it, `lyrics-upcoming` after it. Out-of-range
+/// endpoints drop out of the answer the same way the reference's
+/// `0 <= i < len(widgets)` bounds checks drop them, and an old equal
+/// to the new answers nothing (the reference returns before any
+/// restyle; the caller keeps that early gate, which also gates the
+/// follow-mode verdict below). The pairs come back in ascending index
+/// order — a canonical spelling of the reference's set walk, whose
+/// order never mattered because each row's verdict is decided per row
+/// — so the two backends compare case for case; the `remove_class` /
+/// `add_class` calls themselves stay in the sidebar.
+#[pyfunction]
+pub(crate) fn lyrics_highlight_changes(
+    old_index: i64,
+    new_index: i64,
+    count: i64,
+) -> Vec<(i64, String)> {
+    // The reference's `if old_index == new_index: return` gate — the
+    // no-transition answer is empty.
+    if old_index == new_index {
+        return Vec::new();
+    }
+    // `0 <= i < count` — the bounds check every added index passes.
+    let in_range = |i: i64| i >= 0 && i < count;
+    let mut changed: Vec<i64> = Vec::new();
+    if in_range(old_index) {
+        changed.push(old_index);
+    }
+    if in_range(new_index) {
+        changed.push(new_index);
+    }
+    if old_index >= 0 && new_index >= 0 {
+        // The reference's range(min, max + 1) walk, clamped to the
+        // widget bounds up front — only the in-range middle span is
+        // ever iterated, so an absurd index pair costs the same as a
+        // neighbouring one (the reference would walk the whole span;
+        // the kept indices are identical).
+        let start = old_index.min(new_index).max(0);
+        let end = old_index.max(new_index).min(count.saturating_sub(1));
+        if start <= end {
+            changed.extend(start..=end);
+        }
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    changed
+        .into_iter()
+        .map(|i| {
+            let class = if i < new_index {
+                "lyrics-played"
+            } else if i == new_index {
+                "lyrics-current"
+            } else {
+                "lyrics-upcoming"
+            };
+            (i, class.to_string())
+        })
+        .collect()
+}
+
+/// The follow-mode verdict — the auto-scroll half of
+/// `_apply_line_highlight`: still on, or back on once the
+/// manual-scroll pause has lapsed.
+///
+/// The reference's two nested gates as one decision: a follow already
+/// on stays on, and one paused by a manual scroll resumes only once
+/// `now - last_manual_scroll` outlasts the resume delay. The
+/// `time.monotonic` read and the delay constant stay Python-side — the
+/// clock travels in as *now* and the module's
+/// `_AUTO_SCROLL_RESUME_DELAY` as *resume_delay*, the single source of
+/// truth on both backends. The caller assigns the verdict back onto
+/// the paused flag, exactly the flip the reference performs in place.
+#[pyfunction]
+pub(crate) fn lyrics_scroll_follows(
+    auto_scroll: bool,
+    last_manual_scroll: f64,
+    now: f64,
+    resume_delay: f64,
+) -> bool {
+    // `if not auto_scroll: if now - last > delay: auto_scroll = True`
+    // — the effective flag once the resume rule has had its say (the
+    // float subtraction and comparison are the reference's own f64
+    // arithmetic; the clock never spells NaN).
+    auto_scroll || (now - last_manual_scroll) > resume_delay
+}
+
+/// The centering target — `_apply_line_highlight`'s scroll math: the y
+/// that puts the current line's middle at the viewport's middle, never
+/// above the top.
+///
+/// `max(0, widget_y - viewport_h // 2 + widget_h // 2)` — floor
+/// division throughout (negative operands included), the geometry
+/// reads and the `scroll_to` call staying in the sidebar's own try.
+/// The arithmetic saturates at the i64 rails where the reference's
+/// bignums would not, far above any geometry Textual reports.
+#[pyfunction]
+pub(crate) fn lyrics_scroll_target(widget_y: i64, widget_h: i64, viewport_h: i64) -> i64 {
+    widget_y
+        .saturating_sub(viewport_h.div_euclid(2))
+        .saturating_add(widget_h.div_euclid(2))
+        .max(0)
 }

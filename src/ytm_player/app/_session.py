@@ -7,7 +7,9 @@ implemented by the Rust extension
 (``_ytm_player_native.coerce_session_state``) when it is built and by
 the pure-Python transcription below otherwise. ``SessionMixin`` only
 *applies* the coerced values. ``find_track_index`` is the resume-point
-scan over the restored queue, with the same dual implementation.
+scan over the restored queue, and ``_resume_staging_plan`` is the
+resume arm's decision core — which track comes back, from which
+playlist, at which position — with the same dual implementation.
 """
 
 from __future__ import annotations
@@ -136,6 +138,38 @@ def find_track_index(tracks: Iterable[dict], video_id: object) -> int | None:
     return None
 
 
+def _resume_staging_plan(resume: dict | None) -> dict | None:
+    """The resume-staging plan — which track comes back, from which
+    playlist, at which position.
+
+    The pure core of the resume arm ``_restore_session_state`` runs
+    after the queue is restored. A *resume* that is ``None``, or whose
+    ``video_id`` reads falsy (``""`` substituting only an absent key),
+    stages nothing — the answer is ``None``. Otherwise the plan carries
+    the ``video_id`` and the ``playlist_id`` exactly as read (raw
+    objects — the mixin assigns the playlist id straight onto
+    ``_active_library_playlist_id``, and the ``find_track_index`` scan
+    compares the very video_id object), plus the ``position`` through
+    CPython's own ``float()`` — anything the call rejects as a
+    ``TypeError`` or ``ValueError`` (None, lists, non-numeric strings)
+    reads as ``0.0``, the reference's own ``except`` arm.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.resume_staging_plan``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if resume is None:
+        return None
+    video_id = resume.get("video_id", "")
+    if not video_id:
+        return None
+    try:
+        position = float(resume.get("position", 0))
+    except (TypeError, ValueError):
+        position = 0.0
+    return {"video_id": video_id, "playlist_id": resume.get("playlist_id"), "position": position}
+
+
 class SessionMixin(YTMHostBase):
     """Persist and restore session state (volume, shuffle, repeat, queue, etc.)."""
 
@@ -255,39 +289,38 @@ class SessionMixin(YTMHostBase):
             self._session_restored = True
             return
 
-        if resume is not None:
-            video_id = resume.get("video_id", "")
-            if video_id:
-                self._active_library_playlist_id = resume.get("playlist_id")
-                # Find the track in the restored queue and jump to it.
-                idx = find_track_index(self.queue.tracks, video_id)
+        # Stage the resume point — which track, from which playlist, at
+        # which position — decided by the engine (Rust when the
+        # extension is built) and applied here.
+        plan = _resume_staging_plan(resume)
+        if plan is not None:
+            self._active_library_playlist_id = plan["playlist_id"]
+            # Find the track in the restored queue and jump to it.
+            idx = find_track_index(self.queue.tracks, plan["video_id"])
 
-                if idx is not None:
-                    self.queue.jump_to(idx)
-                    track = self.queue.current_track
-                    if track:
-                        # Stash the resume target so the first play_track
-                        # call for this video_id seeks to the saved position.
-                        self._pending_resume_video_id = video_id
-                        try:
-                            self._pending_resume_position = float(resume.get("position", 0))
-                        except (TypeError, ValueError):
-                            self._pending_resume_position = 0.0
-                        # Show the track + saved position in the UI without
-                        # starting playback.
-                        try:
-                            bar = self.query_one("#playback-bar", PlaybackBar)
-                            bar.update_track(track)
-                            bar.update_playback_state(is_playing=False, is_paused=False)
-                            bar.update_position(
-                                self._pending_resume_position,
-                                track.get("duration") or 0,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Playback bar not ready during resume restore",
-                                exc_info=True,
-                            )
+            if idx is not None:
+                self.queue.jump_to(idx)
+                track = self.queue.current_track
+                if track:
+                    # Stash the resume target so the first play_track
+                    # call for this video_id seeks to the saved position.
+                    self._pending_resume_video_id = plan["video_id"]
+                    self._pending_resume_position = plan["position"]
+                    # Show the track + saved position in the UI without
+                    # starting playback.
+                    try:
+                        bar = self.query_one("#playback-bar", PlaybackBar)
+                        bar.update_track(track)
+                        bar.update_playback_state(is_playing=False, is_paused=False)
+                        bar.update_position(
+                            self._pending_resume_position,
+                            track.get("duration") or 0,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Playback bar not ready during resume restore",
+                            exc_info=True,
+                        )
 
         self._session_restored = True
 
@@ -396,8 +429,12 @@ try:
     from ytm_player.utils._ytm_player_native import (
         find_track_index as _native_find_track_index,
     )
+    from ytm_player.utils._ytm_player_native import (
+        resume_staging_plan as _native_resume_staging_plan,
+    )
 except ImportError:
     pass
 else:
     coerce_session_state = _native_coerce_session_state  # type: ignore[assignment]
     find_track_index = _native_find_track_index  # type: ignore[assignment]
+    _resume_staging_plan = _native_resume_staging_plan  # type: ignore[assignment]
