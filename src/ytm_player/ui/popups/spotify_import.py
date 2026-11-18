@@ -8,8 +8,14 @@ The per-track match verdict is resolved by the import service's
 ``_match_classification`` engine — implemented by the Rust extension
 (``_ytm_player_native.spotify_match_classification``) when it is built,
 by the pure-Python transcription in ``services/spotify_import.py``
-otherwise. The popup owns only the search call and the display arms
-around it; no Python-side scoring/sort/threshold walk remains here.
+otherwise. The popup's own flow decisions — the multi-mode setup
+cascade, the URL-slot validation, the summary counting, the
+create-batch toast verdict, the per-track result arm and the
+candidate-row assembly — resolve through the same dual-implemented
+engines below (``_ytm_player_native.spotify_import_*``); the popup
+owns the search calls, the widget arms and the notifications around
+them. No Python-side scoring/sort/threshold walk, counting pass or
+flow-verdict cascade remains here.
 """
 
 from __future__ import annotations
@@ -47,6 +53,202 @@ _URL_PATTERN = re.compile(r"https?://open\.spotify\.com/(playlist|album)/")
 _ADD_BATCH_SIZE = 100
 
 
+def _candidate_row(idx: int, candidate: dict) -> str:
+    """Compose one disambiguation-candidate row — ``_CandidateItem``'s
+    label line.
+
+    The title through the mapping's own ``get`` with the ``"?"``
+    default, the artist through the formatting module's
+    ``extract_artist`` engine, the duration through the candidate's
+    ``duration`` field with the ``duration_seconds`` fallback — the
+    ``m:ss`` rendering only for a truthy seconds read — and the whole
+    line composed through the reference's f-string shape.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_candidate_row``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = candidate.get("title", "?")
+    artist_str = extract_artist(candidate)
+    dur = candidate.get("duration", "")
+    if not dur:
+        dur_sec = candidate.get("duration_seconds", 0)
+        dur = f"{dur_sec // 60}:{dur_sec % 60:02d}" if dur_sec else ""
+    dur_part = f" ({dur})" if dur else ""
+    return f"  {idx}. {title} — {artist_str}{dur_part}"
+
+
+def _result_symbol(match_type: object) -> tuple[str, str]:
+    """The per-track result-row arm — ``(symbol, theme field)``.
+
+    The display decision both import workers render per matched
+    track: an ``EXACT`` verdict the check arm styled ``success``, a
+    ``MULTIPLE`` one the question arm styled ``warning``, anything
+    else the cross arm styled ``error``. The comparison is CPython's
+    own ``==`` against the service's ``MatchType`` members (imported
+    at call time, the workers' own lazy-import pattern); the theme
+    colour read stays at the call site — ``getattr(get_theme(),
+    field)``.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_result_symbol``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.services.spotify_import import MatchType
+
+    if match_type == MatchType.EXACT:
+        return "✓", "success"
+    if match_type == MatchType.MULTIPLE:
+        return "?", "warning"
+    return "✗", "error"
+
+
+def _multi_part_verdict(name: str, count_str: str) -> tuple[str, int]:
+    """The multi-mode setup verdict — ``_generate_url_inputs``' gates.
+
+    The validation cascade in the reference's own order: a falsy
+    (stripped) *name* answers ``"name"``; a *count_str* CPython's own
+    ``int()`` rejects as a ``ValueError`` answers ``"count"`` (a
+    ``TypeError`` escapes to the caller, exactly like the reference's
+    ``except ValueError``-only arm); a parsed count outside ``2..=20``
+    answers ``"range"``; otherwise the verdict is ``"ok"``. Only the
+    ``"ok"`` verdict's count means anything — the failed gates answer
+    ``0`` — and the widget reads (the strip), the notifications, the
+    focus moves and the input mounting stay at the call site.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_multi_part_verdict``) when it
+    is built; this pure-Python transcription is the fallback otherwise.
+    """
+    if not name:
+        return "name", 0
+    try:
+        count = int(count_str)
+    except ValueError:
+        return "count", 0
+    if count < 2 or count > 20:
+        return "range", 0
+    return "ok", count
+
+
+def _url_slot_verdict(values: list[str | None]) -> tuple[str, int] | None:
+    """The multi-mode URL-slot verdict — ``_start_multi_import``'s pass.
+
+    The first slot (0-based) whose value is bad, with the badness kind:
+    a ``None`` entry — the caller's widget read failed, a missing URL
+    input — answers ``("missing", slot)``; a value the module's
+    ``_URL_PATTERN`` does not match answers ``("invalid", slot)``. A
+    list whose every slot reads a valid playlist/album URL answers
+    ``None``. The widget reads and the notify/focus moves stay at the
+    call site.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_url_slot_verdict``) when it
+    is built; this pure-Python transcription is the fallback otherwise.
+    """
+    for slot, value in enumerate(values):
+        if value is None:
+            return "missing", slot
+        if not _URL_PATTERN.match(value):
+            return "invalid", slot
+    return None
+
+
+def _summary_stats(results: list) -> dict:
+    """The summary assembly — ``_show_summary``'s counting pass.
+
+    The three bucket counts (``exact`` / ``fuzzy`` / ``not_found``,
+    each a full pass comparing ``r.match_type`` through CPython's own
+    ``==`` against the service's ``MatchType`` members, imported at
+    call time), the ``total``, the ``matched`` sum, and the video-id
+    collection — ``get_video_id(r.selected)`` for every result whose
+    ``selected`` is not ``None``, the empty ids dropped — exactly the
+    reference's two-pass walk. The status-line rendering and the
+    widget arms stay at the call site.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_summary_stats``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    from ytm_player.services.spotify_import import MatchType, get_video_id
+
+    exact = sum(1 for r in results if r.match_type == MatchType.EXACT)
+    fuzzy = sum(1 for r in results if r.match_type == MatchType.MULTIPLE)
+    not_found = sum(1 for r in results if r.match_type == MatchType.NONE)
+    total = len(results)
+    video_ids = [get_video_id(r.selected) for r in results if r.selected is not None]
+    video_ids = [vid for vid in video_ids if vid]
+    return {
+        "exact": exact,
+        "fuzzy": fuzzy,
+        "not_found": not_found,
+        "total": total,
+        "matched": exact + fuzzy,
+        "video_ids": video_ids,
+    }
+
+
+def _batch_outcome(batch_results: list, batch_sizes: list[int]) -> dict:
+    """The create-batch toast verdict — ``_do_create``'s final arm.
+
+    Which toast the create flow raises once every add-batch settled:
+    no failed batches answers ``"success"``; every batch failed and
+    they all failed the same way answers ``"all_failed_single"`` with
+    that failure kind riding along (the very first failing result
+    object, the reference's ``failure_kinds[0]``); every batch failed
+    for more than one reason answers ``"all_failed_mixed"``; anything
+    between answers ``"partial"`` with the accepted-track total and the
+    failed-batch count. The message wording, the
+    ``mutation_failure_suffix`` call and the notify calls stay at the
+    call site.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_batch_outcome``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    failed_batches = 0
+    failure_kinds: list = []
+    added_total = 0
+    for result, size in zip(batch_results, batch_sizes):
+        if result == "success":
+            added_total += size
+        else:
+            failed_batches += 1
+            failure_kinds.append(result)
+    batches = len(batch_results)
+    if failed_batches == 0:
+        return {
+            "verdict": "success",
+            "kind": None,
+            "added_total": added_total,
+            "failed_batches": 0,
+            "batches": batches,
+        }
+    if failed_batches == batches:
+        if len(set(failure_kinds)) == 1:
+            return {
+                "verdict": "all_failed_single",
+                "kind": failure_kinds[0],
+                "added_total": added_total,
+                "failed_batches": failed_batches,
+                "batches": batches,
+            }
+        return {
+            "verdict": "all_failed_mixed",
+            "kind": None,
+            "added_total": added_total,
+            "failed_batches": failed_batches,
+            "batches": batches,
+        }
+    return {
+        "verdict": "partial",
+        "kind": None,
+        "added_total": added_total,
+        "failed_batches": failed_batches,
+        "batches": batches,
+    }
+
+
 # ── Shared list items for results ────────────────────────────────────
 
 
@@ -72,14 +274,7 @@ class _CandidateItem(ListItem):
         self._index = index
 
     def compose(self) -> ComposeResult:
-        title = self.candidate.get("title", "?")
-        artist_str = extract_artist(self.candidate)
-        dur = self.candidate.get("duration", "")
-        if not dur:
-            dur_sec = self.candidate.get("duration_seconds", 0)
-            dur = f"{dur_sec // 60}:{dur_sec % 60:02d}" if dur_sec else ""
-        dur_part = f" ({dur})" if dur else ""
-        yield Label(f"  {self._index}. {title} — {artist_str}{dur_part}")
+        yield Label(_candidate_row(self._index, self.candidate))
 
 
 class _SkipItem(ListItem):
@@ -379,7 +574,9 @@ class SpotifyImportPopup(BasePopup[str | None]):
         # ── Single mode ──
         if input_id == "si-url-input" and self._phase == "url":
             url = event.value.strip()
-            if not _URL_PATTERN.match(url):
+            # The single-URL gate is the one-slot URL pass — the same
+            # engine the multi-mode start run validates through.
+            if _url_slot_verdict([url]) is not None:
                 self.notify("Invalid Spotify URL", severity="warning")
                 return
             self._pending_url = url
@@ -479,9 +676,9 @@ class SpotifyImportPopup(BasePopup[str | None]):
         from ytm_player.services.spotify_import import (
             MatchResult,
             MatchType,
+            _bucket_results,
             _match_classification,
             extract_spotify_tracks,
-            get_video_id,
             has_spotify_creds,
         )
 
@@ -528,12 +725,10 @@ class SpotifyImportPopup(BasePopup[str | None]):
             results.append(result)
 
             display_text = f"{sp_track['name']} — {sp_track['artist']}"
-            if result.match_type == MatchType.EXACT:
-                results_list.append(_ResultItem("✓", get_theme().success, display_text))
-            elif result.match_type == MatchType.MULTIPLE:
-                results_list.append(_ResultItem("?", get_theme().warning, display_text))
-            else:
-                results_list.append(_ResultItem("✗", get_theme().error, display_text))
+            symbol, theme_field = _result_symbol(result.match_type)
+            results_list.append(
+                _ResultItem(symbol, getattr(get_theme(), theme_field), display_text)
+            )
 
             progress_bar.update(progress=i)
             status.update(f"Matching on YouTube Music... ({i}/{total})")
@@ -541,13 +736,13 @@ class SpotifyImportPopup(BasePopup[str | None]):
 
         self._results = results
 
-        uncertain = [r for r in results if r.match_type == MatchType.MULTIPLE]
+        uncertain = _bucket_results(results, MatchType.MULTIPLE)
         if uncertain:
             self._disambig_queue = uncertain
             self._disambig_index = 0
             self._start_disambiguation()
         else:
-            self._show_summary(MatchType, get_video_id)
+            self._show_summary()
 
     # ── Multi mode: setup ────────────────────────────────────────────
 
@@ -556,18 +751,15 @@ class SpotifyImportPopup(BasePopup[str | None]):
         name = self.query_one("#si-multi-name-input", Input).value.strip()
         count_str = self.query_one("#si-multi-count-input", Input).value.strip()
 
-        if not name:
+        verdict, count = _multi_part_verdict(name, count_str)
+        if verdict == "name":
             self.notify("Enter a combined playlist name", severity="warning")
             self.query_one("#si-multi-name-input", Input).focus()
             return
-
-        try:
-            count = int(count_str)
-        except ValueError:
+        if verdict == "count":
             self.notify("Enter a valid number", severity="warning")
             return
-
-        if count < 2 or count > 20:
+        if verdict == "range":
             self.notify("Number of parts must be between 2 and 20", severity="warning")
             return
 
@@ -605,20 +797,27 @@ class SpotifyImportPopup(BasePopup[str | None]):
 
     def _start_multi_import(self) -> None:
         """Validate all URLs and begin multi-playlist import."""
-        urls: list[str] = []
+        # Read every slot's value first (a missing input reads None);
+        # the engine then decides which slot — if any — is bad.
+        values: list[str | None] = []
         for i in range(self._multi_url_count):
             try:
                 url_input = self.query_one(f"#si-multi-url-{i}", Input)
-                url = url_input.value.strip()
+                values.append(url_input.value.strip())
             except Exception:
-                self.notify(f"Missing URL input #{i + 1}", severity="error")
-                return
+                values.append(None)
 
-            if not _URL_PATTERN.match(url):
-                self.notify(f"Invalid Spotify URL in slot {i + 1}", severity="warning")
-                url_input.focus()
-                return
-            urls.append(url)
+        bad = _url_slot_verdict(values)
+        if bad is not None:
+            kind, slot = bad
+            if kind == "missing":
+                self.notify(f"Missing URL input #{slot + 1}", severity="error")
+            else:
+                self.notify(f"Invalid Spotify URL in slot {slot + 1}", severity="warning")
+                self.query_one(f"#si-multi-url-{slot}", Input).focus()
+            return
+
+        urls: list[str] = [value for value in values if value is not None]
 
         self._multi_urls = urls
         self._all_results = []
@@ -642,9 +841,9 @@ class SpotifyImportPopup(BasePopup[str | None]):
         """Process all split playlists sequentially."""
         from ytm_player.services.spotify_import import (
             MatchType,
+            _bucket_results,
             _match_classification,
             extract_spotify_tracks,
-            get_video_id,
         )
 
         status = self.query_one("#si-status", Static)
@@ -698,12 +897,10 @@ class SpotifyImportPopup(BasePopup[str | None]):
                 self._all_results.append(result)
 
                 display_text = f"{sp_track['name']} — {sp_track['artist']}"
-                if result.match_type == MatchType.EXACT:
-                    results_list.append(_ResultItem("✓", get_theme().success, display_text))
-                elif result.match_type == MatchType.MULTIPLE:
-                    results_list.append(_ResultItem("?", get_theme().warning, display_text))
-                else:
-                    results_list.append(_ResultItem("✗", get_theme().error, display_text))
+                symbol, theme_field = _result_symbol(result.match_type)
+                results_list.append(
+                    _ResultItem(symbol, getattr(get_theme(), theme_field), display_text)
+                )
 
                 progress_bar.update(progress=i)
                 status.update(
@@ -715,13 +912,13 @@ class SpotifyImportPopup(BasePopup[str | None]):
         self._results = self._all_results
 
         # Check for uncertain matches.
-        uncertain = [r for r in self._results if r.match_type == MatchType.MULTIPLE]
+        uncertain = _bucket_results(self._results, MatchType.MULTIPLE)
         if uncertain:
             self._disambig_queue = uncertain
             self._disambig_index = 0
             self._start_disambiguation()
         else:
-            self._show_summary(MatchType, get_video_id)
+            self._show_summary()
 
     # ── Shared: disambiguation ───────────────────────────────────────
 
@@ -734,9 +931,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
     def _show_current_disambig(self) -> None:
         """Display candidates for the current uncertain match."""
         if self._disambig_index >= len(self._disambig_queue):
-            from ytm_player.services.spotify_import import MatchType, get_video_id
-
-            self._show_summary(MatchType, get_video_id)
+            self._show_summary()
             return
 
         result = self._disambig_queue[self._disambig_index]
@@ -786,19 +981,15 @@ class SpotifyImportPopup(BasePopup[str | None]):
 
     # ── Shared: summary + create ─────────────────────────────────────
 
-    def _show_summary(self, MatchType, get_video_id) -> None:
+    def _show_summary(self) -> None:
         """Display summary stats and playlist name input."""
         self._phase = "summary"
 
-        exact = sum(1 for r in self._results if r.match_type == MatchType.EXACT)
-        fuzzy = sum(1 for r in self._results if r.match_type == MatchType.MULTIPLE)
-        not_found = sum(1 for r in self._results if r.match_type == MatchType.NONE)
-        total = len(self._results)
+        stats = _summary_stats(self._results)
+        not_found = stats["not_found"]
+        total = stats["total"]
 
-        self._video_ids = [
-            get_video_id(r.selected) for r in self._results if r.selected is not None
-        ]
-        self._video_ids = [vid for vid in self._video_ids if vid]
+        self._video_ids = stats["video_ids"]
 
         results_list = self.query_one("#si-results", ListView)
         results_list.clear()
@@ -807,7 +998,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
         self.query_one("#si-progress", ProgressBar).display = False
 
         status = self.query_one("#si-status", Static)
-        matched = exact + fuzzy
+        matched = stats["matched"]
         status.update(f"{matched} matched, {not_found} skipped/not found ({total} total)")
 
         if not self._video_ids:
@@ -860,15 +1051,10 @@ class SpotifyImportPopup(BasePopup[str | None]):
 
                 from ytm_player.services.ytmusic import mutation_failure_suffix
 
-                failed_batches = 0
-                # Track distinct failure kinds across batches so the final
-                # toast can surface the dominant cause (e.g. all batches
-                # 401 → "session expired"; mixed → fall back to generic).
-                failure_kinds: list[str] = []
-                # Cumulative count of tracks the server actually accepted.
-                # Computed by summing len(batch) on success so the final
-                # batch's partial size is reported accurately.
-                added_total = 0
+                # The per-batch answers, collected in batch order; the
+                # engine then decides which toast the outcome deserves.
+                batch_results: list = []
+                batch_sizes = [len(batch) for batch in batches]
                 for batch_idx, batch in enumerate(batches, 1):
                     status.update(
                         f"Adding tracks... ({min(batch_idx * _ADD_BATCH_SIZE, total_ids)}/{total_ids})"
@@ -880,41 +1066,34 @@ class SpotifyImportPopup(BasePopup[str | None]):
                     result = await ytmusic_svc.add_playlist_items(
                         playlist_id, batch, duplicates=True
                     )
-                    if result == "success":
-                        added_total += len(batch)
-                    else:
-                        failed_batches += 1
-                        failure_kinds.append(result)
+                    batch_results.append(result)
                     if len(batches) > 1:
                         progress_bar.update(progress=batch_idx)
 
-                if failed_batches == 0:
+                outcome = _batch_outcome(batch_results, batch_sizes)
+                if outcome["verdict"] == "success":
                     self.notify(
                         f"Created '{name}' with {total_ids} tracks",
                         severity="information",
                     )
-                elif failed_batches == len(batches):
-                    # All batches failed. If they all failed for the same
-                    # reason, surface that. Otherwise stay generic.
-                    unique_kinds = set(failure_kinds)
-                    if len(unique_kinds) == 1:
-                        kind = failure_kinds[0]
-                        suffix = mutation_failure_suffix(kind)  # type: ignore[arg-type]
-                        self.notify(
-                            f"Created '{name}' but couldn't add any tracks — {suffix}",
-                            severity="error",
-                        )
-                    else:
-                        self.notify(
-                            f"Created '{name}' but failed to add any tracks "
-                            f"({len(batches)} batch(es) rejected)",
-                            severity="error",
-                        )
+                elif outcome["verdict"] == "all_failed_single":
+                    # All batches failed the same way — surface that.
+                    suffix = mutation_failure_suffix(outcome["kind"])  # type: ignore[arg-type]
+                    self.notify(
+                        f"Created '{name}' but couldn't add any tracks — {suffix}",
+                        severity="error",
+                    )
+                elif outcome["verdict"] == "all_failed_mixed":
+                    self.notify(
+                        f"Created '{name}' but failed to add any tracks "
+                        f"({outcome['batches']} batch(es) rejected)",
+                        severity="error",
+                    )
                 else:
                     self.notify(
                         f"Created '{name}' with partial track set: "
-                        f"{added_total}/{total_ids} added "
-                        f"({failed_batches} batch(es) failed)",
+                        f"{outcome['added_total']}/{total_ids} added "
+                        f"({outcome['failed_batches']} batch(es) failed)",
                         severity="warning",
                     )
             self.dismiss(playlist_id)
@@ -935,3 +1114,39 @@ class SpotifyImportPopup(BasePopup[str | None]):
         for worker in self.workers:
             worker.cancel()
         self.dismiss(self._CANCEL_RESULT)
+
+
+# ── Native (Rust/PyO3) overrides, if available ──────────────────────────
+# The Rust extension implements the same flow engines; these bindings replace
+# the pure-Python definitions above when the extension is importable.  The
+# rebinding must happen AFTER the definitions above — assigning the native
+# functions any earlier would be clobbered by the ``def`` statements.
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        spotify_import_batch_outcome as _native_spotify_import_batch_outcome,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_candidate_row as _native_spotify_import_candidate_row,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_multi_part_verdict as _native_spotify_import_multi_part_verdict,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_result_symbol as _native_spotify_import_result_symbol,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_summary_stats as _native_spotify_import_summary_stats,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_url_slot_verdict as _native_spotify_import_url_slot_verdict,
+    )
+except ImportError:
+    pass
+else:
+    _candidate_row = _native_spotify_import_candidate_row  # type: ignore[assignment]
+    _result_symbol = _native_spotify_import_result_symbol  # type: ignore[assignment]
+    _multi_part_verdict = _native_spotify_import_multi_part_verdict  # type: ignore[assignment]
+    _url_slot_verdict = _native_spotify_import_url_slot_verdict  # type: ignore[assignment]
+    _summary_stats = _native_spotify_import_summary_stats  # type: ignore[assignment]
+    _batch_outcome = _native_spotify_import_batch_outcome  # type: ignore[assignment]

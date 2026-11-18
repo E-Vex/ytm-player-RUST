@@ -1566,6 +1566,41 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // same string objects.
     module.add_function(pyo3::wrap_pyfunction!(ui::popups::filter_regions, module)?)?;
 
+    // Spotify-import popup flow engines (ui/popups/spotify_import.py
+    // equivalent): the import flow's remaining decision cores — the
+    // disambiguation candidate row, the per-track result arm (symbol +
+    // theme field), the multi-mode setup cascade (name gate, int()
+    // parse, 2..=20 range), the URL-slot validation (first missing or
+    // invalid slot), the summary counting (the three bucket counts,
+    // the matched sum, the video-id collection) and the create-batch
+    // toast verdict (success / all-failed-single-kind / all-failed-mixed
+    // / partial). The search calls, the widget arms and the
+    // notifications stay Python-side in the popup.
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_candidate_row,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_result_symbol,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_multi_part_verdict,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_url_slot_verdict,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_summary_stats,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_batch_outcome,
+        module
+    )?)?;
+
     // Terminal orientation gate (utils/terminal.py equivalent): the
     // aspect-ratio verdict behind the horizontal/vertical layout
     // decision — the rows-zero guard, the true division and the 2.3

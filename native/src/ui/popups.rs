@@ -1,18 +1,28 @@
 //! Native cores for the popups — `ui/popups/actions.py`,
 //! `confirm_popup.py`, `input_popup.py`, `create_playlist_popup.py`,
-//! `playlist_picker.py` and `country_picker.py`: action lists, chrome
-//! labels, picker sorting/rows and region filtering.
+//! `playlist_picker.py`, `country_picker.py` and `spotify_import.py`:
+//! action lists, chrome labels, picker sorting/rows, region filtering
+//! and the import flow's decision cores (the candidate row, the result
+//! arm, the multi-part verdict, the URL-slot verdict, the summary
+//! stats and the create-batch outcome).
 
 use crate::services::ytmusic::py_unpack_pair;
 use crate::ui::pages::browse::field_get;
 use crate::ui::pages::browse::first_truthy_get;
 use crate::ui::pages::help::py_capitalize;
 use crate::ui::sidebars::python_strip;
+use crate::utils::formatting::extract_artist;
+use crate::utils::formatting::get_video_id;
 use crate::utils::pycompat::py_isspace;
+use crate::utils::pycompat::py_str;
 use crate::utils::pycompat::python_lower;
+use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use regex::Regex;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
 // Actions-popup menu builder
@@ -570,4 +580,349 @@ pub(crate) fn filter_regions<'py>(
         }
     }
     Ok(PyTuple::new(py, kept)?.into_any())
+}
+
+// ---------------------------------------------------------------------------
+// Spotify-import popup flow engines (mirrors ui/popups/spotify_import.py)
+// ---------------------------------------------------------------------------
+
+/// The URL prefix the popup's `_URL_PATTERN` accepts — the literal the
+/// reference's `re.match` anchors at position 0 (every dot escaped, so
+/// the pattern spells a literal `http(s)://open.spotify.com/` plus the
+/// `playlist`/`album` alternation and the trailing slash).
+static SPOTIFY_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"https?://open\.spotify\.com/(playlist|album)/").expect("valid spotify url regex")
+});
+
+/// The disambiguation-candidate row — the pure core of `_CandidateItem`'s
+/// label line from `ui/popups/spotify_import.py`.
+///
+/// Mirrors the reference arm for arm: the title through the mapping's
+/// own `get` with the `"?"` default (the fresh object interpolated
+/// through the str protocol, like the reference's f-string); the artist
+/// through the shared `extract_artist` engine (the candidate is a dict
+/// in the ported contract — a non-dict reports a TypeError where the
+/// fallback would read it duck-typed, the `spotify_summarize_results`
+/// precedent); the duration through the candidate's `duration` field,
+/// a falsy read falling to `duration_seconds` and its `m:ss`
+/// rendering — floor division and modulo throughout (Python's int
+/// semantics, negative operands included), the seconds width
+/// zero-padded, the rendering only for a truthy seconds read — and the
+/// ` ({dur})` part exactly when the (possibly rebound) duration reads
+/// truthy. The row composes through the reference's f-string shape.
+#[pyfunction]
+#[pyo3(signature = (idx, candidate))]
+pub(crate) fn spotify_import_candidate_row<'py>(
+    py: Python<'py>,
+    idx: i64,
+    candidate: &Bound<'py, PyAny>,
+) -> PyResult<String> {
+    // title = candidate.get("title", "?")
+    let question = PyString::new(py, "?").into_any();
+    let title = field_get(py, candidate, "title", Some(question))?;
+    let title_s = py_str(&title)?;
+    // artist_str = extract_artist(candidate)
+    let dict = candidate
+        .downcast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("candidate must be a dict"))?;
+    let artist = extract_artist(py, dict);
+    // dur = candidate.get("duration", "") — the truthiness gate below
+    // is the reference's own `if not dur`, on the raw object.
+    let empty = PyString::new(py, "").into_any();
+    let dur = field_get(py, candidate, "duration", Some(empty))?;
+    let (dur_display, dur_truthy) = if dur.is_truthy()? {
+        // The f-string's rendering of the original read.
+        (py_str(&dur)?, true)
+    } else {
+        // dur_sec = candidate.get("duration_seconds", 0)
+        let zero: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+        let dur_sec = field_get(py, candidate, "duration_seconds", Some(zero))?;
+        if dur_sec.is_truthy()? {
+            // f"{dur_sec // 60}:{dur_sec % 60:02d}"
+            let seconds: i64 = dur_sec.extract()?;
+            (
+                format!("{}:{:02}", seconds.div_euclid(60), seconds.rem_euclid(60)),
+                true,
+            )
+        } else {
+            (String::new(), false)
+        }
+    };
+    // dur_part = f" ({dur})" if dur else "" — the gate on the rebound
+    // duration: truthy when the original read was, or when the seconds
+    // fallback rendered.
+    let dur_part = if dur_truthy {
+        format!(" ({dur_display})")
+    } else {
+        String::new()
+    };
+    Ok(format!("  {idx}. {title_s} — {artist}{dur_part}"))
+}
+
+/// The per-track result-row arm — the display decision both import
+/// workers render per matched track (`_result_symbol` from
+/// `ui/popups/spotify_import.py`): an `EXACT` verdict the check arm
+/// styled `success`, a `MULTIPLE` one the question arm styled
+/// `warning`, anything else the cross arm styled `error`.
+///
+/// The comparisons run through CPython's own `==` against the
+/// service's `MatchType` members, imported at call time — the workers'
+/// own lazy-import pattern, so exotic `__eq__` implementations steer
+/// the arm exactly like they steer the reference's `if` chain. The
+/// theme colour read (`getattr(get_theme(), field)`) stays at the call
+/// site, on both backends.
+#[pyfunction]
+pub(crate) fn spotify_import_result_symbol(
+    py: Python,
+    match_type: &Bound<'_, PyAny>,
+) -> PyResult<(&'static str, &'static str)> {
+    let si = py.import("ytm_player.services.spotify_import")?;
+    let members = si.getattr("MatchType")?;
+    if match_type.eq(&members.getattr("EXACT")?)? {
+        return Ok(("✓", "success"));
+    }
+    if match_type.eq(&members.getattr("MULTIPLE")?)? {
+        return Ok(("?", "warning"));
+    }
+    Ok(("✗", "error"))
+}
+
+/// The multi-mode setup verdict — the validation cascade behind
+/// `_generate_url_inputs` in `ui/popups/spotify_import.py`.
+///
+/// The reference's gates in the reference's order: a falsy (stripped)
+/// *name* answers `("name", 0)`; a *count_str* CPython's own `int()`
+/// rejects as a `ValueError` answers `("count", 0)` — only the
+/// `ValueError` arm degrades, a `TypeError` (or anything else the call
+/// raises) escaping to the caller exactly like the reference's
+/// `except ValueError`-only arm; a parsed count outside `2..=20`
+/// answers `("range", 0)` — the comparisons against fresh int objects
+/// through the interpreter's own rich comparisons, so a huge parsed
+/// count (a bignum in the reference) reads out-of-range exactly like
+/// it would there; otherwise the verdict is `("ok", count)` with the
+/// very int object the `int()` call produced. Only the `("ok", …)`
+/// verdict's count means anything — the failed gates answer the int
+/// `0` — and the widget reads (the strips), the notifications, the
+/// focus moves and the input mounting stay at the call site.
+#[pyfunction]
+#[pyo3(signature = (name, count_str))]
+pub(crate) fn spotify_import_multi_part_verdict<'py>(
+    py: Python<'py>,
+    name: &str,
+    count_str: &str,
+) -> PyResult<(String, Bound<'py, PyAny>)> {
+    if name.is_empty() {
+        let zero: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+        return Ok(("name".to_string(), zero));
+    }
+    // int(count_str) — fetched from builtins at call time (the json.rs
+    // str() precedent), so underscores, whitespace and Unicode digits
+    // parse exactly like they do in the reference.
+    let count = match py.import("builtins")?.getattr("int")?.call1((count_str,)) {
+        Ok(value) => value,
+        Err(err) if err.is_instance_of::<PyValueError>(py) => {
+            let zero: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+            return Ok(("count".to_string(), zero));
+        }
+        Err(err) => return Err(err),
+    };
+    // count < 2 or count > 20
+    let two: Bound<'py, PyAny> = 2i64.into_pyobject(py)?.into_any();
+    let twenty: Bound<'py, PyAny> = 20i64.into_pyobject(py)?.into_any();
+    if count.lt(&two)? || count.gt(&twenty)? {
+        let zero: Bound<'py, PyAny> = 0i64.into_pyobject(py)?.into_any();
+        return Ok(("range".to_string(), zero));
+    }
+    Ok(("ok".to_string(), count))
+}
+
+/// The multi-mode URL-slot verdict — the validation pass behind
+/// `_start_multi_import` in `ui/popups/spotify_import.py`.
+///
+/// The first slot (0-based) whose value is bad, with the badness kind:
+/// a `None` entry — the caller's widget read failed, a missing URL
+/// input — answers `("missing", slot)`; a value the module's
+/// `_URL_PATTERN` does not match answers `("invalid", slot)`. A list
+/// whose every slot reads a valid playlist/album URL answers `None`.
+/// The pattern check is the reference's own `re.match` — a match
+/// anchored at position 0, spelt by the literal the module compiles.
+/// The widget reads and the notify/focus moves stay at the call site.
+#[pyfunction]
+#[pyo3(signature = (values))]
+pub(crate) fn spotify_import_url_slot_verdict(
+    values: Vec<Option<String>>,
+) -> Option<(String, usize)> {
+    for (slot, value) in values.iter().enumerate() {
+        match value {
+            None => return Some(("missing".to_string(), slot)),
+            Some(url) => {
+                if !SPOTIFY_URL_RE.is_match_at(url, 0) {
+                    return Some(("invalid".to_string(), slot));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The summary assembly — the counting pass behind `_show_summary` in
+/// `ui/popups/spotify_import.py`.
+///
+/// Mirrors the reference's own pass order: the three bucket counts —
+/// `exact`, then `fuzzy`, then `not_found` — each a full walk comparing
+/// `r.match_type` through CPython's own `==` against the service's
+/// `MatchType` members (imported at call time, the workers' own
+/// lazy-import pattern); the `total`; then the video-id collection —
+/// `get_video_id(r.selected)` for every result whose `selected` is not
+/// `None` (the identity gate, not truthiness — a falsy-but-present
+/// selection still reads its id), the empty ids dropped. The id read is
+/// the shared `get_video_id` engine; a selected candidate that is not
+/// a dict is outside the ported contract and reports a TypeError
+/// rather than the fallback's duck-typed read (the
+/// `spotify_summarize_results` precedent). The answer carries
+/// `matched` — the reference's `exact + fuzzy` — so the wrapper
+/// interpolates the status line from it; the widget arms stay at the
+/// call site.
+#[pyfunction]
+#[pyo3(signature = (results))]
+pub(crate) fn spotify_import_summary_stats<'py>(
+    py: Python<'py>,
+    results: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let si = py.import("ytm_player.services.spotify_import")?;
+    let members = si.getattr("MatchType")?;
+    let exact_member = members.getattr("EXACT")?;
+    let multiple_member = members.getattr("MULTIPLE")?;
+    let none_member = members.getattr("NONE")?;
+
+    let mut n_exact = 0i64;
+    for r in results.try_iter()? {
+        let r = r?;
+        if r.getattr("match_type")?.eq(&exact_member)? {
+            n_exact += 1;
+        }
+    }
+    let mut n_fuzzy = 0i64;
+    for r in results.try_iter()? {
+        let r = r?;
+        if r.getattr("match_type")?.eq(&multiple_member)? {
+            n_fuzzy += 1;
+        }
+    }
+    let mut n_not_found = 0i64;
+    for r in results.try_iter()? {
+        let r = r?;
+        if r.getattr("match_type")?.eq(&none_member)? {
+            n_not_found += 1;
+        }
+    }
+    let total = results.len()? as i64;
+
+    // video_ids = [get_video_id(r.selected) for r in results
+    //              if r.selected is not None]
+    // video_ids = [vid for vid in video_ids if vid]
+    let video_ids = PyList::empty(py);
+    for r in results.try_iter()? {
+        let r = r?;
+        let selected = r.getattr("selected")?;
+        if !selected.is_none() {
+            let dict = selected
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("selected candidate must be a dict"))?;
+            let vid = get_video_id(py, dict);
+            if !vid.is_empty() {
+                video_ids.append(vid)?;
+            }
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("exact", n_exact)?;
+    out.set_item("fuzzy", n_fuzzy)?;
+    out.set_item("not_found", n_not_found)?;
+    out.set_item("total", total)?;
+    out.set_item("matched", n_exact + n_fuzzy)?;
+    out.set_item("video_ids", video_ids)?;
+    Ok(out)
+}
+
+/// The create-batch toast verdict — the final arm behind `_do_create`
+/// in `ui/popups/spotify_import.py`: which toast the create flow
+/// raises once every add-batch settled.
+///
+/// The per-batch answers, collected in batch order with their sizes,
+/// walk the reference's own accounting: a batch answer comparing equal
+/// (CPython's own `==`) to `"success"` adds its size to the accepted
+/// total; anything else is a failed batch and its answer rides into
+/// the failure kinds. No failed batches answers `"success"`; every
+/// batch failed and all failed the same way — the reference's
+/// `set(failure_kinds)` of size one, spelt here as every kind
+/// comparing equal to the first — answers `"all_failed_single"` with
+/// that kind riding along as the very first failing object (the
+/// reference's `failure_kinds[0]`); every batch failed for more than
+/// one reason answers `"all_failed_mixed"`; anything between answers
+/// `"partial"`. The two lists are the caller's own paired collection
+/// (equal lengths by construction); the message wording, the
+/// `mutation_failure_suffix` call and the notify calls stay at the
+/// call site.
+#[pyfunction]
+#[pyo3(signature = (batch_results, batch_sizes))]
+pub(crate) fn spotify_import_batch_outcome<'py>(
+    py: Python<'py>,
+    batch_results: &Bound<'py, PyList>,
+    batch_sizes: &Bound<'py, PyList>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let success = PyString::new(py, "success");
+    let mut failed_batches = 0i64;
+    let mut added_total = 0i64;
+    let mut failure_kinds: Vec<Bound<'py, PyAny>> = Vec::new();
+    for (idx, result) in batch_results.iter().enumerate() {
+        let size: i64 = batch_sizes.get_item(idx)?.extract()?;
+        if result.eq(&success)? {
+            added_total += size;
+        } else {
+            failed_batches += 1;
+            failure_kinds.push(result.clone());
+        }
+    }
+    let batches = batch_results.len() as i64;
+
+    let (verdict, kind) = if failed_batches == 0 {
+        ("success", None)
+    } else if failed_batches == batches {
+        // set(failure_kinds) of size one — spelt as every kind
+        // comparing equal to the first (the set's own membership rule
+        // for strings); the kind rides home as the very first failing
+        // object, the reference's failure_kinds[0].
+        let first = &failure_kinds[0];
+        let mut all_same = true;
+        for k in &failure_kinds {
+            if !k.eq(first)? {
+                all_same = false;
+                break;
+            }
+        }
+        if all_same {
+            ("all_failed_single", Some(failure_kinds[0].clone()))
+        } else {
+            ("all_failed_mixed", None)
+        }
+    } else {
+        ("partial", None)
+    };
+
+    let out = PyDict::new(py);
+    out.set_item("verdict", verdict)?;
+    match kind {
+        Some(k) => {
+            out.set_item("kind", k)?;
+        }
+        None => {
+            out.set_item("kind", py.None())?;
+        }
+    }
+    out.set_item("added_total", added_total)?;
+    out.set_item("failed_batches", failed_batches)?;
+    out.set_item("batches", batches)?;
+    Ok(out)
 }
