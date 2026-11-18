@@ -10,12 +10,14 @@ The per-track match verdict is resolved by the import service's
 by the pure-Python transcription in ``services/spotify_import.py``
 otherwise. The popup's own flow decisions — the multi-mode setup
 cascade, the URL-slot validation, the summary counting, the
-create-batch toast verdict, the per-track result arm and the
-candidate-row assembly — resolve through the same dual-implemented
+create-batch toast verdict, the per-track result arm, the
+candidate-row assembly, the input-submission routing table and the
+tab-activation phase gate — resolve through the same dual-implemented
 engines below (``_ytm_player_native.spotify_import_*``); the popup
 owns the search calls, the widget arms and the notifications around
-them. No Python-side scoring/sort/threshold walk, counting pass or
-flow-verdict cascade remains here.
+them. No Python-side scoring/sort/threshold walk, counting pass,
+flow-verdict cascade, input-routing arm or tab-phase gate remains
+here.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -246,6 +249,123 @@ def _batch_outcome(batch_results: list, batch_sizes: list[int]) -> dict:
         "added_total": added_total,
         "failed_batches": failed_batches,
         "batches": batches,
+    }
+
+
+def _input_route(input_id: str | None, phase: str, value: str) -> dict[str, Any] | None:
+    """The input-submission routing table — ``on_input_submitted``'s core.
+
+    Which action an (input-id × phase) pair routes to, with each
+    claimed arm's own data decision inside, in the reference's own arm
+    order: ``si-url-input`` in the ``url`` phase answers the
+    single-URL submit — the value stripped, the one-slot URL pass (the
+    same ``_url_slot_verdict`` engine the multi-mode start run
+    validates through) deciding between ``"invalid_url"`` (the
+    caller's warning toast) and ``"start_single"`` with the stripped
+    url riding along; ``si-cred-secret-input``/``si-cred-id-input`` in
+    the ``creds`` phase answer ``"save_creds"``/``"focus_secret"``;
+    ``si-name-input`` in the ``summary`` phase answers the name submit
+    — the value stripped, an empty name answering ``"name_empty"``
+    (the caller's warning toast), anything else ``"create_playlist"``
+    with the stripped name riding along; ``si-multi-count-input``/
+    ``si-multi-name-input`` in the ``multi_setup`` phase answer
+    ``"generate_urls"``/``"focus_count"``; and an id starting with
+    ``si-multi-url-`` in the ``multi_urls`` phase answers the advance
+    walk — the index suffix (every ``si-multi-url-`` occurrence
+    replaced away) through CPython's own ``int()``, a ``ValueError``
+    answering nothing (the reference's ``except ValueError: pass``),
+    a parse answering ``"advance_url"`` with the next input's id
+    (``si-multi-url-{idx + 1}``). Anything else — an unknown id, a
+    known id in the wrong phase, a widget with no id at all — answers
+    ``None``: the reference's chain has no else, so an unmatched
+    submission simply does nothing. The notifications, the focus
+    moves, the worker starts and the start-button fallback (the focus
+    query failing) stay at the call site.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_input_route``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    # ── Single mode ──
+    if input_id == "si-url-input" and phase == "url":
+        url = value.strip()
+        # The single-URL gate is the one-slot URL pass — the same
+        # engine the multi-mode start run validates through.
+        if _url_slot_verdict([url]) is not None:
+            return {"action": "invalid_url"}
+        return {"action": "start_single", "url": url}
+
+    if input_id == "si-cred-secret-input" and phase == "creds":
+        return {"action": "save_creds"}
+
+    if input_id == "si-cred-id-input" and phase == "creds":
+        return {"action": "focus_secret"}
+
+    if input_id == "si-name-input" and phase == "summary":
+        name = value.strip()
+        if not name:
+            return {"action": "name_empty"}
+        return {"action": "create_playlist", "name": name}
+
+    # ── Multi mode ──
+    if input_id == "si-multi-count-input" and phase == "multi_setup":
+        return {"action": "generate_urls"}
+
+    if input_id == "si-multi-name-input" and phase == "multi_setup":
+        return {"action": "focus_count"}
+
+    if input_id and input_id.startswith("si-multi-url-") and phase == "multi_urls":
+        idx_str = input_id.replace("si-multi-url-", "")
+        try:
+            next_idx = int(idx_str) + 1
+        except ValueError:
+            return None
+        return {"action": "advance_url", "next_id": f"si-multi-url-{next_idx}"}
+
+    return None
+
+
+def _tab_activation(tab_id: str) -> dict[str, Any]:
+    """The tab-activation phase gate — ``_activate_tab``'s core.
+
+    Which phase and which widget arms activating a tab produces:
+    ``tab_id == "single"`` answers the single arm — the phase resets
+    to ``"url"``, the single pane shows (the multi pane hides — the
+    two displays are always complementary), the status line reads the
+    paste prompt, the focus moves to the URL input and no multi state
+    resets. Anything else — the multi tab, but also the separator or
+    any other label the reference's ``else`` would catch — answers the
+    multi arm: the phase resets to ``"multi_setup"``, the multi pane
+    shows (the single pane hides), the status line reads the
+    split-playlist instructions, the focus moves to the combined-name
+    input and the caller resets the multi setup (the URL container
+    emptied, the start button hidden, the name and count inputs
+    cleared). The mode assignment, the tab-label class toggles, the
+    display writes, the status update, the resets and the focus moves
+    stay at the call site, applied from the answer in the reference's
+    own order.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.spotify_import_tab_activation``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if tab_id == "single":
+        return {
+            "phase": "url",
+            "single_visible": True,
+            "status": "Paste a Spotify playlist URL and press Enter",
+            "focus": "#si-url-input",
+            "reset_multi": False,
+        }
+    return {
+        "phase": "multi_setup",
+        "single_visible": False,
+        "status": (
+            "Split your 100+ track playlist into chunks of ≤100 on Spotify,\n"
+            "then enter the combined name and number of parts below"
+        ),
+        "focus": "#si-multi-name-input",
+        "reset_multi": True,
     }
 
 
@@ -532,6 +652,7 @@ class SpotifyImportPopup(BasePopup[str | None]):
     def _activate_tab(self, tab_id: str) -> None:
         """Switch between single and multi mode."""
         self._mode = tab_id
+        arms = _tab_activation(tab_id)
 
         # Update tab labels.
         for tab in self.query(_TabLabel):
@@ -540,83 +661,58 @@ class SpotifyImportPopup(BasePopup[str | None]):
             elif tab.tab_id != "separator":
                 tab.remove_class("active")
 
-        # Toggle content visibility.
+        # The engine's phase gate, applied in the reference's own order.
+        self._phase = arms["phase"]
         single_content = self.query_one("#si-single-content")
         multi_content = self.query_one("#si-multi-content")
-        status = self.query_one("#si-status", Static)
+        single_content.display = arms["single_visible"]
+        multi_content.display = not arms["single_visible"]
+        self.query_one("#si-status", Static).update(arms["status"])
 
-        if tab_id == "single":
-            self._phase = "url"
-            single_content.display = True
-            multi_content.display = False
-            status.update("Paste a Spotify playlist URL and press Enter")
-            self.query_one("#si-url-input", Input).focus()
-        else:
-            self._phase = "multi_setup"
-            single_content.display = False
-            multi_content.display = True
-            status.update(
-                "Split your 100+ track playlist into chunks of ≤100 on Spotify,\n"
-                "then enter the combined name and number of parts below"
-            )
+        if arms["reset_multi"]:
             # Reset multi URL container.
             self.query_one("#si-multi-urls", VerticalScroll).remove_children()
             self.query_one("#si-multi-start-btn").remove_class("visible")
             self.query_one("#si-multi-name-input", Input).value = ""
             self.query_one("#si-multi-count-input", Input).value = ""
-            self.query_one("#si-multi-name-input", Input).focus()
+        self.query_one(arms["focus"], Input).focus()
 
     # ── Input handling ───────────────────────────────────────────────
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        input_id = event.input.id
+        route = _input_route(event.input.id, self._phase, event.value)
+        if route is None:
+            return
+        action = route["action"]
 
         # ── Single mode ──
-        if input_id == "si-url-input" and self._phase == "url":
-            url = event.value.strip()
-            # The single-URL gate is the one-slot URL pass — the same
-            # engine the multi-mode start run validates through.
-            if _url_slot_verdict([url]) is not None:
-                self.notify("Invalid Spotify URL", severity="warning")
-                return
+        if action == "invalid_url":
+            self.notify("Invalid Spotify URL", severity="warning")
+        elif action == "start_single":
+            url = route["url"]
             self._pending_url = url
             self._start_single_import(url)
-
-        elif input_id == "si-cred-secret-input" and self._phase == "creds":
+        elif action == "save_creds":
             self._save_creds_and_retry()
-
-        elif input_id == "si-cred-id-input" and self._phase == "creds":
+        elif action == "focus_secret":
             self.query_one("#si-cred-secret-input", Input).focus()
-
-        elif input_id == "si-name-input" and self._phase == "summary":
-            name = event.value.strip()
-            if not name:
-                self.notify("Name cannot be empty", severity="warning")
-                return
-            self._create_playlist(name)
+        elif action == "name_empty":
+            self.notify("Name cannot be empty", severity="warning")
+        elif action == "create_playlist":
+            self._create_playlist(route["name"])
 
         # ── Multi mode ──
-        elif input_id == "si-multi-count-input" and self._phase == "multi_setup":
+        elif action == "generate_urls":
             self._generate_url_inputs()
-
-        elif input_id == "si-multi-name-input" and self._phase == "multi_setup":
-            # Tab to count field.
+        elif action == "focus_count":
             self.query_one("#si-multi-count-input", Input).focus()
-
-        elif input_id and input_id.startswith("si-multi-url-") and self._phase == "multi_urls":
+        elif action == "advance_url":
             # User pressed Enter on a URL input — move to next or start.
-            idx_str = input_id.replace("si-multi-url-", "")
             try:
-                idx = int(idx_str)
-                next_idx = idx + 1
-                next_id = f"si-multi-url-{next_idx}"
-                try:
-                    self.query_one(f"#{next_id}", Input).focus()
-                except Exception:
-                    # Last input — focus the start button.
-                    self.query_one("#si-multi-start-btn", Button).focus()
-            except ValueError:
-                pass
+                self.query_one(f"#{route['next_id']}", Input).focus()
+            except Exception:
+                # Last input — focus the start button.
+                self.query_one("#si-multi-start-btn", Button).focus()
 
     # ── Single mode: credential setup ────────────────────────────────
 
@@ -1130,6 +1226,9 @@ try:
         spotify_import_candidate_row as _native_spotify_import_candidate_row,
     )
     from ytm_player.utils._ytm_player_native import (
+        spotify_import_input_route as _native_spotify_import_input_route,
+    )
+    from ytm_player.utils._ytm_player_native import (
         spotify_import_multi_part_verdict as _native_spotify_import_multi_part_verdict,
     )
     from ytm_player.utils._ytm_player_native import (
@@ -1137,6 +1236,9 @@ try:
     )
     from ytm_player.utils._ytm_player_native import (
         spotify_import_summary_stats as _native_spotify_import_summary_stats,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        spotify_import_tab_activation as _native_spotify_import_tab_activation,
     )
     from ytm_player.utils._ytm_player_native import (
         spotify_import_url_slot_verdict as _native_spotify_import_url_slot_verdict,
@@ -1150,3 +1252,5 @@ else:
     _url_slot_verdict = _native_spotify_import_url_slot_verdict  # type: ignore[assignment]
     _summary_stats = _native_spotify_import_summary_stats  # type: ignore[assignment]
     _batch_outcome = _native_spotify_import_batch_outcome  # type: ignore[assignment]
+    _input_route = _native_spotify_import_input_route  # type: ignore[assignment]
+    _tab_activation = _native_spotify_import_tab_activation  # type: ignore[assignment]

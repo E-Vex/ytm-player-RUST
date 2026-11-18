@@ -1,12 +1,15 @@
 """Tests for the Spotify-import popup's flow engines.
 
-Six engines behind ``SpotifyImportPopup``'s import flow: the
+Eight engines behind ``SpotifyImportPopup``'s import flow: the
 disambiguation candidate row (``_candidate_row`` — ``_CandidateItem``'s
 label line), the per-track result arm (``_result_symbol`` — the ✓/?/✗
 verdict both workers render), the multi-mode setup cascade
 (``_multi_part_verdict``), the URL-slot validation
-(``_url_slot_verdict``), the summary counting (``_summary_stats``) and
-the create-batch toast verdict (``_batch_outcome``). The pure-Python
+(``_url_slot_verdict``), the summary counting (``_summary_stats``), the
+create-batch toast verdict (``_batch_outcome``), the input-submission
+routing table (``_input_route`` — input-id × phase → action, the
+URL/name strips and the advance arithmetic inside) and the
+tab-activation phase gate (``_tab_activation``). The pure-Python
 references live in ``ui/popups/spotify_import.py``; when the Rust
 extension is built the same engines run natively
 (``_ytm_player_native.spotify_import_*``). The uncertain-match bucket
@@ -20,8 +23,9 @@ compare the native engines against the pure-Python references (run in
 a child interpreter with the extension import blocked) case for case,
 so the two implementations cannot drift apart. The wiring tests mount
 the popup itself and check the flow routes every verdict — the setup
-notifications, the URL-slot focus moves, the summary status line and
-the final toast — through the engines.
+notifications, the URL-slot focus moves, the summary status line, the
+final toast, every submit arm and the tab switches — through the
+engines.
 """
 
 from __future__ import annotations
@@ -30,20 +34,23 @@ import inspect
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from textual.app import App, ComposeResult
-from textual.widgets import Input, Static
+from textual.widgets import Button, Input, Static
 
 from ytm_player.services.spotify_import import MatchResult, MatchType
 from ytm_player.ui.popups.spotify_import import (
     SpotifyImportPopup,
     _batch_outcome,
     _candidate_row,
+    _input_route,
     _multi_part_verdict,
     _result_symbol,
     _summary_stats,
+    _tab_activation,
     _url_slot_verdict,
 )
 
@@ -329,6 +336,167 @@ class TestBatchOutcome:
         outcome = _batch_outcome([], [])
         assert outcome["verdict"] == "success"
         assert outcome["batches"] == 0
+
+
+# ── Input-submission routing table ───────────────────────────────────
+
+
+class TestInputRoute:
+    """The (input-id × phase → action) table (whichever backend)."""
+
+    def test_a_valid_url_routes_to_the_single_start(self):
+        route = _input_route(
+            "si-url-input", "url", "  https://open.spotify.com/playlist/abc?si=1 \t"
+        )
+        assert route == {
+            "action": "start_single",
+            "url": "https://open.spotify.com/playlist/abc?si=1",
+        }
+
+    def test_an_invalid_url_routes_to_the_warning_arm(self):
+        assert _input_route("si-url-input", "url", "not-a-url") == {"action": "invalid_url"}
+        assert _input_route("si-url-input", "url", "") == {"action": "invalid_url"}
+        assert _input_route("si-url-input", "url", "https://open.spotify.com/track/x") == {
+            "action": "invalid_url"
+        }
+
+    def test_the_url_arm_only_answers_in_the_url_phase(self):
+        url = "https://open.spotify.com/playlist/abc"
+        assert _input_route("si-url-input", "creds", url) is None
+        assert _input_route("si-url-input", "progress", url) is None
+        assert _input_route("si-url-input", "multi_setup", url) is None
+
+    def test_the_credential_inputs_answer_in_the_creds_phase(self):
+        assert _input_route("si-cred-secret-input", "creds", "shh") == {"action": "save_creds"}
+        assert _input_route("si-cred-id-input", "creds", "client-id") == {"action": "focus_secret"}
+
+    def test_the_credential_inputs_only_answer_in_the_creds_phase(self):
+        assert _input_route("si-cred-secret-input", "url", "shh") is None
+        assert _input_route("si-cred-id-input", "summary", "client-id") is None
+
+    def test_a_name_routes_to_the_create_arm(self):
+        route = _input_route("si-name-input", "summary", "  My List  ")
+        assert route == {"action": "create_playlist", "name": "My List"}
+
+    def test_a_blank_name_routes_to_the_warning_arm(self):
+        assert _input_route("si-name-input", "summary", "") == {"action": "name_empty"}
+        assert _input_route("si-name-input", "summary", "   ") == {"action": "name_empty"}
+
+    def test_the_name_arm_only_answers_in_the_summary_phase(self):
+        assert _input_route("si-name-input", "url", "My List") is None
+        assert _input_route("si-name-input", "creating", "My List") is None
+
+    def test_the_multi_setup_inputs_answer_in_the_setup_phase(self):
+        assert _input_route("si-multi-count-input", "multi_setup", "5") == {
+            "action": "generate_urls"
+        }
+        assert _input_route("si-multi-name-input", "multi_setup", "Combined") == {
+            "action": "focus_count"
+        }
+
+    def test_the_multi_setup_inputs_only_answer_in_the_setup_phase(self):
+        assert _input_route("si-multi-count-input", "multi_urls", "5") is None
+        assert _input_route("si-multi-name-input", "url", "Combined") is None
+
+    def test_a_url_input_advances_to_the_next_index(self):
+        assert _input_route("si-multi-url-0", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-1",
+        }
+        assert _input_route("si-multi-url-19", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-20",
+        }
+
+    def test_ints_own_parse_forms_advance_like_the_reference(self):
+        # Surrounding whitespace, underscores and Unicode digits all
+        # parse through CPython's own int() on either backend — and the
+        # next id renders the parsed int, decimal digits.
+        assert _input_route("si-multi-url- 4 ", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-5",
+        }
+        assert _input_route("si-multi-url-1_0", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-11",
+        }
+        assert _input_route("si-multi-url-٣", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-4",
+        }
+
+    def test_a_negative_index_still_advances(self):
+        assert _input_route("si-multi-url--3", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url--2",
+        }
+
+    def test_a_huge_index_renders_the_whole_number(self):
+        # A bignum parses and renders through the interpreter's own
+        # operators on either backend.
+        assert _input_route("si-multi-url-" + "9" * 30, "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-1" + "0" * 30,
+        }
+
+    def test_the_replace_strips_every_occurrence(self):
+        # str.replace takes every si-multi-url- occurrence away — the
+        # reference's own spelling — so a doubled prefix still parses.
+        assert _input_route("si-multi-url-si-multi-url-4", "multi_urls", "x") == {
+            "action": "advance_url",
+            "next_id": "si-multi-url-5",
+        }
+
+    def test_unparseable_indexes_answer_nothing(self):
+        # The reference's except ValueError: pass — no action at all.
+        assert _input_route("si-multi-url-abc", "multi_urls", "x") is None
+        assert _input_route("si-multi-url-", "multi_urls", "x") is None
+        assert _input_route("si-multi-url-3.5", "multi_urls", "x") is None
+        assert _input_route("si-multi-url-0x10", "multi_urls", "x") is None
+
+    def test_the_advance_arm_only_answers_in_the_multi_urls_phase(self):
+        assert _input_route("si-multi-url-0", "multi_setup", "x") is None
+        assert _input_route("si-multi-url-0", "multi_progress", "x") is None
+
+    def test_unknown_ids_and_missing_ids_answer_nothing(self):
+        assert _input_route("something-else", "url", "x") is None
+        assert _input_route("something-else", "multi_urls", "x") is None
+        assert _input_route(None, "url", "x") is None
+        assert _input_route(None, "multi_urls", "x") is None
+
+
+# ── Tab-activation phase gate ────────────────────────────────────────
+
+
+class TestTabActivation:
+    """The tab_id → phase-and-arms gate (whichever backend)."""
+
+    def test_the_single_tab_answers_the_single_arm(self):
+        assert _tab_activation("single") == {
+            "phase": "url",
+            "single_visible": True,
+            "status": "Paste a Spotify playlist URL and press Enter",
+            "focus": "#si-url-input",
+            "reset_multi": False,
+        }
+
+    def test_the_multi_tab_answers_the_multi_arm(self):
+        assert _tab_activation("multi") == {
+            "phase": "multi_setup",
+            "single_visible": False,
+            "status": (
+                "Split your 100+ track playlist into chunks of ≤100 on Spotify,\n"
+                "then enter the combined name and number of parts below"
+            ),
+            "focus": "#si-multi-name-input",
+            "reset_multi": True,
+        }
+
+    def test_anything_else_is_the_multi_arm(self):
+        # The reference's else — the separator label, or any other id,
+        # resets to the multi setup exactly like the multi tab does.
+        assert _tab_activation("separator") == _tab_activation("multi")
+        assert _tab_activation("bogus") == _tab_activation("multi")
 
 
 # ── Flow wiring ──────────────────────────────────────────────────────
@@ -638,6 +806,289 @@ class TestCreateWiring:
             assert service.batches[0] == ids[:100]  # type: ignore[attr-defined]
 
 
+# ── Input-submission routing wiring ──────────────────────────────────
+
+
+class _Submitted:
+    """Stands in for ``Input.Submitted`` — the input's id and the value."""
+
+    def __init__(self, input_id: str | None, value: str) -> None:
+        self.input = SimpleNamespace(id=input_id)
+        self.value = value
+
+
+class TestInputRoutingWiring:
+    """The popup's submit handler routes every (input-id, phase) pair
+    through the engine — the notifications, the focus moves, the
+    pending-url staging and the worker starts hang off the engine's
+    answer, and an unmatched submission does nothing at all.
+    """
+
+    async def test_an_invalid_url_notifies_and_holds(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup.notify = MagicMock()
+            started: list[str] = []
+            popup._start_single_import = lambda url: started.append(url)  # type: ignore[method-assign]
+
+            popup.on_input_submitted(_Submitted("si-url-input", "not-a-url"))
+            await pilot.pause()
+
+            popup.notify.assert_called_once()
+            assert popup.notify.call_args.args[0] == "Invalid Spotify URL"
+            assert popup.notify.call_args.kwargs.get("severity") == "warning"
+            assert started == []
+            assert popup._phase == "url"
+            assert popup._pending_url == ""
+
+    async def test_a_valid_url_stages_and_starts_the_single_import(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            started: list[str] = []
+            popup._start_single_import = lambda url: started.append(url)  # type: ignore[method-assign]
+
+            popup.on_input_submitted(
+                _Submitted("si-url-input", "  https://open.spotify.com/playlist/abc  ")
+            )
+            await pilot.pause()
+
+            assert started == ["https://open.spotify.com/playlist/abc"]
+            assert popup._pending_url == "https://open.spotify.com/playlist/abc"
+
+    async def test_the_secret_submit_saves_the_creds(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._phase = "creds"
+            saved: list[bool] = []
+            popup._save_creds_and_retry = lambda: saved.append(True)  # type: ignore[method-assign]
+
+            popup.on_input_submitted(_Submitted("si-cred-secret-input", "shh"))
+            await pilot.pause()
+
+            assert saved == [True]
+
+    async def test_the_id_submit_focuses_the_secret_input(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            # The creds prompt's own widget arms — both inputs visible.
+            popup._phase = "creds"
+            popup.query_one("#si-cred-id-input", Input).add_class("visible")
+            popup.query_one("#si-cred-secret-input", Input).add_class("visible")
+            popup.query_one("#si-cred-id-input", Input).focus()
+            await pilot.pause()
+
+            popup.on_input_submitted(_Submitted("si-cred-id-input", "client-id"))
+            await pilot.pause()
+
+            assert popup.query_one("#si-cred-secret-input", Input).has_focus
+
+    async def test_an_empty_name_notifies_and_holds(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._phase = "summary"
+            popup.notify = MagicMock()
+            created: list[str] = []
+            popup._create_playlist = lambda name: created.append(name)  # type: ignore[method-assign]
+
+            popup.on_input_submitted(_Submitted("si-name-input", "   "))
+            await pilot.pause()
+
+            popup.notify.assert_called_once()
+            assert popup.notify.call_args.args[0] == "Name cannot be empty"
+            assert popup.notify.call_args.kwargs.get("severity") == "warning"
+            assert created == []
+
+    async def test_a_name_creates_the_playlist(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._phase = "summary"
+            created: list[str] = []
+            popup._create_playlist = lambda name: created.append(name)  # type: ignore[method-assign]
+
+            popup.on_input_submitted(_Submitted("si-name-input", "  My List  "))
+            await pilot.pause()
+
+            assert created == ["My List"]
+
+    async def test_the_count_submit_generates_the_url_inputs(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Combined"
+            popup.query_one("#si-multi-count-input", Input).value = "3"
+
+            popup.on_input_submitted(_Submitted("si-multi-count-input", "3"))
+            await pilot.pause()
+
+            assert popup._phase == "multi_urls"
+            inputs = list(popup.query("#si-multi-urls Input"))
+            assert [i.id for i in inputs] == [f"si-multi-url-{n}" for n in range(3)]
+
+    async def test_the_name_submit_focuses_the_count_input(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+
+            popup.on_input_submitted(_Submitted("si-multi-name-input", "Combined"))
+            await pilot.pause()
+
+            assert popup.query_one("#si-multi-count-input", Input).has_focus
+
+    async def test_enter_on_a_url_input_advances_the_focus(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Combined"
+            popup.query_one("#si-multi-count-input", Input).value = "3"
+            popup._generate_url_inputs()
+            await pilot.pause()
+
+            popup.on_input_submitted(
+                _Submitted("si-multi-url-0", "https://open.spotify.com/playlist/a")
+            )
+            await pilot.pause()
+
+            assert popup.query_one("#si-multi-url-1", Input).has_focus
+
+    async def test_enter_on_the_last_url_input_focuses_the_start_button(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Combined"
+            popup.query_one("#si-multi-count-input", Input).value = "3"
+            popup._generate_url_inputs()
+            await pilot.pause()
+
+            popup.on_input_submitted(
+                _Submitted("si-multi-url-2", "https://open.spotify.com/playlist/c")
+            )
+            await pilot.pause()
+
+            assert popup.query_one("#si-multi-start-btn", Button).has_focus
+
+    async def test_unmatched_submissions_do_nothing(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup.notify = MagicMock()
+            started: list[str] = []
+            popup._start_single_import = lambda url: started.append(url)  # type: ignore[method-assign]
+
+            # An unknown id, and the URL input outside its phase.
+            popup.on_input_submitted(_Submitted("something-else", "x"))
+            popup._phase = "progress"
+            popup.on_input_submitted(
+                _Submitted("si-url-input", "https://open.spotify.com/playlist/abc")
+            )
+            await pilot.pause()
+
+            popup.notify.assert_not_called()
+            assert started == []
+            assert popup._pending_url == ""
+            assert popup._phase == "progress"
+
+
+# ── Tab-activation wiring ────────────────────────────────────────────
+
+
+class TestTabActivationWiring:
+    """The popup's tab switch applies the engine's phase gate — the
+    phase, the pane visibility, the status line, the multi resets and
+    the focus moves all hang off the engine's answer.
+    """
+
+    async def test_activating_multi_resets_the_setup(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+
+            popup._activate_tab("multi")
+            await pilot.pause()
+
+            assert popup._mode == "multi"
+            assert popup._phase == "multi_setup"
+            assert popup.query_one("#si-single-content").display is False
+            assert popup.query_one("#si-multi-content").display is True
+            status = popup.query_one("#si-status", Static)
+            assert "Split your 100+ track playlist" in str(status._Static__content)
+            assert popup.query_one("#si-multi-name-input", Input).has_focus
+
+    async def test_activating_multi_reapplies_the_resets(self):
+        # Re-activating the multi tab mid-setup re-runs the arm — the
+        # mounted URL inputs drop, the start button hides and the
+        # setup inputs clear, exactly like the reference's own resets.
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Combined"
+            popup.query_one("#si-multi-count-input", Input).value = "3"
+            popup._generate_url_inputs()
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Edited"
+            popup.query_one("#si-multi-count-input", Input).value = "4"
+
+            popup._activate_tab("multi")
+            await pilot.pause()
+
+            assert not list(popup.query("#si-multi-urls Input"))
+            assert not popup.query_one("#si-multi-start-btn").has_class("visible")
+            assert popup.query_one("#si-multi-name-input", Input).value == ""
+            assert popup.query_one("#si-multi-count-input", Input).value == ""
+            assert popup._phase == "multi_setup"
+
+    async def test_activating_single_from_multi_answers_the_single_arm(self):
+        app = _Host()
+        async with app.run_test() as pilot:
+            popup = await _mounted_popup(app)
+            await pilot.pause()
+            popup._activate_tab("multi")
+            await pilot.pause()
+            popup.query_one("#si-multi-name-input", Input).value = "Combined"
+            popup.query_one("#si-multi-count-input", Input).value = "3"
+            popup._generate_url_inputs()
+            await pilot.pause()
+
+            popup._activate_tab("single")
+            await pilot.pause()
+
+            assert popup._mode == "single"
+            assert popup._phase == "url"
+            assert popup.query_one("#si-single-content").display is True
+            assert popup.query_one("#si-multi-content").display is False
+            status = popup.query_one("#si-status", Static)
+            assert "Paste a Spotify playlist URL" in str(status._Static__content)
+            assert popup.query_one("#si-url-input", Input).has_focus
+
+
 # ── Engine binding pins ──────────────────────────────────────────────
 
 
@@ -659,6 +1110,9 @@ class TestEngineBindingPins:
         assert "_url_slot_verdict(values)" in source
         assert "_summary_stats(self._results)" in source
         assert "_batch_outcome(batch_results, batch_sizes)" in source
+        # The submit routing table and the tab-activation gate.
+        assert "_input_route(event.input.id, self._phase, event.value)" in source
+        assert "_tab_activation(tab_id)" in source
 
     def test_the_replaced_inline_walks_are_gone(self):
         source = inspect.getsource(SpotifyImportPopup)
@@ -667,6 +1121,23 @@ class TestEngineBindingPins:
         assert "_URL_PATTERN.match" not in source, "the URL pass moved to the engine"
         assert "failure_kinds" not in source, "the batch accounting moved to the engine"
         assert "get_video_id" not in source, "the video-id collection moved to the engine"
+        assert "int(idx_str)" not in source, "the advance arithmetic moved to the engine"
+        assert 'startswith("si-multi-url-")' not in source, (
+            "the id-prefix routing arm moved to the engine"
+        )
+        assert '.replace("si-multi-url-", "")' not in source, (
+            "the index-suffix strip moved to the engine"
+        )
+        # The tab gate's own literals left _activate_tab (compose's
+        # initial status Static keeps the single-arm text, so the pin
+        # targets the method's source, not the class's).
+        activation_source = inspect.getsource(SpotifyImportPopup._activate_tab)
+        assert "Paste a Spotify playlist URL" not in activation_source, (
+            "the single status literal moved to the engine"
+        )
+        assert "Split your 100+ track playlist" not in activation_source, (
+            "the multi status literal moved to the engine"
+        )
 
     def test_the_candidate_rows_route_through_the_row_engine(self):
         from ytm_player.ui.popups.spotify_import import _CandidateItem
@@ -682,6 +1153,8 @@ class TestEngineBindingPins:
         assert _url_slot_verdict is _ytm_player_native.spotify_import_url_slot_verdict
         assert _summary_stats is _ytm_player_native.spotify_import_summary_stats
         assert _batch_outcome is _ytm_player_native.spotify_import_batch_outcome
+        assert _input_route is _ytm_player_native.spotify_import_input_route
+        assert _tab_activation is _ytm_player_native.spotify_import_tab_activation
 
 
 # ── Native / fallback parity ────────────────────────────────────────
@@ -784,6 +1257,48 @@ _PARITY_BATCHES = [
     (["success", "server_error", "server_error"], [10, 10, 10]),
 ]
 
+# (input_id or null, phase, value)
+_PARITY_ROUTES = [
+    ("si-url-input", "url", "https://open.spotify.com/playlist/abc"),
+    ("si-url-input", "url", "  https://open.spotify.com/album/x?si=1 \t"),
+    ("si-url-input", "url", "not-a-url"),
+    ("si-url-input", "url", ""),
+    ("si-url-input", "url", "   "),
+    ("si-url-input", "url", "spotify:playlist:x"),
+    ("si-url-input", "creds", "https://open.spotify.com/playlist/abc"),
+    ("si-url-input", "progress", "https://open.spotify.com/playlist/abc"),
+    ("si-cred-secret-input", "creds", "shh"),
+    ("si-cred-id-input", "creds", "client-id"),
+    ("si-cred-secret-input", "url", "shh"),
+    ("si-name-input", "summary", "My List"),
+    ("si-name-input", "summary", "  Padded Name  "),
+    ("si-name-input", "summary", ""),
+    ("si-name-input", "summary", "   "),
+    ("si-name-input", "creating", "My List"),
+    ("si-multi-count-input", "multi_setup", "5"),
+    ("si-multi-name-input", "multi_setup", "Combined"),
+    ("si-multi-count-input", "multi_urls", "5"),
+    ("si-multi-url-0", "multi_urls", "x"),
+    ("si-multi-url-19", "multi_urls", "x"),
+    ("si-multi-url- 4 ", "multi_urls", "x"),
+    ("si-multi-url-1_0", "multi_urls", "x"),
+    ("si-multi-url-٣", "multi_urls", "x"),
+    ("si-multi-url--3", "multi_urls", "x"),
+    ("si-multi-url-" + "9" * 30, "multi_urls", "x"),
+    ("si-multi-url-si-multi-url-4", "multi_urls", "x"),
+    ("si-multi-url-abc", "multi_urls", "x"),
+    ("si-multi-url-", "multi_urls", "x"),
+    ("si-multi-url-3.5", "multi_urls", "x"),
+    ("si-multi-url-0x10", "multi_urls", "x"),
+    ("si-multi-url-0", "multi_setup", "x"),
+    ("something-else", "url", "x"),
+    (None, "url", "x"),
+    (None, "multi_urls", "x"),
+]
+
+# tab ids
+_PARITY_ACTIVATIONS = ["single", "multi", "separator", "bogus", ""]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -794,9 +1309,11 @@ from ytm_player.services.spotify_import import MatchResult, MatchType
 from ytm_player.ui.popups.spotify_import import (
     _batch_outcome,
     _candidate_row,
+    _input_route,
     _multi_part_verdict,
     _result_symbol,
     _summary_stats,
+    _tab_activation,
     _url_slot_verdict,
 )
 
@@ -837,6 +1354,11 @@ summaries = [
 batches = [
     outcome(_batch_outcome, results, sizes) for results, sizes in payload["batches"]
 ]
+routes = [
+    outcome(_input_route, input_id, phase, value)
+    for input_id, phase, value in payload["routes"]
+]
+activations = [outcome(_tab_activation, tab_id) for tab_id in payload["activations"]]
 
 json.dump(
     {
@@ -846,6 +1368,8 @@ json.dump(
         "slots": slots,
         "summaries": summaries,
         "batches": batches,
+        "routes": routes,
+        "activations": activations,
     },
     sys.stdout,
 )
@@ -901,6 +1425,13 @@ class TestNativeParity:
         native_batches = [
             _native_outcome(_batch_outcome, results, sizes) for results, sizes in _PARITY_BATCHES
         ]
+        native_routes = [
+            _native_outcome(_input_route, input_id, phase, value)
+            for input_id, phase, value in _PARITY_ROUTES
+        ]
+        native_activations = [
+            _native_outcome(_tab_activation, tab_id) for tab_id in _PARITY_ACTIVATIONS
+        ]
 
         payload = json.dumps(
             {
@@ -910,6 +1441,8 @@ class TestNativeParity:
                 "slots": _PARITY_URL_SLOTS,
                 "summaries": _PARITY_SUMMARIES,
                 "batches": _PARITY_BATCHES,
+                "routes": _PARITY_ROUTES,
+                "activations": _PARITY_ACTIVATIONS,
             }
         )
         result = subprocess.run(
@@ -949,5 +1482,17 @@ class TestNativeParity:
         for case, native, ref in zip(_PARITY_BATCHES, native_batches, fallback["batches"]):
             assert native == ref, (
                 f"native and fallback batch outcomes differ for {case!r}:\n"
+                f"native:   {native!r}\nfallback: {ref!r}"
+            )
+        for case, native, ref in zip(_PARITY_ROUTES, native_routes, fallback["routes"]):
+            assert native == ref, (
+                f"native and fallback input routes differ for {case!r}:\n"
+                f"native:   {native!r}\nfallback: {ref!r}"
+            )
+        for case, native, ref in zip(
+            _PARITY_ACTIVATIONS, native_activations, fallback["activations"]
+        ):
+            assert native == ref, (
+                f"native and fallback tab activations differ for {case!r}:\n"
                 f"native:   {native!r}\nfallback: {ref!r}"
             )

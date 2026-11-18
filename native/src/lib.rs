@@ -1567,15 +1567,19 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     module.add_function(pyo3::wrap_pyfunction!(ui::popups::filter_regions, module)?)?;
 
     // Spotify-import popup flow engines (ui/popups/spotify_import.py
-    // equivalent): the import flow's remaining decision cores — the
+    // equivalent): the import flow's decision cores — the
     // disambiguation candidate row, the per-track result arm (symbol +
     // theme field), the multi-mode setup cascade (name gate, int()
     // parse, 2..=20 range), the URL-slot validation (first missing or
     // invalid slot), the summary counting (the three bucket counts,
-    // the matched sum, the video-id collection) and the create-batch
+    // the matched sum, the video-id collection), the create-batch
     // toast verdict (success / all-failed-single-kind / all-failed-mixed
-    // / partial). The search calls, the widget arms and the
-    // notifications stay Python-side in the popup.
+    // / partial), the input-submission routing table (input-id ×
+    // phase → action, the URL/name strips and the advance arithmetic
+    // inside) and the tab-activation phase gate (tab id → phase,
+    // pane visibility, status line, focus target, the multi resets).
+    // The search calls, the widget arms and the notifications stay
+    // Python-side in the popup.
     module.add_function(pyo3::wrap_pyfunction!(
         ui::popups::spotify_import_candidate_row,
         module
@@ -1598,6 +1602,14 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         ui::popups::spotify_import_batch_outcome,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_input_route,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::popups::spotify_import_tab_activation,
         module
     )?)?;
 

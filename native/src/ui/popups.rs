@@ -4,7 +4,8 @@
 //! action lists, chrome labels, picker sorting/rows, region filtering
 //! and the import flow's decision cores (the candidate row, the result
 //! arm, the multi-part verdict, the URL-slot verdict, the summary
-//! stats and the create-batch outcome).
+//! stats, the create-batch outcome, the input-routing table and the
+//! tab-activation phase gate).
 
 use crate::services::ytmusic::py_unpack_pair;
 use crate::ui::pages::browse::field_get;
@@ -925,4 +926,185 @@ pub(crate) fn spotify_import_batch_outcome<'py>(
     out.set_item("failed_batches", failed_batches)?;
     out.set_item("batches", batches)?;
     Ok(out)
+}
+
+/// A one-key outcome map for the popup's routing engines —
+/// `{"action": <name>}`.
+fn spotify_route_outcome<'py>(py: Python<'py>, action: &str) -> Bound<'py, PyDict> {
+    let out = PyDict::new(py);
+    out.set_item("action", action)
+        .expect("dict insertion with a str key cannot fail");
+    out
+}
+
+/// The input-submission routing table — the pure core of
+/// `on_input_submitted` from `ui/popups/spotify_import.py`: which
+/// action an (input-id × phase) pair routes to, with each claimed
+/// arm's own data decision inside.
+///
+/// Mirrors the reference's arm order exactly (the ids and phases are
+/// the popup's own literals, every comparison a plain string
+/// equality):
+///
+/// - `si-url-input` in the `url` phase answers the single-URL submit:
+///   the value stripped (CPython's own `str.strip()` set — see
+///   `py_str_strip`) and validated through the one-slot URL pass —
+///   the very `spotify_import_url_slot_verdict` engine the multi-mode
+///   start run validates through — a bad URL answering
+///   `"invalid_url"` (the caller's warning toast), a good one
+///   `"start_single"` with the stripped url riding along (the caller
+///   stages it as the pending url and starts the import worker).
+/// - `si-cred-secret-input` in the `creds` phase answers
+///   `"save_creds"`; `si-cred-id-input` in the same phase answers
+///   `"focus_secret"`.
+/// - `si-name-input` in the `summary` phase answers the name submit:
+///   the value stripped, an empty name answering `"name_empty"` (the
+///   caller's warning toast), anything else `"create_playlist"` with
+///   the stripped name riding along.
+/// - `si-multi-count-input` in the `multi_setup` phase answers
+///   `"generate_urls"`; `si-multi-name-input` in the same phase
+///   answers `"focus_count"`.
+/// - an id starting with `si-multi-url-` in the `multi_urls` phase
+///   answers the advance walk: the index suffix — every
+///   `si-multi-url-` occurrence replaced away, the reference's own
+///   `str.replace` — parsed through CPython's own `int()` (fetched
+///   from builtins at call time, so whitespace, underscores and
+///   Unicode digits parse exactly like they do in the reference); a
+///   `ValueError` answers nothing (the reference's
+///   `except ValueError: pass`), anything else the call raises
+///   escapes to the caller like the reference's except-ValueError-only
+///   arm, and a parse answers `"advance_url"` with the next input's
+///   id — `si-multi-url-{idx + 1}`, the increment and the rendering
+///   through the interpreter's own operators, so a huge index (a
+///   bignum in the reference) renders exactly like it would there.
+///
+/// Anything else — an unknown id, a known id in the wrong phase, a
+/// widget with no id at all (`Input.id` is `str | None`) — answers
+/// `None`: the reference's chain has no else, so an unmatched
+/// submission simply does nothing. The notifications, the focus
+/// moves, the worker starts and the start-button fallback (the focus
+/// query failing) stay at the call site.
+#[pyfunction]
+#[pyo3(signature = (input_id, phase, value))]
+pub(crate) fn spotify_import_input_route<'py>(
+    py: Python<'py>,
+    input_id: Option<&str>,
+    phase: &str,
+    value: &str,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let is = |expected: &str| input_id == Some(expected);
+    // ── Single mode ──
+    if is("si-url-input") && phase == "url" {
+        // url = value.strip(); if _url_slot_verdict([url]) is not None
+        let url = py_str_strip(value);
+        let verdict = spotify_import_url_slot_verdict(vec![Some(url.to_string())]);
+        if verdict.is_some() {
+            return Ok(Some(spotify_route_outcome(py, "invalid_url")));
+        }
+        let out = spotify_route_outcome(py, "start_single");
+        out.set_item("url", url)?;
+        return Ok(Some(out));
+    }
+    if is("si-cred-secret-input") && phase == "creds" {
+        return Ok(Some(spotify_route_outcome(py, "save_creds")));
+    }
+    if is("si-cred-id-input") && phase == "creds" {
+        return Ok(Some(spotify_route_outcome(py, "focus_secret")));
+    }
+    if is("si-name-input") && phase == "summary" {
+        // name = value.strip(); if not name
+        let name = py_str_strip(value);
+        if name.is_empty() {
+            return Ok(Some(spotify_route_outcome(py, "name_empty")));
+        }
+        let out = spotify_route_outcome(py, "create_playlist");
+        out.set_item("name", name)?;
+        return Ok(Some(out));
+    }
+    // ── Multi mode ──
+    if is("si-multi-count-input") && phase == "multi_setup" {
+        return Ok(Some(spotify_route_outcome(py, "generate_urls")));
+    }
+    if is("si-multi-name-input") && phase == "multi_setup" {
+        return Ok(Some(spotify_route_outcome(py, "focus_count")));
+    }
+    if let Some(id) = input_id {
+        if id.starts_with("si-multi-url-") && phase == "multi_urls" {
+            // idx_str = input_id.replace("si-multi-url-", "")
+            let idx_str = id.replace("si-multi-url-", "");
+            // int(idx_str) — fetched from builtins at call time (the
+            // multi-part verdict's own pattern), so underscores,
+            // whitespace and Unicode digits parse exactly like they do
+            // in the reference.
+            let parsed = match py.import("builtins")?.getattr("int")?.call1((idx_str,)) {
+                Ok(value) => value,
+                Err(err) if err.is_instance_of::<PyValueError>(py) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            // next_idx = idx + 1; next_id = f"si-multi-url-{next_idx}"
+            let one: Bound<'py, PyAny> = 1i64.into_pyobject(py)?.into_any();
+            let next_idx = parsed.add(&one)?;
+            let next_id = format!("si-multi-url-{}", next_idx.str()?);
+            let out = spotify_route_outcome(py, "advance_url");
+            out.set_item("next_id", next_id)?;
+            return Ok(Some(out));
+        }
+    }
+    Ok(None)
+}
+
+/// The tab-activation phase gate — the decision core of
+/// `_activate_tab` from `ui/popups/spotify_import.py`: which phase and
+/// which widget arms activating a tab produces.
+///
+/// `tab_id == "single"` answers the single arm — the phase resets to
+/// `"url"`, the single pane shows (the multi pane hides — the two
+/// displays are always complementary), the status line reads the
+/// paste prompt, the focus moves to the URL input and no multi state
+/// resets. Anything else — the multi tab, but also the separator or
+/// any other label the reference's `else` would catch — answers the
+/// multi arm: the phase resets to `"multi_setup"`, the multi pane
+/// shows (the single pane hides), the status line reads the
+/// split-playlist instructions, the focus moves to the combined-name
+/// input and the caller resets the multi setup (the URL container
+/// emptied, the start button hidden, the name and count inputs
+/// cleared). The mode assignment (`self._mode = tab_id`), the
+/// tab-label class toggles, the display writes, the status update,
+/// the resets and the focus moves stay at the call site, applied from
+/// the answer in the reference's own order.
+#[pyfunction]
+#[pyo3(signature = (tab_id))]
+pub(crate) fn spotify_import_tab_activation<'py>(
+    py: Python<'py>,
+    tab_id: &str,
+) -> Bound<'py, PyDict> {
+    let out = PyDict::new(py);
+    if tab_id == "single" {
+        out.set_item("phase", "url")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("single_visible", true)
+            .expect("dict insertion with a bool key cannot fail");
+        out.set_item("status", "Paste a Spotify playlist URL and press Enter")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("focus", "#si-url-input")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("reset_multi", false)
+            .expect("dict insertion with a bool key cannot fail");
+    } else {
+        out.set_item("phase", "multi_setup")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("single_visible", false)
+            .expect("dict insertion with a bool key cannot fail");
+        out.set_item(
+            "status",
+            "Split your 100+ track playlist into chunks of ≤100 on Spotify,\n\
+             then enter the combined name and number of parts below",
+        )
+        .expect("dict insertion with a str key cannot fail");
+        out.set_item("focus", "#si-multi-name-input")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("reset_multi", true)
+            .expect("dict insertion with a bool key cannot fail");
+    }
+    out
 }
