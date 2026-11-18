@@ -1,15 +1,29 @@
 """Playback coordination mixin for YTMPlayerApp.
 
-Two decision cores are implemented by the Rust extension when it is
-built, with pure-Python transcriptions as the fallback otherwise: the
-playback-failure policy ``_play_failure_policy`` (the verdict behind
-``_handle_play_failure`` — repeat-one's hard stop, the below-threshold
-queue advance, the end-of-queue toast, or the escalation that resets
-the resolver) and the history-report poll step ``_history_report_step``
-(the listen-threshold gate and the two-poll idle termination behind
-both report timer chains, ``_report_local_play`` and
-``_report_ytm_play``). The failure counter, the queue state, the timer
-chains and every await stay Python-side in this mixin.
+Eleven decision cores are implemented by the Rust extension when it
+is built, with pure-Python transcriptions as the fallback otherwise:
+the playback-failure policy ``_play_failure_policy`` (the verdict
+behind ``_handle_play_failure`` — repeat-one's hard stop, the
+below-threshold queue advance, the end-of-queue toast, or the
+escalation that resets the resolver), the history-report poll step
+``_history_report_step`` (the listen-threshold gate and the two-poll
+idle termination behind both report timer chains,
+``_report_local_play`` and ``_report_ytm_play``), the stale-attempt
+consume gate ``_attempt_gate`` (behind ``_on_player_error`` and
+``_on_track_end``), the poll-step failure reset
+``_poll_failure_reset`` (behind ``_poll_position``), the track-change
+notification message ``_notification_message`` (behind
+``_on_track_change``), the prefetch gate ``_prefetch_next_id``
+(behind ``_prefetch_next_track``), the queue-refill plan
+``_refill_plan`` (behind ``_refill_queue``), the local-history
+finalize plan ``_local_listen_plan`` (behind ``_log_local_listen``),
+the insert-finalize plan ``_insert_finalize_plan`` (behind
+``_insert_local_history_play``), and the timer arm pair
+``_min_listen_seconds`` / ``_timer_arm_delay`` (behind
+``_history_min_listen_seconds`` and ``_history_timer_delay``). The
+asyncio/request-ownership glue, the failure counter, the queue state,
+the timer chains, the claim writes and every await stay Python-side
+in this mixin.
 """
 
 from __future__ import annotations
@@ -18,7 +32,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from ytm_player.app._base import YTMHostBase
 from ytm_player.app._ownership import (
@@ -121,6 +135,296 @@ def _history_report_step(
             return {"action": "poll", "idle_polls": idle_polls + 1}
         return {"action": "poll", "idle_polls": 0}
     return {"action": "report"}
+
+
+def _attempt_gate(
+    attempt: Any,
+    play_generation: Any,
+    handled_attempt: Any,
+    active_stop_generation: Any,
+    queue_stop_generation: Any,
+) -> bool:
+    """The stale-attempt consume gate behind ``_on_player_error`` and
+    ``_on_track_end``.
+
+    Whether a player-event payload's attempt token still names the
+    live play, so its handler may consume it (and write it back as its
+    own handled counter): the token must be an ``int`` (a ``bool`` is
+    an ``int``, exactly like CPython), still equal the current
+    ``_play_generation`` (a newer committed play superseded it
+    otherwise), sit strictly over the handler's own handled counter (a
+    duplicate end-file or a duplicate error for the same play was
+    already consumed), and the active stop generation must agree with
+    the queue's (a stop superseded the play otherwise). The event
+    unpacking, the counter writes, the request-ownership checks and
+    the awaits stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_attempt_gate``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if not isinstance(attempt, int):
+        return False
+    if attempt != play_generation:
+        return False
+    if attempt <= handled_attempt:
+        return False
+    if active_stop_generation != queue_stop_generation:
+        return False
+    return True
+
+
+def _poll_failure_reset(
+    position: Any,
+    consecutive_failures: Any,
+    recovery_generation: Any,
+    player: Any,
+    play_generation: Any,
+) -> bool:
+    """The poll-step failure reset behind ``_poll_position``.
+
+    Whether the position poll just proved the current play's audio is
+    advancing — the one point the consecutive-failure counter and the
+    recovery marker are cleared: a strictly positive *position* (audio
+    actually advancing; ``TRACK_CHANGE`` fires before mpv has opened
+    the stream), a failure state worth clearing (a truthy
+    *consecutive_failures* count or a *recovery_generation* that is
+    not ``None``), the *player* object's own ``is_playing``, and the
+    player's ``current_attempt`` still equal to ``_play_generation``.
+    The player's reads happen exactly when the chain reaches them, so
+    a short-circuited chain never touches the player. The counter and
+    marker writes, the bar update and the MPRIS / macOS / Last.fm
+    fan-out stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_poll_failure_reset``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if not position > 0:
+        return False
+    if not (consecutive_failures or recovery_generation is not None):
+        return False
+    if not player.is_playing:
+        return False
+    return player.current_attempt == play_generation
+
+
+def _notification_message(track: Any, fmt: Any) -> Any:
+    """The track-change notification message behind
+    ``_on_track_change``.
+
+    The toast copy a track change shows when ``[notifications]
+    enabled`` is on: the title, artist and album read through the
+    track's own ``get`` (``"Unknown"`` for a missing title or artist,
+    ``""`` for a missing album) interpolated through the configured
+    template via ``str.format``, with the ``(KeyError, ValueError)``
+    fallback — a placeholder the payload does not name, or a malformed
+    template — answering the ``"{title} — {artist}"`` spelling. The
+    enabled gate, the timeout read and the ``notify`` call stay in the
+    mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_notification_message``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = track.get("title", "Unknown")
+    artist = track.get("artist", "Unknown")
+    try:
+        return fmt.format(title=title, artist=artist, album=track.get("album", ""))
+    except (KeyError, ValueError):
+        return f"{title} — {artist}"
+
+
+def _prefetch_next_id(peeked: Any) -> Any:
+    """The prefetch gate behind ``_prefetch_next_track``.
+
+    Which video id the next track's stream URL prefetch runs against,
+    if any: a falsy queue head answers ``None`` (nothing to prefetch),
+    and the head's own ``get("video_id", "")`` is read only for a
+    truthy head — a truthy id answers the very object the read
+    produced, a falsy one ``None``. The ``peek_next`` call, the
+    resolver guard and the worker scheduling stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_prefetch_next_id``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if not peeked:
+        return None
+    next_id = peeked.get("video_id", "")
+    if not next_id:
+        return None
+    return next_id
+
+
+def _refill_plan(
+    repeat_mode: Any,
+    autoplay_enabled: Any,
+    remaining_tracks: Any,
+    extend_running: Any,
+    queue: Any,
+    player: Any,
+) -> Any:
+    """The queue-refill plan behind ``_refill_queue``.
+
+    Whether autoplay tops the queue back up in the background, and the
+    seed tracks that radio fetch runs against: a *repeat_mode* other
+    than ``"off"`` answers ``None`` (repeat never drains the queue),
+    so do a falsy *autoplay_enabled*, *remaining_tracks* over 3 and a
+    truthy *extend_running* flag (the caller's own walk of its live
+    ``queue_extend`` workers, so two refills never race). Then the
+    seeds, read off the *queue* object exactly when the reference
+    reads them: the played prefix ``tracks[: real_index + 1]`` (or a
+    fresh empty list for a negative index) and its last five entries,
+    falling back to the *player* object's own ``current_track`` when
+    that prefix is empty — and still-empty seeds answer ``None``. Any
+    other answer is the very seeds list the radio fetch receives; the
+    worker scheduling and the fetch stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_refill_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if repeat_mode != "off":
+        return None
+    if not autoplay_enabled:
+        return None
+    if remaining_tracks > 3:
+        return None
+    if extend_running:
+        return None
+    all_tracks = queue.tracks
+    current_idx = queue.real_index
+    played = list(all_tracks[: current_idx + 1]) if current_idx >= 0 else []
+    seeds = played[-5:]
+    if not seeds:
+        track = player.current_track if player else None
+        if track:
+            seeds = [track]
+    if not seeds:
+        return None
+    return seeds
+
+
+def _local_listen_plan(
+    claim: Any,
+    video_id: Any,
+    player: Any,
+    track_start_position: Any,
+) -> dict[str, Any]:
+    """The local-history finalize plan behind ``_log_local_listen``.
+
+    How one play's listen duration is written to the local SQLite
+    history when its track ends or is superseded: the ownership gate
+    first (a ``None`` *claim*, or one whose own ``video_id`` does not
+    equal the ending track's, is not owned — another play owns the
+    pending row), the consumed dedup (an owned claim already
+    ``finalized`` answers ``"consumed"`` — a second write would
+    duplicate the row, so no listen is even measured), then the
+    measured listen — the *player* object's own ``position`` minus
+    ``track_start_position`` through ``int()`` — with the
+    nothing-to-write gate at or under zero (``"no_write"``). A
+    positive listen on an owned claim with a ``row_id`` answers
+    ``"update_row"`` carrying that row id; an owned claim whose
+    insert has started answers ``"stash_pending"``; everything else
+    answers ``"direct_log"``. ``mark_finalized`` names whether the
+    caller consumes the claim (the reference's own
+    ``owned.finalized = True`` before anything else, so even a
+    nothing-to-write finish blocks a later finalize). The claim
+    writes, the history calls and the awaits stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_local_listen_plan``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    owned = claim if claim is not None and claim.video_id == video_id else None
+    if owned is not None and owned.finalized:
+        return {"action": "consumed", "mark_finalized": False}
+    listened = int(player.position - track_start_position)
+    if listened <= 0:
+        return {"action": "no_write", "listened": listened, "mark_finalized": owned is not None}
+    if owned is not None and owned.row_id is not None:
+        return {
+            "action": "update_row",
+            "listened": listened,
+            "mark_finalized": True,
+            "row_id": owned.row_id,
+        }
+    if owned is not None and owned.insert_started:
+        return {"action": "stash_pending", "listened": listened, "mark_finalized": True}
+    return {"action": "direct_log", "listened": listened, "mark_finalized": owned is not None}
+
+
+def _insert_finalize_plan(claim: Any, listened: Any, play_generation: Any) -> dict[str, Any]:
+    """The insert-finalize plan behind ``_insert_local_history_play``.
+
+    What the local-history insert worker does once its row lands, and
+    whether the play is still current enough to reflect optimistically:
+    a pending duration stashed on the *claim* (finalize ran while the
+    insert was in flight) answers ``had_pending`` carrying the very
+    value, with ``apply_pending`` true only when it beats the row's
+    own *listened* seconds — and no optimistic add (the reference
+    returns without the generation check). Without one, the plan
+    answers the generation check — the claim's own ``generation``
+    equal to ``play_generation`` — behind the optimistic add to the
+    Recently Played page. The claim writes, the history update, the
+    optimistic add and the awaits stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_insert_finalize_plan``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    pending = claim.pending_seconds
+    if pending is not None:
+        return {
+            "had_pending": True,
+            "pending": pending,
+            "apply_pending": pending > listened,
+            "optimistic_add": False,
+        }
+    return {
+        "had_pending": False,
+        "pending": None,
+        "apply_pending": False,
+        "optimistic_add": claim.generation == play_generation,
+    }
+
+
+def _min_listen_seconds(value: Any) -> Any:
+    """The min-listen clamp behind ``_history_min_listen_seconds``.
+
+    The configured minimum seconds a listen must run before it counts
+    as a play: the raw configured *value* coerced through ``int()``
+    then clamped through ``max(0, ...)``, so a negative or zero
+    configuration can never make the gate negative. The settings read
+    stays in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_history_min_listen_seconds``) when
+    it is built; this pure-Python transcription is the fallback
+    otherwise.
+    """
+    return max(0, int(value))
+
+
+def _timer_arm_delay(min_listen_seconds: Any) -> Any:
+    """The history-report timer arm delay behind
+    ``_history_timer_delay``.
+
+    How long both report timer chains wait before their first poll:
+    the already-clamped *min_listen_seconds* coerced through
+    ``float()`` and measured against this module's own
+    ``_YTM_HISTORY_POLL_SECONDS`` through ``max`` — never zero, because
+    a threshold of 0 (count any playback) is valid gating yet
+    ``set_timer(0)`` trips a ``ZeroDivisionError`` inside Textual's
+    timer, so the poll interval is the floor. The ``set_timer``
+    scheduling stays in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_history_timer_delay``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return max(float(min_listen_seconds), _YTM_HISTORY_POLL_SECONDS)
 
 
 @dataclass
@@ -475,17 +779,23 @@ class PlaybackMixin(YTMHostBase):
             return
         attempt = event.get("attempt")
         track = event.get("track")
-        if not isinstance(attempt, int) or not isinstance(track, dict):
+        if not isinstance(track, dict):
             return
-        if (
-            attempt != self._play_generation
-            or attempt <= self._handled_error_attempt
-            or getattr(self, "_active_stop_generation", 0)
-            != getattr(self, "_queue_stop_generation", 0)
+        # The stale-attempt consume gate — whether this error's attempt
+        # still names the live play — is resolved by the
+        # ``_attempt_gate`` engine (native when the Rust extension is
+        # built, the pure-Python transcription otherwise).
+        if not _attempt_gate(
+            attempt,
+            self._play_generation,
+            self._handled_error_attempt,
+            getattr(self, "_active_stop_generation", 0),
+            getattr(self, "_queue_stop_generation", 0),
         ):
             logger.debug("Ignoring stream error for superseded or handled attempt %d", attempt)
             return
-        self._handled_error_attempt = attempt
+        # The gate's isinstance arm guarantees an int attempt here.
+        self._handled_error_attempt = cast("int", attempt)
         video_id = get_video_id(track)
         title = track.get("title", video_id)
         if attempt == self._recovery_generation:
@@ -645,15 +955,21 @@ class PlaybackMixin(YTMHostBase):
         attempt = event.get("attempt")
         request = request_number(self)
         queue_generation = self.queue.generation
-        if (
-            not isinstance(attempt, int)
-            or attempt != self._play_generation
-            or attempt <= getattr(self, "_handled_end_attempt", -1)
-            or getattr(self, "_active_stop_generation", 0)
-            != getattr(self, "_queue_stop_generation", 0)
+        # The stale-attempt consume gate — whether this EOF's attempt
+        # still names the live play — is resolved by the
+        # ``_attempt_gate`` engine (native when the Rust extension is
+        # built, the pure-Python transcription otherwise), the same
+        # engine behind ``_on_player_error``'s own consume gate.
+        if not _attempt_gate(
+            attempt,
+            self._play_generation,
+            getattr(self, "_handled_end_attempt", -1),
+            getattr(self, "_active_stop_generation", 0),
+            getattr(self, "_queue_stop_generation", 0),
         ):
             return
-        self._handled_end_attempt = attempt
+        # The gate's isinstance arm guarantees an int attempt here.
+        self._handled_end_attempt = cast("int", attempt)
         logger.debug("Track ended (event=%s), advancing to next", event)
         try:
             ended_track = event.get("track") if isinstance(event, dict) else None
@@ -702,12 +1018,16 @@ class PlaybackMixin(YTMHostBase):
 
         # Audio actually advancing is the only proof a play attempt
         # succeeded (TRACK_CHANGE fires before mpv has opened the stream),
-        # so failure state is reset here and nowhere earlier.
-        if (
-            pos > 0
-            and (self._consecutive_failures or self._recovery_generation is not None)
-            and self.player.is_playing
-            and self.player.current_attempt == self._play_generation
+        # so failure state is reset here and nowhere earlier — the whole
+        # four-arm gate resolved by the ``_poll_failure_reset`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise).
+        if _poll_failure_reset(
+            pos,
+            self._consecutive_failures,
+            self._recovery_generation,
+            self.player,
+            self._play_generation,
         ):
             self._consecutive_failures = 0
             self._recovery_generation = None
@@ -773,16 +1093,14 @@ class PlaybackMixin(YTMHostBase):
         except Exception:
             logger.debug("Failed to update playing indicator on track table", exc_info=True)
 
-        # Show track change notification if enabled.
+        # Show track change notification if enabled — the message
+        # assembly (the template interpolation with its KeyError /
+        # ValueError fallback spelling) resolved by the
+        # ``_notification_message`` engine (native when the Rust
+        # extension is built, the pure-Python transcription otherwise).
         try:
             if self.settings.notifications.enabled:
-                title = track.get("title", "Unknown")
-                artist = track.get("artist", "Unknown")
-                fmt = self.settings.notifications.format
-                try:
-                    msg = fmt.format(title=title, artist=artist, album=track.get("album", ""))
-                except (KeyError, ValueError):
-                    msg = f"{title} — {artist}"
+                msg = _notification_message(track, self.settings.notifications.format)
                 self.notify(msg, timeout=self.settings.notifications.timeout_seconds)
         except Exception:
             logger.debug("Failed to show track change notification", exc_info=True)
@@ -801,36 +1119,43 @@ class PlaybackMixin(YTMHostBase):
         """
         if not self.stream_resolver:
             return
-        next_track = self.queue.peek_next()
-        if next_track:
-            next_id = next_track.get("video_id", "")
-            if next_id:
-                self.run_worker(
-                    self.stream_resolver.prefetch(next_id),
-                    group="prefetch",
-                    exclusive=True,
-                )
+        # The prefetch gate — the queue head's video id, read only for
+        # a truthy head — is resolved by the ``_prefetch_next_id``
+        # engine (native when the Rust extension is built, the
+        # pure-Python transcription otherwise).
+        next_id = _prefetch_next_id(self.queue.peek_next())
+        if next_id is not None:
+            self.run_worker(
+                self.stream_resolver.prefetch(next_id),
+                group="prefetch",
+                exclusive=True,
+            )
 
     def _refill_queue(self) -> None:
-        """Refill the queue in the background when tracks are running low."""
-        if self.queue.repeat_mode != "off":
-            return
-        if not self.settings.playback.autoplay:
-            return
-        if self.queue.remaining_tracks > 3:
-            return
+        """Refill the queue in the background when tracks are running low.
+
+        The four refill gates (repeat, autoplay, the remaining-tracks
+        threshold and the live ``queue_extend`` worker walk) and the
+        seed draw (the played prefix's last five, the player's current
+        track as the last resort) are resolved by the ``_refill_plan``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise); a ``None`` answer means
+        no refill.
+        """
+        extend_running = False
         for worker in self.workers:
             if worker.group == "queue_extend" and worker.is_running:
-                return
+                extend_running = True
+                break
 
-        all_tracks = self.queue.tracks
-        current_idx = self.queue.real_index
-        played = list(all_tracks[: current_idx + 1]) if current_idx >= 0 else []
-        seeds = played[-5:]
-        if not seeds:
-            track = self.player.current_track if self.player else None
-            if track:
-                seeds = [track]
+        seeds = _refill_plan(
+            self.queue.repeat_mode,
+            self.settings.playback.autoplay,
+            self.queue.remaining_tracks,
+            extend_running,
+            self.queue,
+            self.player,
+        )
         if not seeds:
             return
 
@@ -950,42 +1275,55 @@ class PlaybackMixin(YTMHostBase):
         await self._log_local_listen(track)
 
     async def _log_local_listen(self, track: dict) -> None:
-        """Insert or finalize the local SQLite history row for this play."""
+        """Insert or finalize the local SQLite history row for this play.
+
+        The finalize branch plan — the claim ownership gate, the
+        consumed dedup, the measured listen and the update-row /
+        stash-pending / direct-log branch — is resolved by the
+        ``_local_listen_plan`` engine (native when the Rust extension
+        is built, the pure-Python transcription otherwise).
+        """
         if not self.history or not self.player:
             return
 
         video_id = get_video_id(track)
         claim = self._local_history_claim
-        # Only a claim for THIS video belongs to the play being finalized; on
-        # a mismatch another play owns it — leave it alone and direct-log.
-        owned = claim if claim is not None and claim.video_id == video_id else None
-        if owned is not None:
-            if owned.finalized:
-                # Already finalized (duplicate end-file or a concurrent
-                # supersede) — a second write would duplicate the row.
-                return
-            # Consume before any await: stops the report timer chain and
-            # blocks a concurrent finalize. Same-video replays get a fresh
-            # claim object, so a consumed claim can't swallow a later play.
-            owned.finalized = True
+        plan = _local_listen_plan(
+            claim,
+            video_id,
+            self.player,
+            self._track_start_position,
+        )
+        # Consume the claim before any await: stops the report timer
+        # chain and blocks a concurrent finalize. Same-video replays
+        # get a fresh claim object, so a consumed claim can't swallow
+        # a later play.
+        if plan["mark_finalized"]:
+            # mark_finalized answers True only for an owned claim —
+            # never None.
+            cast("_LocalHistoryClaim", claim).finalized = True
 
-        listened = int(self.player.position - self._track_start_position)
-        if listened <= 0:
-            # Nothing to write (mpv reads position 0.0 once idle, so natural
-            # EOF lands here) — but the claim above is already consumed: a
-            # replay of the same video must get its own row, not merge into
-            # this one.
+        action = plan["action"]
+        if action == "consumed" or action == "no_write":
+            # Already finalized (duplicate end-file or a concurrent
+            # supersede) or nothing to write (mpv reads position 0.0
+            # once idle, so a natural EOF lands here) — but the claim
+            # above is already consumed: a replay of the same video
+            # must get its own row, not merge into this one.
             return
+        listened = plan["listened"]
         try:
-            if owned is not None and owned.row_id is not None:
-                await self.history.update_play_listened_seconds(owned.row_id, listened)
-            elif owned is not None and owned.insert_started:
-                # Insert worker in flight: hand off the final duration for it
-                # to apply once the row exists. If the worker is already dead
-                # (insert failed, or cancelled at quit) this is a no-op — the
-                # row keeps its threshold-time value rather than risking a
-                # duplicate from a blind direct log.
-                owned.pending_seconds = listened
+            if action == "update_row":
+                await self.history.update_play_listened_seconds(plan["row_id"], listened)
+            elif action == "stash_pending":
+                # Insert worker in flight: hand off the final duration
+                # for it to apply once the row exists. If the worker is
+                # already dead (insert failed, or cancelled at quit)
+                # this is a no-op — the row keeps its threshold-time
+                # value rather than risking a duplicate from a blind
+                # direct log. stash_pending answers only for an owned
+                # claim — never None.
+                cast("_LocalHistoryClaim", claim).pending_seconds = listened
             else:
                 await self.history.log_play(
                     track=track,
@@ -997,19 +1335,26 @@ class PlaybackMixin(YTMHostBase):
             logger.exception("Failed to log play history")
 
     def _history_min_listen_seconds(self) -> int:
-        """Configured minimum seconds before a play counts instead of a skip."""
-        value = self.settings.playback.history_min_listen_seconds
-        return max(0, int(value))
+        """Configured minimum seconds before a play counts instead of a skip.
+
+        The coercion-and-clamp is resolved by the ``_min_listen_seconds``
+        engine (native when the Rust extension is built, the
+        pure-Python transcription otherwise).
+        """
+        return _min_listen_seconds(self.settings.playback.history_min_listen_seconds)
 
     def _history_timer_delay(self) -> float:
         """Initial arm delay for the report timers.
 
         Mirrors the listen threshold, but never returns 0: a threshold of 0
-        "count any playback" is valid gating, yet ``set_timer(0)`` triggers a
-        ZeroDivisionError inside Textual's timer. Fall back to the poll
-        interval so the first check still runs promptly.
+        (count any playback) is valid gating, yet ``set_timer(0)`` triggers a
+        ``ZeroDivisionError`` inside Textual's timer. Fall back to the poll
+        interval so the first check still runs promptly — the whole
+        measure resolved by the ``_timer_arm_delay`` engine (native when
+        the Rust extension is built, the pure-Python transcription
+        otherwise).
         """
-        return max(float(self._history_min_listen_seconds()), _YTM_HISTORY_POLL_SECONDS)
+        return _timer_arm_delay(self._history_min_listen_seconds())
 
     def _schedule_local_history_log(self, track: dict, video_id: str, generation: int) -> None:
         """Insert the current play into SQLite once it crosses the threshold."""
@@ -1081,19 +1426,22 @@ class PlaybackMixin(YTMHostBase):
         # Finalize may have stashed the final duration while the insert was
         # in flight. No await sits between publishing row_id above and
         # reading pending_seconds here, so a finalize either already saw
-        # row_id (and updated the row itself) or its stash is visible now.
-        pending = claim.pending_seconds
-        if pending is not None:
+        # row_id (and updated the row itself) or its stash is visible now —
+        # the pending handoff and the still-current generation check
+        # resolved by the ``_insert_finalize_plan`` engine (native when the
+        # Rust extension is built, the pure-Python transcription otherwise).
+        plan = _insert_finalize_plan(claim, listened, self._play_generation)
+        if plan["had_pending"]:
             claim.pending_seconds = None
-            if pending > listened:
+            if plan["apply_pending"]:
                 try:
-                    await self.history.update_play_listened_seconds(play_id, pending)
+                    await self.history.update_play_listened_seconds(play_id, plan["pending"])
                 except Exception:
                     logger.exception("Failed to finalize play history")
             return
         # Reflect it live only if this play is still current (generation, not
         # current_track, which a duplicate end-file can transiently clear).
-        if claim.generation == self._play_generation:
+        if plan["optimistic_add"]:
             self._optimistic_local_history_add(claim.track)
 
     def _optimistic_local_history_add(self, track: dict) -> None:
@@ -1328,21 +1676,57 @@ class PlaybackMixin(YTMHostBase):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same playback-failure policy and the
-# same history-report poll step; these bindings replace the pure-Python
-# transcriptions above when the extension is importable.  The rebinding
-# must happen AFTER the definitions above — assigning the native
-# functions any earlier would be clobbered by the ``def`` statements.
+# The Rust extension implements the same playback decision cores;
+# these bindings replace the pure-Python transcriptions above when the
+# extension is importable.  The rebinding must happen AFTER the
+# definitions above — assigning the native functions any earlier would
+# be clobbered by the ``def`` statements.
 
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_attempt_gate as _native_attempt_gate,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_failure_policy as _native_play_failure_policy,
+    )
+    from ytm_player.utils._ytm_player_native import (
+        playback_history_min_listen_seconds as _native_min_listen_seconds,  # type: ignore[import-not-found]
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_history_report_step as _native_history_report_step,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_history_timer_delay as _native_timer_arm_delay,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_insert_finalize_plan as _native_insert_finalize_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_local_listen_plan as _native_local_listen_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_notification_message as _native_notification_message,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_poll_failure_reset as _native_poll_failure_reset,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_prefetch_next_id as _native_prefetch_next_id,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_refill_plan as _native_refill_plan,
     )
 except ImportError:
     pass
 else:
     _play_failure_policy = _native_play_failure_policy  # type: ignore[assignment]
     _history_report_step = _native_history_report_step  # type: ignore[assignment]
+    _attempt_gate = _native_attempt_gate  # type: ignore[assignment]
+    _poll_failure_reset = _native_poll_failure_reset  # type: ignore[assignment]
+    _notification_message = _native_notification_message  # type: ignore[assignment]
+    _prefetch_next_id = _native_prefetch_next_id  # type: ignore[assignment]
+    _refill_plan = _native_refill_plan  # type: ignore[assignment]
+    _local_listen_plan = _native_local_listen_plan  # type: ignore[assignment]
+    _insert_finalize_plan = _native_insert_finalize_plan  # type: ignore[assignment]
+    _min_listen_seconds = _native_min_listen_seconds  # type: ignore[assignment]
+    _timer_arm_delay = _native_timer_arm_delay  # type: ignore[assignment]

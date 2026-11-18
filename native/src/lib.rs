@@ -1910,19 +1910,76 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // the reference's arm consults it, the end-of-queue toast, and the
     // escalation whose resolver reset is gated on the failure kind and
     // the resolver's truthiness — the cap read through the playback
-    // module's own _MAX_CONSECUTIVE_FAILURES name), and the
-    // history-report poll step shared by the two report timer chains
-    // (the listen-threshold gate with its boundary kept on the poll
-    // side, the live-track reset of the idle count, and the two-poll
-    // stability window's stop). The failure counter, the queue state,
-    // the resolver reset, the timer re-arms and the report workers stay
-    // Python-side in the mixin.
+    // module's own _MAX_CONSECUTIVE_FAILURES name), the history-report
+    // poll step shared by the two report timer chains (the
+    // listen-threshold gate with its boundary kept on the poll side,
+    // the live-track reset of the idle count, and the two-poll
+    // stability window's stop), the stale-attempt consume gate shared
+    // by _on_player_error and _on_track_end (the isinstance/int check,
+    // the generation equality, the handled-attempt dedup and the
+    // stop-generation mismatch), the poll-step failure reset (the
+    // audio-advancing proof that clears the failure counter and the
+    // recovery marker — the player's own is_playing and
+    // current_attempt read exactly when the reference's chain reaches
+    // them), the track-change notification message (the settings
+    // template through CPython's own str.format with the
+    // KeyError/ValueError fallback spelling), the prefetch gate (the
+    // queue head's own video_id read, truthiness-gated both sides),
+    // the queue-refill plan (the repeat/autoplay/remaining/worker
+    // gates and the played-prefix seed draw with the player's current
+    // track as the last-resort seed), the local-history finalize plan
+    // (the claim ownership gate, the consumed dedup, the measured
+    // listen and the update-row / stash-pending / direct-log branch),
+    // the insert-finalize plan (the pending stash's
+    // beats-the-threshold gate and the still-current generation check
+    // behind the optimistic add), and the history-report timer arm
+    // pair (the min-listen clamp and the never-zero arm delay — the
+    // poll interval read through the playback module's own name). The
+    // failure counter, the queue state, the resolver reset, the timer
+    // re-arms, the report workers, the claim writes and every awaited
+    // history call stay Python-side in the mixin.
     module.add_function(pyo3::wrap_pyfunction!(
         app::playback::playback_failure_policy,
         module
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         app::playback::playback_history_report_step,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_attempt_gate,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_poll_failure_reset,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_notification_message,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_prefetch_next_id,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_refill_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_local_listen_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_insert_finalize_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_history_min_listen_seconds,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_history_timer_delay,
         module
     )?)?;
 
