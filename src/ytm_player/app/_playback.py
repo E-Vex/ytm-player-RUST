@@ -1,7 +1,8 @@
 """Playback coordination mixin for YTMPlayerApp.
 
-Eleven decision cores are implemented by the Rust extension when it
-is built, with pure-Python transcriptions as the fallback otherwise:
+Twenty-three decision cores are implemented by the Rust extension
+when it is built, with pure-Python transcriptions as the fallback
+otherwise:
 the playback-failure policy ``_play_failure_policy`` (the verdict
 behind ``_handle_play_failure`` — repeat-one's hard stop, the
 below-threshold queue advance, the end-of-queue toast, or the
@@ -20,10 +21,22 @@ finalize plan ``_local_listen_plan`` (behind ``_log_local_listen``),
 the insert-finalize plan ``_insert_finalize_plan`` (behind
 ``_insert_local_history_play``), and the timer arm pair
 ``_min_listen_seconds`` / ``_timer_arm_delay`` (behind
-``_history_min_listen_seconds`` and ``_history_timer_delay``). The
-asyncio/request-ownership glue, the failure counter, the queue state,
-the timer chains, the claim writes and every await stay Python-side
-in this mixin.
+``_history_min_listen_seconds`` and ``_history_timer_delay``), plus
+the action and assembly cores: the like-toggle plan
+``_like_toggle_plan`` (behind ``_toggle_like_current``), the download
+toast trio ``_start_toasts`` / ``_download_success_toast`` /
+``_download_failure_toast`` (behind ``_download_track``), the
+pause-change pair ``_pause_status`` / ``_pause_discord_plan`` (behind
+``_on_pause_change``), the failure-path toasts
+``_no_video_id_toast`` / ``_unavailable_toast`` /
+``_stream_failed_twice_toast`` (behind ``play_track`` and
+``_on_player_error``), the cache-hit ``StreamInfo`` kwargs
+``_cache_hit_stream_info`` (behind ``play_track``), and the radio
+pair ``_radio_seed_ids`` / ``_radio_fallback_label`` (behind
+``_fetch_and_play_radio``). The asyncio/request-ownership glue, the
+failure counter, the queue state, the timer chains, the claim writes,
+the widget queries, the play/pause/next/previous branch glue and
+every await stay Python-side in this mixin.
 """
 
 from __future__ import annotations
@@ -427,6 +440,240 @@ def _timer_arm_delay(min_listen_seconds: Any) -> Any:
     return max(float(min_listen_seconds), _YTM_HISTORY_POLL_SECONDS)
 
 
+def _like_toggle_plan(track: Any) -> dict[str, Any]:
+    """The like-toggle plan behind ``_toggle_like_current``.
+
+    Which rating the playback bar's ``l`` key submits, and the toast
+    that confirms it: the raw ``likeStatus`` (no default) falls back to
+    ``"INDIFFERENT"`` under its own truthiness, uppercased through the
+    string's own ``.upper()``, and the cycle flips — ``"LIKE"`` answers
+    ``"INDIFFERENT"``, anything else ``"LIKE"`` (a disliked track
+    switches to LIKE, clearing the dislike). The player / track /
+    video-id / service gates, the ``rate_song`` submission, the track's
+    ``likeStatus`` write and the bar push stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_like_toggle_plan``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    current_status = (track.get("likeStatus") or "INDIFFERENT").upper()
+    new_status = "INDIFFERENT" if current_status == "LIKE" else "LIKE"
+    msg = "Added to Liked songs" if new_status == "LIKE" else "Removed from Liked songs"
+    return {"current": current_status, "new": new_status, "toast": msg}
+
+
+def _start_toasts(downloader: Any, video_id: Any, title: Any) -> dict[str, Any]:
+    """The download start toasts behind ``_download_track``.
+
+    What the user hears before the download worker runs, and whether it
+    runs at all: ``is_downloading`` is consulted first — a truthy answer
+    is the busy arm (the ``"Already downloading: …"`` toast, and
+    ``is_downloaded`` never consulted, the reference's early return) —
+    and a falsy one proceeds to ``is_downloaded``, whose answer travels
+    home as ``already_downloaded`` with the ``"Downloading: …"`` toast
+    shown only when nothing is downloaded yet. The ``download`` await,
+    the cache indexing and the retention branch stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_download_start_toasts``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if downloader.is_downloading(video_id):
+        return {"busy": True, "toast": f"Already downloading: {title}", "already_downloaded": False}
+    already_downloaded = downloader.is_downloaded(video_id)
+    toast = None if already_downloaded else f"Downloading: {title}"
+    return {"busy": False, "toast": toast, "already_downloaded": already_downloaded}
+
+
+def _download_success_toast(already_downloaded: Any, title: Any) -> str:
+    """The download success toast behind ``_download_track``.
+
+    ``"Already downloaded."`` when the track was downloaded before this
+    press, ``"Downloaded: …"`` when this press produced the file — the
+    title interpolated through the f-string's own ``str()`` conversion.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_download_success_toast``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if already_downloaded:
+        return "Already downloaded."
+    return f"Downloaded: {title}"
+
+
+def _download_failure_toast(error: Any) -> str:
+    """The download failure toast behind ``_download_track``.
+
+    The raw *error* object falling back to ``"Unknown error"`` under its
+    own truthiness, interpolated through the f-string's own ``str()``
+    conversion.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_download_failure_toast``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return f"Download failed: {error or 'Unknown error'}"
+
+
+def _pause_status(paused: Any) -> str:
+    """The pause-change status string behind ``_on_pause_change``.
+
+    The ``"Paused"`` / ``"Playing"`` spelling both platform integrations
+    (MPRIS and macOS Now Playing) publish under the flag's own
+    truthiness.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_pause_status``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return "Paused" if paused else "Playing"
+
+
+def _pause_discord_plan(paused: Any, player: Any) -> dict[str, Any]:
+    """The pause-change Discord plan behind ``_on_pause_change``.
+
+    Whether a pause clears the Discord presence and a resume
+    re-publishes it, and the exact kwargs the resume's ``update``
+    receives: a truthy *paused* answers ``clear``; otherwise the
+    *player* object's own ``current_track`` is read (a falsy player or
+    track answers ``none``), and a truthy track answers ``update``
+    carrying the five kwargs — the title, artist and album through the
+    track's own ``get`` with the ``""`` defaults, the thumbnail with
+    the ``or ""`` truthiness fallback, and the player's own
+    ``position``. The ``call_later`` scheduling and the worker runs
+    stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_pause_discord_plan``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if paused:
+        return {"action": "clear"}
+    track = player.current_track if player else None
+    if not track:
+        return {"action": "none"}
+    return {
+        "action": "update",
+        "kwargs": {
+            "title": track.get("title", ""),
+            "artist": track.get("artist", ""),
+            "album": track.get("album", ""),
+            "position": player.position,
+            "thumbnail_url": track.get("thumbnail_url") or "",
+        },
+    }
+
+
+def _no_video_id_toast(track: Any) -> str:
+    """The no-video-id toast behind ``play_track``.
+
+    The title through the track's own ``get`` with the ``"Unknown"``
+    default, interpolated through the f-string's own ``str()``
+    conversion.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_no_video_id_toast``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = track.get("title", "Unknown")
+    return f'Skipping "{title}" — no video ID (AI-generated streams are not supported).'
+
+
+def _unavailable_toast(track: Any, video_id: Any) -> str:
+    """The unavailable toast behind ``play_track``'s resolved-to-nothing
+    arm.
+
+    The title through the track's own ``get`` with the *video_id*
+    default, interpolated through the f-string's own ``str()``
+    conversion.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_unavailable_toast``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = track.get("title", video_id)
+    return f'Couldn\'t play "{title}" — track may be unavailable or region-locked. Playback failed.'
+
+
+def _stream_failed_twice_toast(track: Any, video_id: Any) -> str:
+    """The stream-failed-twice toast behind ``_on_player_error``'s
+    recovery arm.
+
+    The title through the track's own ``get`` with the *video_id*
+    default, interpolated through the f-string's own ``str()``
+    conversion.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_stream_failed_twice_toast``) when it
+    is built; this pure-Python transcription is the fallback otherwise.
+    """
+    title = track.get("title", video_id)
+    return f'Couldn\'t play "{title}" — stream failed twice.'
+
+
+def _cache_hit_stream_info(cached_path: Any, video_id: Any, track: Any) -> dict[str, Any]:
+    """The cache-hit stream info behind ``play_track``'s local-file arm.
+
+    The ``StreamInfo`` kwargs for a track the audio cache already
+    holds: ``str(cached_path)`` for the url, the path's own suffix
+    stripped of its leading dot with the ``"opus"`` fallback, the
+    literal ``0`` bitrate, the track's own duration with the ``or 0``
+    fallback, ``float("inf")`` (local files do not expire), and the
+    track's own thumbnail passed through as the object it is. The
+    ``StreamInfo`` construction itself stays in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_cache_hit_stream_info``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return {
+        "url": str(cached_path),
+        "video_id": video_id,
+        "format": cached_path.suffix.lstrip(".") or "opus",
+        "bitrate": 0,
+        "duration": track.get("duration") or 0,
+        "expires_at": float("inf"),
+        "thumbnail_url": track.get("thumbnail_url"),
+    }
+
+
+def _radio_seed_ids(seed_track: Any) -> dict[str, Any]:
+    """The radio seed ids behind ``_fetch_and_play_radio``.
+
+    The seed list a radio fetch runs against, and the video ids it
+    actually seeds with: a dict seed is wrapped in a fresh one-element
+    list, anything else passes through as the object it is, and every
+    seed's video id is resolved through this module's own
+    ``get_video_id`` (called exactly twice per seed like the
+    reference's comprehension) with only truthy ids landing in the
+    list. The ``get_radio`` await, the queue mutations and the
+    notifications stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_radio_seed_ids``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    seeds = [seed_track] if isinstance(seed_track, dict) else seed_track
+    video_ids = [get_video_id(t) for t in seeds if get_video_id(t)]
+    return {"seeds": seeds, "video_ids": video_ids}
+
+
+def _radio_fallback_label(seeds: Any) -> str:
+    """The radio fallback label behind ``_fetch_and_play_radio``.
+
+    The ``"Radio from …"`` spelling built from the first seed's own
+    title (the sequence's own subscription, the seed's own ``get`` with
+    the ``"Unknown"`` default, interpolated through the f-string's own
+    ``str()`` conversion). The caller's own label argument wins when
+    set.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_radio_fallback_label``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return f"Radio from {seeds[0].get('title', 'Unknown')}"
+
+
 @dataclass
 class _LocalHistoryClaim:
     """Ownership token for one play's local-history row.
@@ -485,12 +732,10 @@ class PlaybackMixin(YTMHostBase):
             self._last_play_video_id = video_id
             self._last_play_time = now
         if not video_id:
-            title = track.get("title", "Unknown")
-            self.notify(
-                f'Skipping "{title}" — no video ID (AI-generated streams are not supported).',
-                severity="warning",
-                timeout=3,
-            )
+            # The toast copy is resolved by the ``_no_video_id_toast``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            self.notify(_no_video_id_toast(track), severity="warning", timeout=3)
             self._handle_play_failure(
                 exhausted_message="Multiple tracks unplayable — check if your account has access.",
                 clear_debounce=False,
@@ -538,15 +783,11 @@ class PlaybackMixin(YTMHostBase):
                 # .url and .duration — duration comes from the track dict.
                 from ytm_player.services.stream import StreamInfo
 
-                stream_info = StreamInfo(
-                    url=str(cached_path),
-                    video_id=video_id,
-                    format=cached_path.suffix.lstrip(".") or "opus",
-                    bitrate=0,  # unknown for cached files
-                    duration=track.get("duration") or 0,
-                    expires_at=float("inf"),  # local files don't expire
-                    thumbnail_url=track.get("thumbnail_url"),
-                )
+                # The kwargs assembly is resolved by the
+                # ``_cache_hit_stream_info`` engine (native when the
+                # Rust extension is built, the pure-Python transcription
+                # otherwise).
+                stream_info = StreamInfo(**_cache_hit_stream_info(cached_path, video_id, track))
                 logger.info("Cache hit for %s — playing from %s", video_id, cached_path)
 
         # Resolve via yt-dlp if no cache hit.
@@ -565,13 +806,10 @@ class PlaybackMixin(YTMHostBase):
             return
 
         if stream_info is None:
-            title = track.get("title", video_id)
-            self.notify(
-                f'Couldn\'t play "{title}" — track may be unavailable or region-locked. '
-                f"Playback failed.",
-                severity="error",
-                timeout=4,
-            )
+            # The toast copy is resolved by the ``_unavailable_toast``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            self.notify(_unavailable_toast(track, video_id), severity="error", timeout=4)
             self._handle_play_failure(
                 exhausted_message="Multiple tracks failed — stream resolver reset. Try playing again.",
                 failure_kind="stream",
@@ -797,7 +1035,6 @@ class PlaybackMixin(YTMHostBase):
         # The gate's isinstance arm guarantees an int attempt here.
         self._handled_error_attempt = cast("int", attempt)
         video_id = get_video_id(track)
-        title = track.get("title", video_id)
         if attempt == self._recovery_generation:
             self._recovery_generation = None
             logger.warning(
@@ -805,8 +1042,12 @@ class PlaybackMixin(YTMHostBase):
                 video_id,
                 event.get("error"),
             )
+            # The toast copy is resolved by the
+            # ``_stream_failed_twice_toast`` engine (native when the
+            # Rust extension is built, the pure-Python transcription
+            # otherwise).
             self.notify(
-                f'Couldn\'t play "{title}" — stream failed twice.',
+                _stream_failed_twice_toast(track, video_id),
                 severity="error",
                 timeout=4,
             )
@@ -894,8 +1135,12 @@ class PlaybackMixin(YTMHostBase):
         """
         if not self.ytmusic:
             return
-        seeds = [seed_track] if isinstance(seed_track, dict) else seed_track
-        video_ids = [get_video_id(t) for t in seeds if get_video_id(t)]
+        # The seed normalisation and the id walk are resolved by the
+        # ``_radio_seed_ids`` engine (native when the Rust extension is
+        # built, the pure-Python transcription otherwise).
+        seed_plan = _radio_seed_ids(seed_track)
+        seeds = seed_plan["seeds"]
+        video_ids = seed_plan["video_ids"]
         if not video_ids:
             return
 
@@ -935,7 +1180,11 @@ class PlaybackMixin(YTMHostBase):
         self.queue.set_context(None)
         self._refresh_queue_page()
         if not label:
-            label = f"Radio from {seeds[0].get('title', 'Unknown')}"
+            # The fallback label is resolved by the
+            # ``_radio_fallback_label`` engine (native when the Rust
+            # extension is built, the pure-Python transcription
+            # otherwise).
+            label = _radio_fallback_label(seeds)
         # Fire before play_track(), not after: "Playing: X" means the radio
         # was fetched and queued, not that the first track's audio is
         # already flowing. play_track() awaits the full stream resolve, so
@@ -1214,7 +1463,10 @@ class PlaybackMixin(YTMHostBase):
             logger.debug("Failed to update pause state display", exc_info=True)
 
         if self.mpris:
-            status = "Paused" if paused else "Playing"
+            # The status string is resolved by the ``_pause_status``
+            # engine (native when the Rust extension is built, the
+            # pure-Python transcription otherwise).
+            status = _pause_status(paused)
             mpris = self.mpris
             try:
                 self.call_later(
@@ -1224,7 +1476,7 @@ class PlaybackMixin(YTMHostBase):
                 logger.exception("MPRIS playback status update failed")
 
         if self.mac_media:
-            status = "Paused" if paused else "Playing"
+            status = _pause_status(paused)
             mac_media = self.mac_media
             try:
                 self.call_later(
@@ -1233,26 +1485,19 @@ class PlaybackMixin(YTMHostBase):
             except Exception:
                 logger.exception("macOS Now Playing playback status update failed")
 
-        # Update Discord presence on pause/resume.
+        # Update Discord presence on pause/resume — the whole arm
+        # (clear vs re-publish, and the update's kwargs) resolved by the
+        # ``_pause_discord_plan`` engine (native when the Rust extension
+        # is built, the pure-Python transcription otherwise).
         discord = self.discord
         if discord:
             try:
-                if paused:
+                plan = _pause_discord_plan(paused, self.player)
+                if plan["action"] == "clear":
                     self.call_later(lambda d=discord: self.run_worker(d.clear()))
-                elif self.player and self.player.current_track:
-                    t = self.player.current_track
-                    player = self.player
-                    self.call_later(
-                        lambda d=discord, p=player, track=t: self.run_worker(
-                            d.update(
-                                title=track.get("title", ""),
-                                artist=track.get("artist", ""),
-                                album=track.get("album", ""),
-                                position=p.position,
-                                thumbnail_url=track.get("thumbnail_url") or "",
-                            )
-                        )
-                    )
+                elif plan["action"] == "update":
+                    kwargs = plan["kwargs"]
+                    self.call_later(lambda d=discord: self.run_worker(d.update(**kwargs)))
             except Exception:
                 logger.exception("Discord RPC presence update failed")
 
@@ -1593,8 +1838,11 @@ class PlaybackMixin(YTMHostBase):
             self.notify("Sign in to like songs", severity="warning", timeout=2)
             return
 
-        current_status = (track.get("likeStatus") or "INDIFFERENT").upper()
-        new_status = "INDIFFERENT" if current_status == "LIKE" else "LIKE"
+        # The rating cycle and the confirming toast are resolved by the
+        # ``_like_toggle_plan`` engine (native when the Rust extension
+        # is built, the pure-Python transcription otherwise).
+        plan = _like_toggle_plan(track)
+        new_status = plan["new"]
 
         result = await self.ytmusic.rate_song(video_id, new_status)
         if result != "success":
@@ -1610,8 +1858,7 @@ class PlaybackMixin(YTMHostBase):
         # Update the track dict so subsequent reads reflect the new state.
         track["likeStatus"] = new_status
         # Notify the user of the change.
-        msg = "Added to Liked songs" if new_status == "LIKE" else "Removed from Liked songs"
-        self.notify(msg, timeout=2)
+        self.notify(plan["toast"], timeout=2)
         # Push the new state to the playback bar.
         try:
             from ytm_player.ui.playback_bar import PlaybackBar
@@ -1631,14 +1878,20 @@ class PlaybackMixin(YTMHostBase):
             return
 
         title = track.get("title", video_id)
-        if self.downloader.is_downloading(video_id):
+        # The busy verdict, the start toast and the already-downloaded
+        # flag are resolved by the ``_start_toasts`` engine (native when
+        # the Rust extension is built, the pure-Python transcription
+        # otherwise) — the downloader's own methods consulted exactly
+        # when the reference consults them.
+        start = _start_toasts(self.downloader, video_id, title)
+        if start["busy"]:
             # The running writer keeps ownership; this press just reports it.
-            self.notify(f"Already downloading: {title}", timeout=3)
+            self.notify(start["toast"], timeout=3)
             return
 
-        already_downloaded = self.downloader.is_downloaded(video_id)
-        if not already_downloaded:
-            self.notify(f"Downloading: {title}", timeout=3)
+        already_downloaded = start["already_downloaded"]
+        if start["toast"] is not None:
+            self.notify(start["toast"], timeout=3)
 
         result = await self.downloader.download(video_id)
         if result.success:
@@ -1668,11 +1921,17 @@ class PlaybackMixin(YTMHostBase):
                         timeout=6,
                     )
                     return
-            message = "Already downloaded." if already_downloaded else f"Downloaded: {title}"
-            self.notify(message, timeout=3)
+            # The landed-arm copy is resolved by the
+            # ``_download_success_toast`` engine (native when the Rust
+            # extension is built, the pure-Python transcription
+            # otherwise).
+            self.notify(_download_success_toast(already_downloaded, title), timeout=3)
         else:
-            error = result.error or "Unknown error"
-            self.notify(f"Download failed: {error}", severity="error", timeout=4)
+            # The failure copy is resolved by the
+            # ``_download_failure_toast`` engine (native when the Rust
+            # extension is built, the pure-Python transcription
+            # otherwise).
+            self.notify(_download_failure_toast(result.error), severity="error", timeout=4)
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
@@ -1685,6 +1944,18 @@ class PlaybackMixin(YTMHostBase):
 try:
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_attempt_gate as _native_attempt_gate,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_cache_hit_stream_info as _native_cache_hit_stream_info,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_download_failure_toast as _native_download_failure_toast,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_download_start_toasts as _native_start_toasts,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_download_success_toast as _native_download_success_toast,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_failure_policy as _native_play_failure_policy,
@@ -1702,10 +1973,22 @@ try:
         playback_insert_finalize_plan as _native_insert_finalize_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_like_toggle_plan as _native_like_toggle_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_local_listen_plan as _native_local_listen_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_no_video_id_toast as _native_no_video_id_toast,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_notification_message as _native_notification_message,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_pause_discord_plan as _native_pause_discord_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_pause_status as _native_pause_status,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_poll_failure_reset as _native_poll_failure_reset,
@@ -1714,7 +1997,19 @@ try:
         playback_prefetch_next_id as _native_prefetch_next_id,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_radio_fallback_label as _native_radio_fallback_label,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_radio_seed_ids as _native_radio_seed_ids,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_refill_plan as _native_refill_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_stream_failed_twice_toast as _native_stream_failed_twice_toast,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_unavailable_toast as _native_unavailable_toast,
     )
 except ImportError:
     pass
@@ -1730,3 +2025,15 @@ else:
     _insert_finalize_plan = _native_insert_finalize_plan  # type: ignore[assignment]
     _min_listen_seconds = _native_min_listen_seconds  # type: ignore[assignment]
     _timer_arm_delay = _native_timer_arm_delay  # type: ignore[assignment]
+    _like_toggle_plan = _native_like_toggle_plan  # type: ignore[assignment]
+    _start_toasts = _native_start_toasts  # type: ignore[assignment]
+    _download_success_toast = _native_download_success_toast  # type: ignore[assignment]
+    _download_failure_toast = _native_download_failure_toast  # type: ignore[assignment]
+    _pause_status = _native_pause_status  # type: ignore[assignment]
+    _pause_discord_plan = _native_pause_discord_plan  # type: ignore[assignment]
+    _no_video_id_toast = _native_no_video_id_toast  # type: ignore[assignment]
+    _unavailable_toast = _native_unavailable_toast  # type: ignore[assignment]
+    _stream_failed_twice_toast = _native_stream_failed_twice_toast  # type: ignore[assignment]
+    _cache_hit_stream_info = _native_cache_hit_stream_info  # type: ignore[assignment]
+    _radio_seed_ids = _native_radio_seed_ids  # type: ignore[assignment]
+    _radio_fallback_label = _native_radio_fallback_label  # type: ignore[assignment]

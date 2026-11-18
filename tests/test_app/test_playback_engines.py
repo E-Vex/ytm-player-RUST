@@ -33,6 +33,20 @@ generation check behind ``_insert_local_history_play``; and the timer
 arm pair ``_min_listen_seconds`` / ``_timer_arm_delay`` behind
 ``_history_min_listen_seconds`` and ``_history_timer_delay``.
 
+The action and assembly cores: ``_like_toggle_plan``, the rating cycle
+and confirming toast behind ``_toggle_like_current``; the download
+toast trio ``_start_toasts`` / ``_download_success_toast`` /
+``_download_failure_toast`` behind ``_download_track`` (the
+downloader's own membership methods consulted exactly when the
+reference consults them); the pause-change pair ``_pause_status`` /
+``_pause_discord_plan`` behind ``_on_pause_change``; the failure-path
+toasts ``_no_video_id_toast`` / ``_unavailable_toast`` /
+``_stream_failed_twice_toast`` behind ``play_track`` and
+``_on_player_error``; the cache-hit ``StreamInfo`` kwargs
+``_cache_hit_stream_info`` behind ``play_track``; and the radio pair
+``_radio_seed_ids`` / ``_radio_fallback_label`` behind
+``_fetch_and_play_radio``.
+
 The engines run with two interchangeable backends: the pure-Python
 transcriptions in the module and, when the Rust extension is built, the
 native implementations bound at the module's tail. The failure cap and
@@ -56,7 +70,11 @@ handlers consult the attempt gate with their own handled counters, the
 poll consults the reset engine with the very player object, and the
 verdicts steer the toasts, the deferred advance, the resolver reset,
 the counter reset, the claim writes, the history calls and the timer
-re-arms.
+re-arms; the like toggle consults the plan engine with the very track
+and submits its rating; the download consults the toast engines around
+its await; the pause change consults the status engine per integration
+and the Discord plan for the presence arm; and the radio fetch
+consults the seed and label engines with its own seed objects.
 """
 
 from __future__ import annotations
@@ -75,17 +93,29 @@ from ytm_player.app._playback import (
     _YTM_HISTORY_POLL_SECONDS,
     PlaybackMixin,
     _attempt_gate,
+    _cache_hit_stream_info,
+    _download_failure_toast,
+    _download_success_toast,
     _history_report_step,
     _insert_finalize_plan,
+    _like_toggle_plan,
     _local_listen_plan,
     _LocalHistoryClaim,
     _min_listen_seconds,
+    _no_video_id_toast,
     _notification_message,
+    _pause_discord_plan,
+    _pause_status,
     _play_failure_policy,
     _poll_failure_reset,
     _prefetch_next_id,
+    _radio_fallback_label,
+    _radio_seed_ids,
     _refill_plan,
+    _start_toasts,
+    _stream_failed_twice_toast,
     _timer_arm_delay,
+    _unavailable_toast,
 )
 from ytm_player.config.settings import DEFAULT_HISTORY_MIN_LISTEN_SECONDS
 
@@ -1451,6 +1481,666 @@ class TestHistoryTimerPairWiring:
         assert calls == [(12,)]
 
 
+# ── The like-toggle plan's arms ────────────────────────────────────────────
+
+
+class TestLikeTogglePlanArms:
+    """``_like_toggle_plan``'s cycle, on whichever backend."""
+
+    def test_a_liked_track_unlikes(self):
+        assert _like_toggle_plan({"likeStatus": "LIKE"}) == {
+            "current": "LIKE",
+            "new": "INDIFFERENT",
+            "toast": "Removed from Liked songs",
+        }
+
+    def test_anything_else_likes(self):
+        assert _like_toggle_plan({"likeStatus": "DISLIKE"}) == {
+            "current": "DISLIKE",
+            "new": "LIKE",
+            "toast": "Added to Liked songs",
+        }
+
+    def test_a_missing_status_reads_indifferent(self):
+        assert _like_toggle_plan({}) == {
+            "current": "INDIFFERENT",
+            "new": "LIKE",
+            "toast": "Added to Liked songs",
+        }
+
+    def test_the_status_is_uppercased_first(self):
+        assert _like_toggle_plan({"likeStatus": "like"})["new"] == "INDIFFERENT"
+
+    def test_a_truthy_non_str_status_raises_the_upper_error(self):
+        with pytest.raises(AttributeError, match="'int' object has no attribute 'upper'"):
+            _like_toggle_plan({"likeStatus": 7})
+
+
+# ── The download toast trio's arms ─────────────────────────────────────────
+
+
+class _Downloader:
+    """A downloader stand-in answering the two membership checks."""
+
+    def __init__(self, downloading=False, downloaded=False):
+        self._downloading = downloading
+        self._downloaded = downloaded
+        self.calls: list[tuple[str, str]] = []
+
+    def is_downloading(self, video_id):
+        self.calls.append(("is_downloading", video_id))
+        return self._downloading
+
+    def is_downloaded(self, video_id):
+        self.calls.append(("is_downloaded", video_id))
+        return self._downloaded
+
+
+class TestDownloadStartToastsArms:
+    """``_start_toasts``' verdict, on whichever backend."""
+
+    def test_a_running_download_is_the_busy_arm(self):
+        downloader = _Downloader(downloading=True, downloaded=True)
+        plan = _start_toasts(downloader, "v", "T")
+        assert plan == {
+            "busy": True,
+            "toast": "Already downloading: T",
+            "already_downloaded": False,
+        }
+        # The reference's early return: is_downloaded is never consulted.
+        assert downloader.calls == [("is_downloading", "v")]
+
+    def test_a_fresh_download_shows_the_starting_toast(self):
+        downloader = _Downloader()
+        assert _start_toasts(downloader, "v", "T") == {
+            "busy": False,
+            "toast": "Downloading: T",
+            "already_downloaded": False,
+        }
+
+    def test_an_already_downloaded_track_shows_no_start_toast(self):
+        downloader = _Downloader(downloaded=True)
+        assert _start_toasts(downloader, "v", "T") == {
+            "busy": False,
+            "toast": None,
+            "already_downloaded": True,
+        }
+
+    def test_the_title_interpolates_through_str(self):
+        plan = _start_toasts(_Downloader(), "v", 7)
+        assert plan["toast"] == "Downloading: 7"
+
+
+class TestDownloadToastPairArms:
+    """``_download_success_toast`` / ``_download_failure_toast``, on
+    whichever backend."""
+
+    def test_the_success_toast_names_the_outcome(self):
+        assert _download_success_toast(True, "T") == "Already downloaded."
+        assert _download_success_toast(False, "T") == "Downloaded: T"
+
+    def test_the_failure_toast_falls_back_to_unknown(self):
+        assert _download_failure_toast(None) == "Download failed: Unknown error"
+        assert _download_failure_toast("") == "Download failed: Unknown error"
+
+    def test_the_failure_toast_carries_the_error(self):
+        assert _download_failure_toast("HTTP 403") == "Download failed: HTTP 403"
+        assert _download_failure_toast(7) == "Download failed: 7"
+
+
+# ── The pause-change pair's arms ───────────────────────────────────────────
+
+
+class TestPauseStatusArms:
+    """``_pause_status``' spelling, on whichever backend."""
+
+    def test_the_flag_picks_the_spelling(self):
+        assert _pause_status(True) == "Paused"
+        assert _pause_status(False) == "Playing"
+
+
+class TestPauseDiscordPlanArms:
+    """``_pause_discord_plan``'s verdict, on whichever backend."""
+
+    _PLAYER = SimpleNamespace(current_track={"title": "T"}, position=12.5)
+
+    def test_a_pause_clears_the_presence(self):
+        assert _pause_discord_plan(True, self._PLAYER) == {"action": "clear"}
+
+    def test_no_player_answers_none(self):
+        assert _pause_discord_plan(False, None) == {"action": "none"}
+
+    def test_no_current_track_answers_none(self):
+        player = SimpleNamespace(current_track=None)
+        assert _pause_discord_plan(False, player) == {"action": "none"}
+
+    def test_a_live_track_answers_the_update_kwargs(self):
+        player = SimpleNamespace(
+            current_track={"title": "T", "artist": "A", "thumbnail_url": None}, position=12.5
+        )
+        assert _pause_discord_plan(False, player) == {
+            "action": "update",
+            "kwargs": {
+                "title": "T",
+                "artist": "A",
+                "album": "",
+                "position": 12.5,
+                "thumbnail_url": "",
+            },
+        }
+
+
+# ── The failure-path toasts' arms ──────────────────────────────────────────
+
+
+class TestFailureToastArms:
+    """The three failure-path toasts, on whichever backend."""
+
+    def test_the_no_video_id_toast(self):
+        assert _no_video_id_toast({"title": "X"}) == (
+            'Skipping "X" — no video ID (AI-generated streams are not supported).'
+        )
+        assert _no_video_id_toast({}) == (
+            'Skipping "Unknown" — no video ID (AI-generated streams are not supported).'
+        )
+
+    def test_the_unavailable_toast(self):
+        assert _unavailable_toast({"title": "X"}, "vid") == (
+            'Couldn\'t play "X" — track may be unavailable or region-locked. Playback failed.'
+        )
+        assert _unavailable_toast({}, "vid") == (
+            'Couldn\'t play "vid" — track may be unavailable or region-locked. Playback failed.'
+        )
+
+    def test_the_stream_failed_twice_toast(self):
+        assert _stream_failed_twice_toast({"title": "X"}, "vid") == (
+            'Couldn\'t play "X" — stream failed twice.'
+        )
+        assert (
+            _stream_failed_twice_toast({}, "vid") == 'Couldn\'t play "vid" — stream failed twice.'
+        )
+
+    def test_the_titles_interpolate_through_str(self):
+        assert 'Skipping "7"' in _no_video_id_toast({"title": 7})
+        assert 'Couldn\'t play "7"' in _unavailable_toast({"title": 7}, "v")
+
+
+# ── The cache-hit stream info's arms ───────────────────────────────────────
+
+
+class TestCacheHitStreamInfoArms:
+    """``_cache_hit_stream_info``'s kwargs, on whichever backend."""
+
+    def test_the_full_payload_assembles(self):
+        path = SimpleNamespace(suffix=".opus")
+        info = _cache_hit_stream_info(path, "vid", {"duration": 200, "thumbnail_url": "u"})
+        assert info == {
+            "url": str(path),
+            "video_id": "vid",
+            "format": "opus",
+            "bitrate": 0,
+            "duration": 200,
+            "expires_at": float("inf"),
+            "thumbnail_url": "u",
+        }
+
+    def test_a_dotted_suffix_strips_only_the_leading_dot(self):
+        path = SimpleNamespace(suffix=".tar.gz")
+        assert _cache_hit_stream_info(path, "v", {})["format"] == "tar.gz"
+
+    def test_an_empty_or_dot_only_suffix_falls_back_to_opus(self):
+        for suffix in ("", "."):
+            path = SimpleNamespace(suffix=suffix)
+            assert _cache_hit_stream_info(path, "v", {})["format"] == "opus"
+
+    def test_a_falsy_duration_falls_back_to_zero(self):
+        path = SimpleNamespace(suffix=".opus")
+        for duration in (None, 0, ""):
+            assert _cache_hit_stream_info(path, "v", {"duration": duration})["duration"] == 0
+
+    def test_a_missing_thumbnail_travels_as_none(self):
+        path = SimpleNamespace(suffix=".opus")
+        assert _cache_hit_stream_info(path, "v", {})["thumbnail_url"] is None
+
+    def test_a_path_without_a_suffix_raises_the_attribute_error(self):
+        with pytest.raises(AttributeError):
+            _cache_hit_stream_info(42, "v", {})
+
+
+# ── The radio pair's arms ──────────────────────────────────────────────────
+
+
+class TestRadioPairArms:
+    """``_radio_seed_ids`` / ``_radio_fallback_label``, on whichever
+    backend."""
+
+    def test_a_dict_seed_is_wrapped_in_a_fresh_list(self):
+        plan = _radio_seed_ids({"videoId": "a"})
+        assert plan == {"seeds": [{"videoId": "a"}], "video_ids": ["a"]}
+
+    def test_a_list_seed_passes_through_as_it_is(self):
+        seeds = [{"videoId": "a"}, {"videoId": ""}, {"video_id": "b"}, {}]
+        plan = _radio_seed_ids(seeds)
+        assert plan["seeds"] is seeds
+        assert plan["video_ids"] == ["a", "b"]
+
+    def test_an_empty_list_seeds_with_nothing(self):
+        assert _radio_seed_ids([]) == {"seeds": [], "video_ids": []}
+
+    def test_the_fallback_label_reads_the_first_seed(self):
+        assert _radio_fallback_label([{"title": "Song"}]) == "Radio from Song"
+        assert _radio_fallback_label([{}]) == "Radio from Unknown"
+
+    def test_the_label_interpolates_through_str(self):
+        assert _radio_fallback_label([{"title": 7}]) == "Radio from 7"
+
+
+# ── The like-toggle / download / pause wiring ──────────────────────────────
+
+
+def _toggle_like_host(*, current_track=_TRACK, ytmusic="mock"):
+    host = MagicMock()
+    host.player = SimpleNamespace(current_track=current_track)
+    if ytmusic == "mock":
+        host.ytmusic = MagicMock()
+        host.ytmusic.rate_song = AsyncMock(return_value="success")
+    else:
+        host.ytmusic = ytmusic
+    host.query_one = MagicMock(return_value=MagicMock())
+    host.notify = MagicMock()
+    return host
+
+
+async def _consume(awaitable):
+    """Await a coroutine built outside asyncio.run's loop."""
+    return await awaitable
+
+
+def _run(coro):
+    """Run a coroutine to completion on a fresh loop."""
+    import asyncio
+
+    return asyncio.run(_consume(coro))
+
+
+class TestToggleLikeWiring:
+    """``_toggle_like_current`` routes through the plan engine name."""
+
+    async def test_the_engine_is_consulted_with_the_very_track(self, monkeypatch):
+        calls: list[tuple] = []
+        track = {"video_id": "vid1", "likeStatus": "LIKE"}
+
+        def recording_plan(*args):
+            calls.append(args)
+            return {"current": "LIKE", "new": "INDIFFERENT", "toast": "Removed from Liked songs"}
+
+        monkeypatch.setattr(playback_module, "_like_toggle_plan", recording_plan)
+
+        host = _toggle_like_host(current_track=track)
+        await PlaybackMixin._toggle_like_current.__get__(host)()
+
+        assert calls == [(track,)]
+        host.ytmusic.rate_song.assert_awaited_once_with("vid1", "INDIFFERENT")
+        assert track["likeStatus"] == "INDIFFERENT"
+        host.notify.assert_called_once_with("Removed from Liked songs", timeout=2)
+
+    async def test_a_failed_rating_keeps_the_track_and_skips_the_toast(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module,
+            "_like_toggle_plan",
+            lambda track: {
+                "current": "INDIFFERENT",
+                "new": "LIKE",
+                "toast": "Added to Liked songs",
+            },
+        )
+        track = {"video_id": "vid1", "likeStatus": "INDIFFERENT"}
+        host = _toggle_like_host(current_track=track)
+        host.ytmusic.rate_song = AsyncMock(return_value="error")
+
+        await PlaybackMixin._toggle_like_current.__get__(host)()
+
+        assert track["likeStatus"] == "INDIFFERENT"
+        host.notify.assert_called_once()  # only the failure toast
+
+    async def test_no_current_track_never_consults_the_engine(self, monkeypatch):
+        engine = MagicMock()
+        monkeypatch.setattr(playback_module, "_like_toggle_plan", engine)
+
+        host = _toggle_like_host(current_track=None)
+        await PlaybackMixin._toggle_like_current.__get__(host)()
+
+        engine.assert_not_called()
+
+    async def test_no_service_toasts_the_sign_in_copy(self, monkeypatch):
+        engine = MagicMock()
+        monkeypatch.setattr(playback_module, "_like_toggle_plan", engine)
+
+        host = _toggle_like_host(ytmusic=None)
+        await PlaybackMixin._toggle_like_current.__get__(host)()
+
+        engine.assert_not_called()
+        host.notify.assert_called_once_with("Sign in to like songs", severity="warning", timeout=2)
+
+
+class TestDownloadTrackWiring:
+    """``_download_track`` routes through the toast engine names."""
+
+    def _host(self, *, result=None):
+        host = MagicMock()
+        host.downloader = MagicMock()
+        host.downloader.download = AsyncMock(return_value=result)
+        host.notify = MagicMock()
+        host.cache = None
+        return host
+
+    def test_the_start_engine_is_consulted_before_the_await(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_start(*args):
+            calls.append(args)
+            return {"busy": True, "toast": "Already downloading: T", "already_downloaded": False}
+
+        monkeypatch.setattr(playback_module, "_start_toasts", recording_start)
+
+        host = self._host()
+        _run(PlaybackMixin._download_track.__get__(host)({"video_id": "vid1", "title": "T"}))
+
+        assert calls == [(host.downloader, "vid1", "T")]
+        host.notify.assert_called_once_with("Already downloading: T", timeout=3)
+        host.downloader.download.assert_not_awaited()
+
+    def test_the_success_toast_engine_is_consulted_with_the_start_flag(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module,
+            "_start_toasts",
+            lambda *args: {"busy": False, "toast": None, "already_downloaded": True},
+        )
+        seen: list[tuple] = []
+
+        def recording_success(*args):
+            seen.append(args)
+            return "Already downloaded."
+
+        monkeypatch.setattr(playback_module, "_download_success_toast", recording_success)
+
+        host = self._host(result=SimpleNamespace(success=True, file_path=None))
+        _run(PlaybackMixin._download_track.__get__(host)({"video_id": "vid1", "title": "T"}))
+
+        assert seen == [(True, "T")]
+        host.notify.assert_called_once_with("Already downloaded.", timeout=3)
+
+    def test_the_failure_toast_engine_is_consulted_with_the_raw_error(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module,
+            "_start_toasts",
+            lambda *args: {"busy": False, "toast": None, "already_downloaded": False},
+        )
+        seen: list[tuple] = []
+
+        def recording_failure(*args):
+            seen.append(args)
+            return "Download failed: HTTP 403"
+
+        monkeypatch.setattr(playback_module, "_download_failure_toast", recording_failure)
+
+        host = self._host(result=SimpleNamespace(success=False, error="HTTP 403"))
+        _run(PlaybackMixin._download_track.__get__(host)({"video_id": "vid1", "title": "T"}))
+
+        assert seen == [("HTTP 403",)]
+        host.notify.assert_called_once_with(
+            "Download failed: HTTP 403", severity="error", timeout=4
+        )
+
+    def test_the_no_video_id_copy_is_the_static_spelling(self, monkeypatch):
+        engine = MagicMock()
+        monkeypatch.setattr(playback_module, "_no_video_id_toast", engine)
+
+        host = self._host()
+        _run(PlaybackMixin._download_track.__get__(host)({"title": "T"}))
+
+        # The download path's own copy is static; play_track's engine is
+        # not consulted here.
+        engine.assert_not_called()
+        host.notify.assert_called_once_with("Track has no video ID.", severity="warning", timeout=2)
+        host.downloader.download.assert_not_awaited()
+
+
+class TestPauseChangeWiring:
+    """``_on_pause_change`` routes through the status and Discord engine
+    names."""
+
+    def _host(self, *, mpris=True, mac_media=True, discord=True, player=None):
+        host = MagicMock()
+        host.query_one = MagicMock(return_value=MagicMock())
+        host.mpris = MagicMock() if mpris else None
+        host.mac_media = MagicMock() if mac_media else None
+        host.discord = MagicMock() if discord else None
+        host.player = player
+        host.notify = MagicMock()
+        return host
+
+    def test_the_status_engine_feeds_both_integrations(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_status(paused):
+            calls.append((paused,))
+            return "Paused"
+
+        monkeypatch.setattr(playback_module, "_pause_status", recording_status)
+
+        host = self._host()
+        host.discord = None
+        PlaybackMixin._on_pause_change.__get__(host)(True)
+
+        assert calls == [(True,), (True,)]  # MPRIS and macOS both consult
+        # Both scheduled workers publish the engine's own spelling.
+        host.call_later.call_args_list[0].args[0]()
+        host.run_worker.call_args_list[0].args[0]
+        host.mpris.update_playback_status.assert_called_once_with("Paused")
+        host.call_later.call_args_list[1].args[0]()
+        host.mac_media.update_playback_status.assert_called_once_with("Paused")
+
+    def test_the_discord_clear_arm_runs_the_clear(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_pause_discord_plan", lambda paused, player: {"action": "clear"}
+        )
+
+        host = self._host(mpris=False, mac_media=False)
+        PlaybackMixin._on_pause_change.__get__(host)(True)
+
+        host.call_later.assert_called_once()
+        host.call_later.call_args.args[0]()
+        host.discord.clear.assert_called_once()
+
+    def test_the_discord_update_arm_runs_the_kwargs(self, monkeypatch):
+        kwargs = {"title": "T", "artist": "A", "album": "", "position": 5.0, "thumbnail_url": ""}
+
+        monkeypatch.setattr(
+            playback_module,
+            "_pause_discord_plan",
+            lambda paused, player: {"action": "update", "kwargs": kwargs},
+        )
+
+        host = self._host(mpris=False, mac_media=False)
+        PlaybackMixin._on_pause_change.__get__(host)(False)
+
+        host.call_later.assert_called_once()
+        host.call_later.call_args.args[0]()
+        host.discord.update.assert_called_once_with(**kwargs)
+
+    def test_the_discord_none_arm_schedules_nothing(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_pause_discord_plan", lambda paused, player: {"action": "none"}
+        )
+
+        host = self._host(mpris=False, mac_media=False)
+        PlaybackMixin._on_pause_change.__get__(host)(False)
+
+        host.call_later.assert_not_called()
+
+
+class TestRadioSeedWiring:
+    """``_fetch_and_play_radio`` routes through the seed and label engine
+    names."""
+
+    def _host(self):
+        host = MagicMock()
+        host.ytmusic = MagicMock()
+        host.ytmusic.get_radio = AsyncMock(return_value=[{"video_id": "r1"}])
+        host.notify = MagicMock()
+        host._refresh_queue_page = MagicMock()
+        return host
+
+    async def test_the_seed_engine_is_consulted_with_the_seed_track(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_ids(seed_track):
+            calls.append((seed_track,))
+            return {"seeds": [seed_track], "video_ids": ["a"]}
+
+        monkeypatch.setattr(playback_module, "_radio_seed_ids", recording_ids)
+
+        host = self._host()
+        seed = {"videoId": "a"}
+        await PlaybackMixin._fetch_and_play_radio.__get__(host)(seed, append=True)
+
+        assert calls == [(seed,)]
+        host.ytmusic.get_radio.assert_awaited_once_with(["a"])
+        host.queue.set_radio_tracks.assert_called_once_with([{"video_id": "r1"}])
+        assert host.queue.radio_seeds == [seed]
+
+    async def test_no_resolved_ids_never_fetch(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_radio_seed_ids", lambda seed: {"seeds": [seed], "video_ids": []}
+        )
+
+        host = self._host()
+        await PlaybackMixin._fetch_and_play_radio.__get__(host)({"videoId": ""}, append=True)
+
+        host.ytmusic.get_radio.assert_not_awaited()
+        host.notify.assert_not_called()
+
+    async def test_the_label_engine_answers_the_missing_label(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module,
+            "_radio_seed_ids",
+            lambda seed: {"seeds": [seed], "video_ids": ["a"]},
+        )
+        seen: list[tuple] = []
+
+        def recording_label(seeds):
+            seen.append((seeds,))
+            return "Radio from Song"
+
+        monkeypatch.setattr(playback_module, "_radio_fallback_label", recording_label)
+
+        host = self._host()
+        host.queue.next_track = MagicMock(return_value=None)
+        await PlaybackMixin._fetch_and_play_radio.__get__(host)({"videoId": "a"})
+
+        assert seen == [([{"videoId": "a"}],)]
+        host.notify.assert_called_with("Playing: Radio from Song", timeout=4)
+
+    async def test_an_explicit_label_skips_the_engine(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module,
+            "_radio_seed_ids",
+            lambda seed: {"seeds": [seed], "video_ids": ["a"]},
+        )
+        engine = MagicMock()
+        monkeypatch.setattr(playback_module, "_radio_fallback_label", engine)
+
+        host = self._host()
+        host.queue.next_track = MagicMock(return_value=None)
+        await PlaybackMixin._fetch_and_play_radio.__get__(host)({"videoId": "a"}, label="My Radio")
+
+        engine.assert_not_called()
+        host.notify.assert_called_with("Playing: My Radio", timeout=4)
+
+
+# ── The play-track toast and cache-hit wiring ──────────────────────────────
+
+
+class TestPlayTrackToastWiring:
+    """``play_track``'s failure-path toasts and the cache-hit assembly
+    route through their engine names."""
+
+    def test_the_no_video_id_toast_comes_from_the_engine(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_toast(track):
+            calls.append((track,))
+            return "no id copy"
+
+        monkeypatch.setattr(playback_module, "_no_video_id_toast", recording_toast)
+        monkeypatch.setattr(playback_module.PlaybackMixin, "_handle_play_failure", MagicMock())
+
+        from tests.test_app.test_playback import _fresh_playback_host
+
+        host = _fresh_playback_host()
+        track = {"title": "T"}
+        _run(PlaybackMixin.play_track.__get__(host)(track))
+
+        assert calls == [(track,)]
+        host.notify.assert_called_once_with("no id copy", severity="warning", timeout=3)
+        PlaybackMixin._handle_play_failure.assert_called_once()
+
+    def test_the_unavailable_toast_comes_from_the_engine(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_toast(track, video_id):
+            calls.append((track, video_id))
+            return "unavailable copy"
+
+        monkeypatch.setattr(playback_module, "_unavailable_toast", recording_toast)
+        monkeypatch.setattr(playback_module.PlaybackMixin, "_handle_play_failure", MagicMock())
+
+        from tests.test_app.test_playback import _fresh_playback_host
+
+        host = _fresh_playback_host()
+        host.stream_resolver.resolve = AsyncMock(return_value=None)
+        track = {"video_id": "vid1", "title": "T"}
+        _run(PlaybackMixin.play_track.__get__(host)(track))
+
+        assert calls == [(track, "vid1")]
+        host.notify.assert_called_once_with("unavailable copy", severity="error", timeout=4)
+
+    def test_the_cache_hit_assembles_through_the_engine(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_info(cached_path, video_id, track):
+            calls.append((cached_path, video_id, track))
+            return {
+                "url": "file:///cache/vid1.opus",
+                "video_id": video_id,
+                "format": "opus",
+                "bitrate": 0,
+                "duration": 200,
+                "expires_at": float("inf"),
+                "thumbnail_url": None,
+            }
+
+        monkeypatch.setattr(playback_module, "_cache_hit_stream_info", recording_info)
+
+        from tests.test_app.test_playback import _fresh_playback_host
+
+        host = _fresh_playback_host()
+        host.cache = MagicMock()
+        cached_path = SimpleNamespace(suffix=".opus")
+        host.cache.get = AsyncMock(return_value=cached_path)
+        track = {"video_id": "vid1", "title": "T", "duration": 200}
+        _run(PlaybackMixin.play_track.__get__(host)(track))
+
+        assert calls == [(cached_path, "vid1", track)]
+        # The resolver is never consulted on a cache hit, and the player
+        # receives the engine's url.
+        host.stream_resolver.resolve.assert_not_awaited()
+        url, played_track = host.player.play.await_args.args[:2]
+        assert url == "file:///cache/vid1.opus"
+        assert played_track is track
+
+
 # ── Native parity ─────────────────────────────────────────────────────────
 
 # Failure-policy cases: [repeat_mode, consecutive_failures, failure_kind,
@@ -1632,6 +2322,121 @@ _TIMER_PARITY_CASES = [
     [None, None],
 ]
 
+# Like-toggle cases: [track].
+_LIKE_PARITY_CASES = [
+    [{"likeStatus": "LIKE"}],
+    [{"likeStatus": "like"}],
+    [{"likeStatus": "DISLIKE"}],
+    [{}],
+    [{"likeStatus": None}],
+    [{"likeStatus": ""}],
+    [{"likeStatus": 7}],
+]
+
+# Download-start cases: [downloader desc ([downloading, downloaded] |
+# "boom"), video_id, title].
+_DL_START_PARITY_CASES = [
+    [[True, True], "v", "T"],
+    [[True, False], "v", "T"],
+    [[False, False], "v", "T"],
+    [[False, True], "v", "T"],
+    [[False, False], "v", 7],
+    ["boom", "v", "T"],
+]
+
+# Download-success cases: [already_downloaded, title].
+_DL_OK_PARITY_CASES = [
+    [True, "T"],
+    [False, "T"],
+    [1, "T"],
+    [None, "T"],
+    [False, 7],
+]
+
+# Download-failure cases: [raw error].
+_DL_FAIL_PARITY_CASES = [
+    [None],
+    [""],
+    [0],
+    ["HTTP 403"],
+    [7],
+]
+
+# Pause-status cases: [paused].
+_PAUSE_STATUS_PARITY_CASES = [
+    [True],
+    [False],
+    [1],
+    [0],
+    [None],
+    ["x"],
+]
+
+# Pause-Discord cases: [paused, player desc (null | [current track or
+# null, position])].
+_PAUSE_DISCORD_PARITY_CASES = [
+    [True, None],
+    [False, None],
+    [False, [None, 0.0]],
+    [False, [{"title": "T", "artist": "A"}, 12.5]],
+    [False, [{"title": "T", "thumbnail_url": "u"}, 0.0]],
+    [False, [[], 0.0]],
+    [False, [5, 0.0]],
+]
+
+# No-video-id toast cases: [track].
+_TOAST_NO_ID_PARITY_CASES = [
+    [{"title": "X"}],
+    [{}],
+    [{"title": 7}],
+]
+
+# Unavailable toast cases: [track, video_id].
+_TOAST_UNAVAIL_PARITY_CASES = [
+    [{"title": "X"}, "v"],
+    [{}, "v"],
+    [{"title": 7}, "v"],
+    [{}, 7],
+]
+
+# Stream-failed-twice toast cases: [track, video_id].
+_TOAST_TWICE_PARITY_CASES = [
+    [{"title": "X"}, "v"],
+    [{}, "v"],
+    [{"title": 7}, "v"],
+    [{}, 7],
+]
+
+# Cache-hit cases: [path suffix ("boom" → a path without one), video_id,
+# track].
+_CACHE_HIT_PARITY_CASES = [
+    [".opus", "vid", {"duration": 200, "thumbnail_url": "u"}],
+    [".opus", "vid", {}],
+    ["opus", "vid", {"duration": None}],
+    [".", "vid", {"duration": 0}],
+    ["", "vid", {"duration": 200}],
+    [".tar.gz", "vid", {"duration": "x"}],
+    ["boom", "vid", {}],
+]
+
+# Radio-seed cases: [seed].
+_RADIO_IDS_PARITY_CASES = [
+    [{"videoId": "a"}],
+    [{"video_id": "b"}],
+    [[{"videoId": "a"}, {"videoId": ""}, {"video_id": "b"}, {}]],
+    [[]],
+    [7],
+]
+
+# Radio-label cases: [seeds].
+_RADIO_LABEL_PARITY_CASES = [
+    [[{"title": "Song"}]],
+    [[{}]],
+    [[{"title": 7}]],
+    [[]],
+    [[7]],
+]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -1684,6 +2489,41 @@ def make_position(desc):
     if desc == "inf":
         return float("inf")
     return desc
+
+
+class Dl:
+    def __init__(self, downloading, downloaded):
+        self._downloading = downloading
+        self._downloaded = downloaded
+
+    def is_downloading(self, video_id):
+        return self._downloading
+
+    def is_downloaded(self, video_id):
+        return self._downloaded
+
+
+class BoomDl:
+    def is_downloading(self, video_id):
+        raise RuntimeError("boom is_downloading")
+
+
+def make_dl(desc):
+    if desc == "boom":
+        return BoomDl()
+    return Dl(desc[0], desc[1])
+
+
+def make_pause_player(desc):
+    if desc is None:
+        return None
+    return SimpleNamespace(current_track=desc[0], position=desc[1])
+
+
+def make_cache_path(desc):
+    if desc == "boom":
+        return 42
+    return SimpleNamespace(suffix=desc)
 
 
 def failure_outcome(case):
@@ -1815,6 +2655,114 @@ def timer_outcome(case):
     return {"ok": result}
 
 
+def like_outcome(case):
+    (track,) = case
+    try:
+        result = _playback._like_toggle_plan(track)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def dl_start_outcome(case):
+    dl_desc, video_id, title = case
+    try:
+        result = _playback._start_toasts(make_dl(dl_desc), video_id, title)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def dl_ok_outcome(case):
+    already, title = case
+    try:
+        result = _playback._download_success_toast(already, title)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def dl_fail_outcome(case):
+    (error,) = case
+    try:
+        result = _playback._download_failure_toast(error)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def pause_status_outcome(case):
+    (paused,) = case
+    try:
+        result = _playback._pause_status(paused)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def pause_discord_outcome(case):
+    paused, player_desc = case
+    try:
+        result = _playback._pause_discord_plan(paused, make_pause_player(player_desc))
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def toast_no_id_outcome(case):
+    (track,) = case
+    try:
+        result = _playback._no_video_id_toast(track)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def toast_unavail_outcome(case):
+    track, video_id = case
+    try:
+        result = _playback._unavailable_toast(track, video_id)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def toast_twice_outcome(case):
+    track, video_id = case
+    try:
+        result = _playback._stream_failed_twice_toast(track, video_id)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def cache_hit_outcome(case):
+    suffix, video_id, track = case
+    try:
+        result = _playback._cache_hit_stream_info(make_cache_path(suffix), video_id, track)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def radio_ids_outcome(case):
+    (seed,) = case
+    try:
+        result = _playback._radio_seed_ids(seed)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def radio_label_outcome(case):
+    (seeds,) = case
+    try:
+        result = _playback._radio_fallback_label(seeds)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
 FAMILIES = {
     "failure": failure_outcome,
     "step": step_outcome,
@@ -1827,6 +2775,18 @@ FAMILIES = {
     "insert": insert_outcome,
     "min": min_outcome,
     "timer": timer_outcome,
+    "like": like_outcome,
+    "dl_start": dl_start_outcome,
+    "dl_ok": dl_ok_outcome,
+    "dl_fail": dl_fail_outcome,
+    "pause_status": pause_status_outcome,
+    "pause_discord": pause_discord_outcome,
+    "toast_no_id": toast_no_id_outcome,
+    "toast_unavail": toast_unavail_outcome,
+    "toast_twice": toast_twice_outcome,
+    "cache_hit": cache_hit_outcome,
+    "radio_ids": radio_ids_outcome,
+    "radio_label": radio_label_outcome,
 }
 
 payload = json.load(sys.stdin)
@@ -1905,6 +2865,31 @@ def _parent_position(desc):
     if desc == "inf":
         return float("inf")
     return desc
+
+
+class _ParityBoomDl:
+    """The parent-side twin of the child program's raising downloader."""
+
+    def is_downloading(self, video_id):
+        raise RuntimeError("boom is_downloading")
+
+
+def _parent_dl(desc):
+    if desc == "boom":
+        return _ParityBoomDl()
+    return _Downloader(desc[0], desc[1])
+
+
+def _parent_pause_player(desc):
+    if desc is None:
+        return None
+    return SimpleNamespace(current_track=desc[0], position=desc[1])
+
+
+def _parent_cache_path(desc):
+    if desc == "boom":
+        return 42
+    return SimpleNamespace(suffix=desc)
 
 
 def _native_new_family_outcomes(family):
@@ -1999,6 +2984,96 @@ def _native_new_family_outcomes(family):
         finally:
             playback_module._YTM_HISTORY_POLL_SECONDS = saved
 
+    def like(case):
+        (track,) = case
+        try:
+            return {"ok": playback_module._like_toggle_plan(track)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def dl_start(case):
+        dl_desc, video_id, title = case
+        try:
+            return {"ok": playback_module._start_toasts(_parent_dl(dl_desc), video_id, title)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def dl_ok(case):
+        already, title = case
+        try:
+            return {"ok": playback_module._download_success_toast(already, title)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def dl_fail(case):
+        (error,) = case
+        try:
+            return {"ok": playback_module._download_failure_toast(error)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def pause_status(case):
+        (paused,) = case
+        try:
+            return {"ok": playback_module._pause_status(paused)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def pause_discord(case):
+        paused, player_desc = case
+        try:
+            return {
+                "ok": playback_module._pause_discord_plan(paused, _parent_pause_player(player_desc))
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def toast_no_id(case):
+        (track,) = case
+        try:
+            return {"ok": playback_module._no_video_id_toast(track)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def toast_unavail(case):
+        track, video_id = case
+        try:
+            return {"ok": playback_module._unavailable_toast(track, video_id)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def toast_twice(case):
+        track, video_id = case
+        try:
+            return {"ok": playback_module._stream_failed_twice_toast(track, video_id)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def cache_hit(case):
+        suffix, video_id, track = case
+        try:
+            return {
+                "ok": playback_module._cache_hit_stream_info(
+                    _parent_cache_path(suffix), video_id, track
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def radio_ids(case):
+        (seed,) = case
+        try:
+            return {"ok": playback_module._radio_seed_ids(seed)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def radio_label(case):
+        (seeds,) = case
+        try:
+            return {"ok": playback_module._radio_fallback_label(seeds)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     builders = {
         "gate": gate,
         "poll": poll,
@@ -2009,18 +3084,20 @@ def _native_new_family_outcomes(family):
         "insert": insert,
         "min": minimum,
         "timer": timer,
+        "like": like,
+        "dl_start": dl_start,
+        "dl_ok": dl_ok,
+        "dl_fail": dl_fail,
+        "pause_status": pause_status,
+        "pause_discord": pause_discord,
+        "toast_no_id": toast_no_id,
+        "toast_unavail": toast_unavail,
+        "toast_twice": toast_twice,
+        "cache_hit": cache_hit,
+        "radio_ids": radio_ids,
+        "radio_label": radio_label,
     }
-    cases = {
-        "gate": _GATE_PARITY_CASES,
-        "poll": _POLL_PARITY_CASES,
-        "notif": _NOTIF_PARITY_CASES,
-        "prefetch": _PREFETCH_PARITY_CASES,
-        "refill": _REFILL_PARITY_CASES,
-        "local": _LOCAL_PARITY_CASES,
-        "insert": _INSERT_PARITY_CASES,
-        "min": _MIN_PARITY_CASES,
-        "timer": _TIMER_PARITY_CASES,
-    }
+    cases = _FAMILY_CASES
     return [builders[family](case) for case in cases[family]]
 
 
@@ -2034,22 +3111,48 @@ _FAMILY_ENGINE_NAMES = {
     "insert": "_insert_finalize_plan",
     "min": "_min_listen_seconds",
     "timer": "_timer_arm_delay",
+    "like": "_like_toggle_plan",
+    "dl_start": "_start_toasts",
+    "dl_ok": "_download_success_toast",
+    "dl_fail": "_download_failure_toast",
+    "pause_status": "_pause_status",
+    "pause_discord": "_pause_discord_plan",
+    "toast_no_id": "_no_video_id_toast",
+    "toast_unavail": "_unavailable_toast",
+    "toast_twice": "_stream_failed_twice_toast",
+    "cache_hit": "_cache_hit_stream_info",
+    "radio_ids": "_radio_seed_ids",
+    "radio_label": "_radio_fallback_label",
+}
+
+_FAMILY_CASES = {
+    "gate": _GATE_PARITY_CASES,
+    "poll": _POLL_PARITY_CASES,
+    "notif": _NOTIF_PARITY_CASES,
+    "prefetch": _PREFETCH_PARITY_CASES,
+    "refill": _REFILL_PARITY_CASES,
+    "local": _LOCAL_PARITY_CASES,
+    "insert": _INSERT_PARITY_CASES,
+    "min": _MIN_PARITY_CASES,
+    "timer": _TIMER_PARITY_CASES,
+    "like": _LIKE_PARITY_CASES,
+    "dl_start": _DL_START_PARITY_CASES,
+    "dl_ok": _DL_OK_PARITY_CASES,
+    "dl_fail": _DL_FAIL_PARITY_CASES,
+    "pause_status": _PAUSE_STATUS_PARITY_CASES,
+    "pause_discord": _PAUSE_DISCORD_PARITY_CASES,
+    "toast_no_id": _TOAST_NO_ID_PARITY_CASES,
+    "toast_unavail": _TOAST_UNAVAIL_PARITY_CASES,
+    "toast_twice": _TOAST_TWICE_PARITY_CASES,
+    "cache_hit": _CACHE_HIT_PARITY_CASES,
+    "radio_ids": _RADIO_IDS_PARITY_CASES,
+    "radio_label": _RADIO_LABEL_PARITY_CASES,
 }
 
 
 def _assert_family_parity(family):
     """Run the child for one family and compare every case."""
-    cases = {
-        "gate": _GATE_PARITY_CASES,
-        "poll": _POLL_PARITY_CASES,
-        "notif": _NOTIF_PARITY_CASES,
-        "prefetch": _PREFETCH_PARITY_CASES,
-        "refill": _REFILL_PARITY_CASES,
-        "local": _LOCAL_PARITY_CASES,
-        "insert": _INSERT_PARITY_CASES,
-        "min": _MIN_PARITY_CASES,
-        "timer": _TIMER_PARITY_CASES,
-    }[family]
+    cases = _FAMILY_CASES[family]
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROG],
         input=json.dumps({family: cases}),
@@ -2146,3 +3249,51 @@ class TestNativeParity:
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     def test_the_timer_arm_delay_matches_the_fallback(self):
         _assert_family_parity("timer")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_like_toggle_plan_matches_the_fallback(self):
+        _assert_family_parity("like")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_download_start_toasts_match_the_fallback(self):
+        _assert_family_parity("dl_start")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_download_success_toast_matches_the_fallback(self):
+        _assert_family_parity("dl_ok")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_download_failure_toast_matches_the_fallback(self):
+        _assert_family_parity("dl_fail")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_pause_status_matches_the_fallback(self):
+        _assert_family_parity("pause_status")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_pause_discord_plan_matches_the_fallback(self):
+        _assert_family_parity("pause_discord")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_no_video_id_toast_matches_the_fallback(self):
+        _assert_family_parity("toast_no_id")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_unavailable_toast_matches_the_fallback(self):
+        _assert_family_parity("toast_unavail")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_stream_failed_twice_toast_matches_the_fallback(self):
+        _assert_family_parity("toast_twice")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_cache_hit_stream_info_matches_the_fallback(self):
+        _assert_family_parity("cache_hit")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_radio_seed_ids_match_the_fallback(self):
+        _assert_family_parity("radio_ids")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_radio_fallback_label_matches_the_fallback(self):
+        _assert_family_parity("radio_label")

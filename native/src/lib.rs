@@ -1982,6 +1982,54 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         app::playback::playback_history_timer_delay,
         module
     )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_like_toggle_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_download_start_toasts,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_download_success_toast,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_download_failure_toast,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_pause_status,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_pause_discord_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_no_video_id_toast,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_unavailable_toast,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_stream_failed_twice_toast,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_cache_hit_stream_info,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_radio_seed_ids,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_radio_fallback_label,
+        module
+    )?)?;
 
     // Track-action engines (app/_track_actions.py equivalents): the
     // occurrence gate behind the actions popup's queue-entry naming

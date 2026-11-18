@@ -670,3 +670,431 @@ pub(crate) fn playback_history_timer_delay<'py>(
     }
     Ok(fl)
 }
+
+/// The like-toggle plan — `app/_playback.py`'s `_toggle_like_current`
+/// decision core: which rating the playback bar's `l` key submits, and
+/// the toast that confirms it.
+///
+/// Mirrors the reference exactly, every read through the track's own
+/// `get` method: the raw `likeStatus` (no default — a missing status
+/// reads `None`) falls back to `"INDIFFERENT"` under CPython's own
+/// truthiness, the result uppercased through the string's own
+/// `.upper()` (a truthy non-str status raises its own `AttributeError`
+/// here, exactly like the reference), and the cycle flips — a current
+/// status of `"LIKE"` (CPython's own `==`) answers `INDIFFERENT`,
+/// anything else `LIKE` (a disliked track switches to LIKE, clearing
+/// the dislike; DISLIKE is never re-applied — that state is left to
+/// the track-actions popup). The toast names the outcome: `"Added to
+/// Liked songs"` / `"Removed from Liked songs"`. The player / track /
+/// video-id / service gates, the `rate_song` submission, the track's
+/// `likeStatus` write and the bar push stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (track))]
+pub(crate) fn playback_like_toggle_plan<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // track.get("likeStatus") or "INDIFFERENT" — the truthiness read,
+    // then the string's own .upper().
+    let like_status = track.call_method1("get", ("likeStatus",))?;
+    let base = if like_status.is_truthy()? {
+        like_status
+    } else {
+        "INDIFFERENT".into_pyobject(py)?.into_any()
+    };
+    let current = base.call_method0("upper")?;
+    // current_status == "LIKE" — CPython's own ==.
+    let new_status = if current.eq("LIKE")? {
+        "INDIFFERENT"
+    } else {
+        "LIKE"
+    };
+    let toast = if new_status == "LIKE" {
+        "Added to Liked songs"
+    } else {
+        "Removed from Liked songs"
+    };
+    let out = PyDict::new(py);
+    out.set_item("current", current)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("new", new_status)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("toast", toast)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The download start toasts — `app/_playback.py`'s `_download_track`
+/// pre-await decision core: what the user hears before the download
+/// worker runs, and whether it runs at all.
+///
+/// Mirrors the reference exactly, both service reads through the
+/// *downloader*'s own methods, each called exactly when the reference
+/// calls it: `is_downloading(video_id)` first — a truthy answer is the
+/// busy arm: the caller returns after the `"Already downloading: …"`
+/// toast and `is_downloaded` is never consulted (the reference's early
+/// return); a falsy one proceeds to `is_downloaded(video_id)`, whose
+/// answer travels home as `already_downloaded` (the caller's own
+/// success toast needs it) with the `"Downloading: …"` toast shown
+/// only when nothing is downloaded yet. *title* is the caller's own
+/// read (the reference's `track.get("title", video_id)`, read once
+/// before either arm). The `download` await, the cache indexing and
+/// the retention branch stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (downloader, video_id, title))]
+pub(crate) fn playback_download_start_toasts<'py>(
+    py: Python<'py>,
+    downloader: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+    title: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // downloader.is_downloading(video_id) — called exactly here,
+    // exactly once.
+    let is_downloading = downloader.call_method1("is_downloading", (video_id,))?;
+    if is_downloading.is_truthy()? {
+        let toast = format!("Already downloading: {}", py_str(title)?);
+        out.set_item("busy", true)
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("toast", toast)
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("already_downloaded", false)
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    // downloader.is_downloaded(video_id) — the reference's own read,
+    // only on the non-busy arm.
+    let already = downloader.call_method1("is_downloaded", (video_id,))?;
+    let already = already.is_truthy()?;
+    let toast = if already {
+        None
+    } else {
+        Some(format!("Downloading: {}", py_str(title)?))
+    };
+    let toast = match toast {
+        Some(text) => text.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    out.set_item("busy", false)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("toast", toast)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("already_downloaded", already)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The download success toast — `app/_playback.py`'s `_download_track`
+/// landed-arm copy: `"Already downloaded."` when the track was
+/// downloaded before this press, `"Downloaded: …"` when this press
+/// produced the file. *title* is the caller's own read; the cache
+/// indexing and the retention branch stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (already_downloaded, title))]
+pub(crate) fn playback_download_success_toast<'py>(
+    py: Python<'py>,
+    already_downloaded: &Bound<'py, PyAny>,
+    title: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    if already_downloaded.is_truthy()? {
+        return Ok("Already downloaded.".into_pyobject(py)?.into_any());
+    }
+    let text = format!("Downloaded: {}", py_str(title)?);
+    Ok(text.into_pyobject(py)?.into_any())
+}
+
+/// The download failure toast — `app/_playback.py`'s `_download_track`
+/// failure-arm copy: the raw *error* object falling back to
+/// `"Unknown error"` under CPython's own truthiness, interpolated
+/// through the f-string's own `str()` conversion.
+#[pyfunction]
+#[pyo3(signature = (error))]
+pub(crate) fn playback_download_failure_toast<'py>(
+    py: Python<'py>,
+    error: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // result.error or "Unknown error" — the truthiness read.
+    let error = if error.is_truthy()? {
+        py_str(error)?
+    } else {
+        "Unknown error".to_string()
+    };
+    let text = format!("Download failed: {}", error);
+    Ok(text.into_pyobject(py)?.into_any())
+}
+
+/// The pause-change status string — `app/_playback.py`'s
+/// `_on_pause_change` copy, the `"Paused"` / `"Playing"` spelling both
+/// platform integrations (MPRIS and macOS Now Playing) publish under
+/// the *paused* flag's own truthiness.
+#[pyfunction]
+#[pyo3(signature = (paused))]
+pub(crate) fn playback_pause_status(paused: &Bound<'_, PyAny>) -> PyResult<&'static str> {
+    if paused.is_truthy()? {
+        return Ok("Paused");
+    }
+    Ok("Playing")
+}
+
+/// The pause-change Discord plan — `app/_playback.py`'s
+/// `_on_pause_change` Discord Rich Presence arm: whether a pause
+/// clears the presence and a resume re-publishes it, and the exact
+/// kwargs the resume's `update` receives.
+///
+/// Mirrors the reference exactly: a truthy *paused* answers `clear`.
+/// Otherwise the *player* object's own `current_track` is read
+/// exactly here (a falsy player answers `none` — the reference's
+/// `elif self.player and …` guard), and a falsy track answers `none`
+/// too. A truthy track answers `update` carrying the five kwargs: the
+/// title, artist and album through the track's own `get` with the
+/// reference's `""` defaults, the thumbnail through the same `get`
+/// with the `or ""` truthiness fallback, and the player's own
+/// `position`, read exactly here, exactly when the reference builds
+/// the update. The `call_later` scheduling and the worker runs stay
+/// Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (paused, player))]
+pub(crate) fn playback_pause_discord_plan<'py>(
+    py: Python<'py>,
+    paused: &Bound<'py, PyAny>,
+    player: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // if paused: — the flag's truthiness.
+    if paused.is_truthy()? {
+        out.set_item("action", "clear")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    // elif self.player and self.player.current_track: — the player's
+    // own track, read exactly here.
+    let track = if player.is_truthy()? {
+        player.getattr("current_track")?
+    } else {
+        py.None().into_bound(py)
+    };
+    if !track.is_truthy()? {
+        out.set_item("action", "none")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    let kwargs = PyDict::new(py);
+    let empty = "".into_pyobject(py)?.into_any();
+    kwargs
+        .set_item("title", track.call_method1("get", ("title", &empty))?)
+        .expect("dict insertion with a str key cannot fail");
+    kwargs
+        .set_item("artist", track.call_method1("get", ("artist", &empty))?)
+        .expect("dict insertion with a str key cannot fail");
+    kwargs
+        .set_item("album", track.call_method1("get", ("album", &empty))?)
+        .expect("dict insertion with a str key cannot fail");
+    // p.position — the player's own read, exactly when the reference
+    // builds the update.
+    kwargs
+        .set_item("position", player.getattr("position")?)
+        .expect("dict insertion with a str key cannot fail");
+    let thumbnail = track.call_method1("get", ("thumbnail_url",))?;
+    let thumbnail = if thumbnail.is_truthy()? {
+        thumbnail
+    } else {
+        empty
+    };
+    kwargs
+        .set_item("thumbnail_url", thumbnail)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("action", "update")
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("kwargs", kwargs)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The no-video-id toast — `app/_playback.py`'s `play_track` copy for
+/// a track with no resolvable id: the title through the track's own
+/// `get` with the reference's `"Unknown"` default, interpolated
+/// through the f-string's own `str()` conversion.
+#[pyfunction]
+#[pyo3(signature = (track))]
+pub(crate) fn playback_no_video_id_toast<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // track.get("title", "Unknown") — the track's own get.
+    let title = track.call_method1("get", ("title", "Unknown"))?;
+    let text = format!(
+        "Skipping \"{}\" — no video ID (AI-generated streams are not supported).",
+        py_str(&title)?
+    );
+    Ok(text.into_pyobject(py)?.into_any())
+}
+
+/// The unavailable-toast — `app/_playback.py`'s `play_track` copy for
+/// a stream that resolved to nothing: the title through the track's
+/// own `get` with the *video_id* default (the reference's own
+/// spelling), interpolated through the f-string's own `str()`
+/// conversion.
+#[pyfunction]
+#[pyo3(signature = (track, video_id))]
+pub(crate) fn playback_unavailable_toast<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // track.get("title", video_id) — the track's own get, the id as
+    // the default.
+    let title = track.call_method1("get", ("title", video_id))?;
+    let text = format!(
+        "Couldn't play \"{}\" — track may be unavailable or region-locked. Playback failed.",
+        py_str(&title)?
+    );
+    Ok(text.into_pyobject(py)?.into_any())
+}
+
+/// The stream-failed-twice toast — `app/_playback.py`'s
+/// `_on_player_error` recovery-arm copy: the title through the track's
+/// own `get` with the *video_id* default, interpolated through the
+/// f-string's own `str()` conversion.
+#[pyfunction]
+#[pyo3(signature = (track, video_id))]
+pub(crate) fn playback_stream_failed_twice_toast<'py>(
+    py: Python<'py>,
+    track: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let title = track.call_method1("get", ("title", video_id))?;
+    let text = format!(
+        "Couldn't play \"{}\" — stream failed twice.",
+        py_str(&title)?
+    );
+    Ok(text.into_pyobject(py)?.into_any())
+}
+
+/// The cache-hit stream info — `app/_playback.py`'s `play_track`
+/// assembly of the local-file `StreamInfo` kwargs when the audio cache
+/// already holds the track.
+///
+/// Mirrors the reference exactly, every read through the referenced
+/// object's own protocol: `url` is `str(cached_path)` (the f-string's
+/// own conversion), `format` the path's own `.suffix` stripped of its
+/// leading dot through the string's own `.lstrip(".")` with the
+/// `"opus"` fallback under CPython's own truthiness, `bitrate` the
+/// literal `0` (unknown for cached files), `duration` the track's own
+/// `get("duration")` with the `or 0` truthiness fallback,
+/// `expires_at` the builtins' own `float("inf")` (local files do not
+/// expire), and `thumbnail_url` the track's own `get` answer passed
+/// through as the object it is. The `StreamInfo` construction itself
+/// stays Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (cached_path, video_id, track))]
+pub(crate) fn playback_cache_hit_stream_info<'py>(
+    py: Python<'py>,
+    cached_path: &Bound<'py, PyAny>,
+    video_id: &Bound<'py, PyAny>,
+    track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // str(cached_path) — the f-string's own conversion.
+    out.set_item("url", py_str(cached_path)?)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("video_id", video_id)
+        .expect("dict insertion with a str key cannot fail");
+    // cached_path.suffix.lstrip(".") or "opus" — the path's own
+    // suffix, the string's own lstrip, the truthiness fallback.
+    let suffix = cached_path.getattr("suffix")?;
+    let stripped = suffix.call_method1("lstrip", (".",))?;
+    let format = if stripped.is_truthy()? {
+        py_str(&stripped)?
+    } else {
+        "opus".to_string()
+    };
+    out.set_item("format", format)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("bitrate", 0i64)
+        .expect("dict insertion with a str key cannot fail");
+    // track.get("duration") or 0 — the track's own get, the
+    // truthiness fallback.
+    let duration = track.call_method1("get", ("duration",))?;
+    let duration = if duration.is_truthy()? {
+        duration
+    } else {
+        0i64.into_pyobject(py)?.into_any()
+    };
+    out.set_item("duration", duration)
+        .expect("dict insertion with a str key cannot fail");
+    // float("inf") — the builtins' own conversion.
+    let inf = py.import("builtins")?.getattr("float")?.call1(("inf",))?;
+    out.set_item("expires_at", inf)
+        .expect("dict insertion with a str key cannot fail");
+    // track.get("thumbnail_url") — the object itself, None included.
+    let thumbnail = track.call_method1("get", ("thumbnail_url",))?;
+    out.set_item("thumbnail_url", thumbnail)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The radio seed ids — `app/_playback.py`'s `_fetch_and_play_radio`
+/// seed normalisation and id walk: the seed list a radio fetch runs
+/// against, and the video ids it actually seeds with.
+///
+/// Mirrors the reference exactly: a dict *seed_track* is wrapped in a
+/// fresh one-element list (`isinstance(..., dict)` — the
+/// `PyDict_Check` acceptance set, dict subclasses included), anything
+/// else passes through as the object it is; then every seed's video id
+/// is resolved through this module's own `get_video_id` name at call
+/// time (the very function the fallback calls — a patched or native
+/// binding steers both backends identically), called exactly twice per
+/// seed like the reference's `if get_video_id(t)` comprehension, and
+/// only truthy ids land in the list. The `get_radio` await, the queue
+/// mutations and the notifications stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (seed_track))]
+pub(crate) fn playback_radio_seed_ids<'py>(
+    py: Python<'py>,
+    seed_track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    // [seed_track] if isinstance(seed_track, dict) else seed_track.
+    let seeds: Bound<'py, PyAny> = if seed_track.is_instance_of::<PyDict>() {
+        PyList::new(py, [seed_track])?.into_any()
+    } else {
+        seed_track.clone()
+    };
+    // This module's own get_video_id, resolved at call time.
+    let get_video_id = PyModule::import(py, "ytm_player.app._playback")?.getattr("get_video_id")?;
+    let video_ids = PyList::new(py, Vec::<Bound<'py, PyAny>>::new())?;
+    for item in seeds.try_iter()? {
+        let item = item?;
+        let id = get_video_id.call1((&item,))?;
+        if id.is_truthy()? {
+            video_ids.append(id)?;
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("seeds", &seeds)
+        .expect("dict insertion with a str key cannot fail");
+    out.set_item("video_ids", video_ids)
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The radio fallback label — `app/_playback.py`'s
+/// `_fetch_and_play_radio` label fallback: the `"Radio from …"`
+/// spelling built from the first seed's own title (`seeds[0]` through
+/// the sequence's own `__getitem__`, the title through the seed's own
+/// `get` with the `"Unknown"` default, interpolated through the
+/// f-string's own `str()` conversion). The caller's own label argument
+/// wins when set; the queue mutations and the notifications stay
+/// Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (seeds))]
+pub(crate) fn playback_radio_fallback_label<'py>(
+    py: Python<'py>,
+    seeds: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    // seeds[0].get("title", "Unknown") — the sequence's own
+    // subscription, the seed's own get.
+    let first = seeds.get_item(0)?;
+    let title = first.call_method1("get", ("title", "Unknown"))?;
+    let text = format!("Radio from {}", py_str(&title)?);
+    Ok(text.into_pyobject(py)?.into_any())
+}
