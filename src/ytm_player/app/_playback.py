@@ -1,6 +1,6 @@
 """Playback coordination mixin for YTMPlayerApp.
 
-Twenty-three decision cores are implemented by the Rust extension
+Twenty-seven decision cores are implemented by the Rust extension
 when it is built, with pure-Python transcriptions as the fallback
 otherwise:
 the playback-failure policy ``_play_failure_policy`` (the verdict
@@ -33,10 +33,14 @@ pause-change pair ``_pause_status`` / ``_pause_discord_plan`` (behind
 ``_on_player_error``), the cache-hit ``StreamInfo`` kwargs
 ``_cache_hit_stream_info`` (behind ``play_track``), and the radio
 pair ``_radio_seed_ids`` / ``_radio_fallback_label`` (behind
-``_fetch_and_play_radio``). The asyncio/request-ownership glue, the
-failure counter, the queue state, the timer chains, the claim writes,
-the widget queries, the play/pause/next/previous branch glue and
-every await stay Python-side in this mixin.
+``_fetch_and_play_radio``), plus the report-chain identity gate pair
+``_local_report_gates`` / ``_ytm_report_gates`` (the liveness checks
+that head ``_report_local_play`` and ``_report_ytm_play``) and the
+transport branch pair ``_toggle_plan`` / ``_next_plan`` (behind
+``_toggle_play_pause`` and ``_play_next``). The asyncio/request-
+ownership glue, the failure counter, the queue state, the timer
+chains, the claim writes, the widget queries, the awaited I/O
+coordination and every await stay Python-side in this mixin.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ytm_player.app._base import YTMHostBase
 from ytm_player.app._ownership import (
@@ -59,6 +63,9 @@ from ytm_player.ui.header_bar import HeaderBar
 from ytm_player.ui.playback_bar import PlaybackBar
 from ytm_player.ui.widgets.track_table import TrackTable
 from ytm_player.utils.formatting import get_video_id, normalize_tracks
+
+if TYPE_CHECKING:
+    from ytm_player.services.player import Player
 
 logger = logging.getLogger(__name__)
 
@@ -674,6 +681,145 @@ def _radio_fallback_label(seeds: Any) -> str:
     return f"Radio from {seeds[0].get('title', 'Unknown')}"
 
 
+def _local_report_gates(
+    claim: Any,
+    live_claim: Any,
+    history: Any,
+    player: Any,
+) -> bool:
+    """The local report chain's identity gates behind
+    ``_report_local_play``.
+
+    Whether the local-history report timer chain is still armed for
+    the very play it was scheduled for, so the tick may measure the
+    listen and consult ``_history_report_step`` at all: identity is the
+    liveness check — a *claim* that is not the host's live claim (the
+    ``is`` comparison; every committed play replaces
+    ``_local_history_claim``) ends the chain without ever reading the
+    claim's own ``finalized`` flag (the or-chain's short circuit), and
+    a truthy flag on the live claim ends it too — the finalize path
+    already wrote the row, the claim is consumed. Then the two service
+    guards: a falsy *history* manager or a falsy *player* ends the
+    chain — each read by the caller exactly when the reference's own
+    chain reaches it. The position read, the min-listen resolution,
+    the timer re-arms and the insert worker stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_local_report_gates``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if claim is not live_claim or claim.finalized:
+        return False
+    if not history or not player:
+        return False
+    return True
+
+
+def _ytm_report_gates(
+    generation: Any,
+    play_generation: Any,
+    reported_generation: Any,
+    sync_enabled: Any,
+    ytmusic: Any,
+    player: Any,
+) -> bool:
+    """The account report chain's identity gates behind
+    ``_report_ytm_play``.
+
+    Whether the YT Music history report timer chain is still armed for
+    the very play it was scheduled for, so the tick may measure the
+    listen and consult ``_history_report_step`` at all: a *generation*
+    that no longer equals the host's current ``_play_generation`` ends
+    the chain (a quick skip bumped it before the timer fired); a
+    *reported_generation* that equals this one ends it too — the
+    account already accepted the play and the push worker marked it,
+    so a second poll would duplicate it; a falsy *sync_enabled*
+    setting or a falsy *ytmusic* service ends the chain — the opt-out
+    read by the caller exactly when the reference's own chain reaches
+    it; and a falsy *player* ends it. The position read, the
+    min-listen resolution, the timer re-arms and the push worker stay
+    in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_ytm_report_gates``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if generation != play_generation:
+        return False
+    if reported_generation == generation:
+        return False
+    if not sync_enabled or not ytmusic:
+        return False
+    if not player:
+        return False
+    return True
+
+
+def _toggle_plan(player: Any, queue: Any) -> dict[str, Any]:
+    """The play/pause toggle branch behind ``_toggle_play_pause``.
+
+    Which of the transport's three outcomes a toggle press takes: a
+    truthy *player* whose own ``current_track`` is ``None`` (the
+    identity check — the player is idle) and whose *queue* object's
+    own ``current_track`` is truthy answers ``start`` — the caller
+    restarts playback from the queue's current track, re-reading it
+    exactly like the reference's second read; the player's read first,
+    the queue's read only once the player proved idle, so a
+    short-circuited chain never touches the queue. A truthy player
+    without that idle-and-armed pair answers ``toggle`` — the caller
+    flips the player's pause; a falsy player answers ``none`` —
+    nothing to toggle. The ``play_track`` / ``toggle_pause`` calls and
+    every await stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_toggle_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if player:
+        if player.current_track is None and queue.current_track:
+            return {"action": "start"}
+        return {"action": "toggle"}
+    return {"action": "none"}
+
+
+def _next_plan(
+    next_track: Any,
+    autoplay_enabled: Any,
+    ended_track: Any,
+    player: Any,
+) -> dict[str, Any]:
+    """The next-track branch behind ``_play_next``.
+
+    Where a next-press (or a consumed track end) goes from here: the
+    queue's own advance-and-read — pulled through *next_track* exactly
+    here, exactly once, the reference's own ``next_track()`` — answers
+    ``play`` carrying the very track it produced. An empty pull
+    consults *autoplay_enabled*: a falsy setting answers
+    ``end_of_queue``. A truthy one walks the radio seed — *ended_track*
+    under its own truthiness first (the track that just ended, passed
+    by the track-end handler), and for a falsy ended track the
+    *player* object's own ``current_track`` (read exactly here, a
+    falsy player answering ``None``) — a truthy seed answers ``radio``
+    carrying the very object, anything else ``end_of_queue``. The
+    ``play_track`` and radio-fetch awaits, the request-ownership
+    re-check after the fetch, the second queue pull and the
+    end-of-queue toasts stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_next_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    track = next_track()
+    if track:
+        return {"action": "play", "track": track}
+    if not autoplay_enabled:
+        return {"action": "end_of_queue"}
+    seed = ended_track or (player.current_track if player else None)
+    if seed:
+        return {"action": "radio", "seed": seed}
+    return {"action": "end_of_queue"}
+
+
 @dataclass
 class _LocalHistoryClaim:
     """Ownership token for one play's local-history row.
@@ -1071,30 +1217,52 @@ class PlaybackMixin(YTMHostBase):
 
     async def _toggle_play_pause(self) -> None:
         """Toggle play/pause, starting playback from queue if player is idle."""
-        if self.player and self.player.current_track is None and self.queue.current_track:
+        # The idle-vs-pause branch — whether a toggle press starts
+        # playback from the queue's current track or flips the
+        # player's pause — is resolved by the ``_toggle_plan`` engine
+        # (native when the Rust extension is built, the pure-Python
+        # transcription otherwise), which reads the player's and the
+        # queue's own current tracks exactly when the reference's
+        # chain reaches them.
+        plan = _toggle_plan(self.player, self.queue)
+        action = plan["action"]
+        if action == "start":
             await self.play_track(self.queue.current_track)
-        elif self.player:
-            await self.player.toggle_pause()
+        elif action == "toggle":
+            # The plan's toggle verdict is answered only for a truthy
+            # player — the cast narrows for the type checker alone.
+            await cast("Player", self.player).toggle_pause()
 
     @playback_request
     async def _play_next(self, *, ended_track: dict | None = None) -> None:
         """Advance to the next track in the queue and play it."""
-        track = self.queue.next_track()
-        if track:
-            await self.play_track(track)
-        elif self.settings.playback.autoplay:
-            # Use the ended track for radio seed when player.current_track
-            # is already None (cleared by _on_end_file before we get here).
-            seed = ended_track or (self.player.current_track if self.player else None)
-            if seed:
-                await self._fetch_and_play_radio(seed_track=seed, append=True)
-                if not owns_request(self):
-                    return
-                first = self.queue.next_track()
-                if first:
-                    await self.play_track(first)
-                else:
-                    self.notify("End of queue.", timeout=2)
+        # The advance-vs-radio-vs-end branch — whether the queue's own
+        # next track plays, autoplay radio seeds a background refill,
+        # or the end-of-queue toast shows — is resolved by the
+        # ``_next_plan`` engine (native when the Rust extension is
+        # built, the pure-Python transcription otherwise), which pulls
+        # the queue's own advance-and-read exactly here, exactly once,
+        # and walks the radio seed through the ended track's
+        # truthiness and the player's own current track.
+        plan = _next_plan(
+            self.queue.next_track,
+            self.settings.playback.autoplay,
+            ended_track,
+            self.player,
+        )
+        action = plan["action"]
+        if action == "play":
+            await self.play_track(plan["track"])
+        elif action == "radio":
+            # Use the ended track for radio seed when
+            # player.current_track is already None (cleared by
+            # _on_end_file before we get here).
+            await self._fetch_and_play_radio(seed_track=plan["seed"], append=True)
+            if not owns_request(self):
+                return
+            first = self.queue.next_track()
+            if first:
+                await self.play_track(first)
             else:
                 self.notify("End of queue.", timeout=2)
         else:
@@ -1615,22 +1783,32 @@ class PlaybackMixin(YTMHostBase):
     def _report_local_play(self, claim: _LocalHistoryClaim, idle_polls: int = 0) -> None:
         # Identity is the liveness check: every committed play replaces
         # ``_local_history_claim`` and finalize marks the claim consumed;
-        # either ends this chain. The threshold gate and the two-poll
-        # idle termination — the chain ends once the player is idle for
-        # two consecutive polls, because stream errors, stop and
-        # end-of-queue never bump the generation or replace the claim —
-        # are resolved by the ``_history_report_step`` engine (native
-        # when the Rust extension is built, the pure-Python
-        # transcription otherwise).
-        if claim is not self._local_history_claim or claim.finalized:
+        # either ends this chain, as do a missing history manager or
+        # player — the whole guard pair resolved by the
+        # ``_local_report_gates`` engine (native when the Rust
+        # extension is built, the pure-Python transcription otherwise).
+        # The threshold gate and the two-poll idle termination — the
+        # chain ends once the player is idle for two consecutive polls,
+        # because stream errors, stop and end-of-queue never bump the
+        # generation or replace the claim — are resolved by the
+        # ``_history_report_step`` engine (native when the Rust
+        # extension is built, the pure-Python transcription
+        # otherwise).
+        if not _local_report_gates(
+            claim,
+            self._local_history_claim,
+            self.history,
+            self.player,
+        ):
             return
-        if not self.history or not self.player:
-            return
-        listened = int(self.player.position - self._track_start_position)
+        # The gates' player arm guarantees a truthy player here — the
+        # cast narrows for the type checker alone.
+        player = cast("Player", self.player)
+        listened = int(player.position - self._track_start_position)
         step = _history_report_step(
             listened=listened,
             min_listen_seconds=self._history_min_listen_seconds(),
-            current_track=self.player.current_track,
+            current_track=player.current_track,
             idle_polls=idle_polls,
         )
         if step["action"] == "poll":
@@ -1765,29 +1943,38 @@ class PlaybackMixin(YTMHostBase):
         Best-effort and non-blocking. If playback started late or was paused,
         ``position`` may still be below threshold when the timer fires; in that
         case keep polling. This means pause does not count, but reporting still
-        works without window focus. The threshold gate and the two-poll idle
+        works without window focus. Identity is the liveness check here too —
+        a quick skip bumps the generation, the push worker marks the reported
+        one, and the opt-out setting or a missing service ends the chain —
+        the whole guard quartet resolved by the ``_ytm_report_gates`` engine
+        (native when the Rust extension is built, the pure-Python
+        transcription otherwise). The threshold gate and the two-poll idle
         termination are resolved by the ``_history_report_step`` engine
         (native when the Rust extension is built, the pure-Python
         transcription otherwise) — the same engine behind the local
         chain's ``_report_local_play``.
         """
-        if generation != self._play_generation:
-            return
-        if self._ytm_reported_generation == generation:
-            return
-        if not self.settings.playback.sync_history_to_ytmusic or not self.ytmusic:
-            return
-        if not self.player:
+        if not _ytm_report_gates(
+            generation,
+            self._play_generation,
+            self._ytm_reported_generation,
+            self.settings.playback.sync_history_to_ytmusic,
+            self.ytmusic,
+            self.player,
+        ):
             return
         # Measure listen time relative to where this track started, not the
         # raw player position. On resume-on-launch the track starts mid-file
         # (``_track_start_position`` > 0), so a bare ``position`` check would
         # report the play immediately even if the user only heard a second.
-        listened = int(self.player.position - self._track_start_position)
+        # The gates' player arm guarantees a truthy player here — the cast
+        # narrows for the type checker alone.
+        player = cast("Player", self.player)
+        listened = int(player.position - self._track_start_position)
         step = _history_report_step(
             listened=listened,
             min_listen_seconds=self._history_min_listen_seconds(),
-            current_track=self.player.current_track,
+            current_track=player.current_track,
             idle_polls=idle_polls,
         )
         if step["action"] == "poll":
@@ -1979,6 +2166,12 @@ try:
         playback_local_listen_plan as _native_local_listen_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_local_report_gates as _native_local_report_gates,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_next_plan as _native_next_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_no_video_id_toast as _native_no_video_id_toast,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -2009,7 +2202,13 @@ try:
         playback_stream_failed_twice_toast as _native_stream_failed_twice_toast,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_toggle_plan as _native_toggle_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_unavailable_toast as _native_unavailable_toast,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_ytm_report_gates as _native_ytm_report_gates,
     )
 except ImportError:
     pass
@@ -2037,3 +2236,7 @@ else:
     _cache_hit_stream_info = _native_cache_hit_stream_info  # type: ignore[assignment]
     _radio_seed_ids = _native_radio_seed_ids  # type: ignore[assignment]
     _radio_fallback_label = _native_radio_fallback_label  # type: ignore[assignment]
+    _local_report_gates = _native_local_report_gates  # type: ignore[assignment]
+    _ytm_report_gates = _native_ytm_report_gates  # type: ignore[assignment]
+    _toggle_plan = _native_toggle_plan  # type: ignore[assignment]
+    _next_plan = _native_next_plan  # type: ignore[assignment]

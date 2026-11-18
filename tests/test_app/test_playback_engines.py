@@ -47,6 +47,20 @@ toasts ``_no_video_id_toast`` / ``_unavailable_toast`` /
 ``_radio_seed_ids`` / ``_radio_fallback_label`` behind
 ``_fetch_and_play_radio``.
 
+The report-chain identity gates: ``_local_report_gates`` and
+``_ytm_report_gates``, the liveness checks that head both report timer
+chains (the claim identity and consumed flag plus the history/player
+service guards behind ``_report_local_play``; the generation equality,
+the already-reported dedup, the opt-out setting and service guards
+behind ``_report_ytm_play``). The transport branches: ``_toggle_plan``,
+the idle-vs-pause verdict behind ``_toggle_play_pause`` (the player's
+own current-track read through identity, the queue's own through
+truthiness, each exactly when the reference's chain reaches it), and
+``_next_plan``, the advance-vs-radio-vs-end verdict behind
+``_play_next`` (the queue's own advance-and-read pulled through the
+caller's bound method exactly once, and the ended-track-or-player
+radio seed walk).
+
 The engines run with two interchangeable backends: the pure-Python
 transcriptions in the module and, when the Rust extension is built, the
 native implementations bound at the module's tail. The failure cap and
@@ -74,7 +88,15 @@ re-arms; the like toggle consults the plan engine with the very track
 and submits its rating; the download consults the toast engines around
 its await; the pause change consults the status engine per integration
 and the Discord plan for the presence arm; and the radio fetch
-consults the seed and label engines with its own seed objects.
+consults the seed and label engines with its own seed objects; the
+report chains consult their identity gate engines before anything else
+(a gated-out tick never measures the listen and never consults the
+step engine); the toggle consults the plan engine with the very player
+and queue objects, its verdict steering the queue restart, the pause
+flip or nothing; and the next consults the plan engine with the
+queue's own bound pull, the autoplay setting, the ended track and the
+very player, its verdicts steering the play, the radio fetch with its
+ownership re-check and second pull, and the end-of-queue toast.
 """
 
 from __future__ import annotations
@@ -100,8 +122,10 @@ from ytm_player.app._playback import (
     _insert_finalize_plan,
     _like_toggle_plan,
     _local_listen_plan,
+    _local_report_gates,
     _LocalHistoryClaim,
     _min_listen_seconds,
+    _next_plan,
     _no_video_id_toast,
     _notification_message,
     _pause_discord_plan,
@@ -115,7 +139,9 @@ from ytm_player.app._playback import (
     _start_toasts,
     _stream_failed_twice_toast,
     _timer_arm_delay,
+    _toggle_plan,
     _unavailable_toast,
+    _ytm_report_gates,
 )
 from ytm_player.config.settings import DEFAULT_HISTORY_MIN_LISTEN_SECONDS
 
@@ -451,6 +477,52 @@ class TestLocalReportWiring:
     """``_report_local_play`` routes through the engine name and keeps
     the claim/insert plumbing."""
 
+    def test_the_identity_gates_are_consulted_with_the_read_values(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_gates(claim_arg, live_claim, history, player):
+            calls.append(
+                {"claim": claim_arg, "live_claim": live_claim, "history": history, "player": player}
+            )
+            return False
+
+        monkeypatch.setattr(playback_module, "_local_report_gates", recording_gates)
+        step = MagicMock()
+        monkeypatch.setattr(playback_module, "_history_report_step", step)
+
+        host = _report_host()
+        claim = _claim()
+        host._local_history_claim = claim
+
+        PlaybackMixin._report_local_play.__get__(host)(claim)
+
+        assert calls == [
+            {
+                "claim": claim,
+                "live_claim": claim,
+                "history": host.history,
+                "player": host.player,
+            }
+        ]
+        # A gated-out tick never measures the listen nor consults the
+        # step engine: nothing re-arms and no worker runs.
+        step.assert_not_called()
+        host.set_timer.assert_not_called()
+        host.run_worker.assert_not_called()
+
+    def test_a_stale_claim_never_consults_the_step_engine(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_local_report_gates", lambda *args: False)
+        step = MagicMock()
+        monkeypatch.setattr(playback_module, "_history_report_step", step)
+
+        host = _report_host(position=42.5, current_track=_TRACK)
+        host._local_history_claim = _claim()
+
+        PlaybackMixin._report_local_play.__get__(host)(_claim())
+
+        step.assert_not_called()
+        host.run_worker.assert_not_called()
+
     def test_the_engine_is_consulted_with_the_read_values(self, monkeypatch):
         calls: list[dict] = []
 
@@ -531,6 +603,48 @@ class TestLocalReportWiring:
 class TestYtmReportWiring:
     """``_report_ytm_play`` routes through the same engine name."""
 
+    def test_the_identity_gates_are_consulted_with_the_read_values(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_gates(
+            generation, play_generation, reported_generation, sync_enabled, ytmusic, player
+        ):
+            calls.append(
+                {
+                    "generation": generation,
+                    "play_generation": play_generation,
+                    "reported_generation": reported_generation,
+                    "sync_enabled": sync_enabled,
+                    "ytmusic": ytmusic,
+                    "player": player,
+                }
+            )
+            return False
+
+        monkeypatch.setattr(playback_module, "_ytm_report_gates", recording_gates)
+        step = MagicMock()
+        monkeypatch.setattr(playback_module, "_history_report_step", step)
+
+        host = _report_host(position=5.5, current_track=None)
+
+        PlaybackMixin._report_ytm_play.__get__(host)({"video_id": "vid1"}, "vid1", 4, idle_polls=1)
+
+        assert calls == [
+            {
+                "generation": 4,
+                "play_generation": 1,
+                "reported_generation": -1,
+                "sync_enabled": True,
+                "ytmusic": host.ytmusic,
+                "player": host.player,
+            }
+        ]
+        # A gated-out tick never measures the listen nor consults the
+        # step engine: nothing re-arms and no worker runs.
+        step.assert_not_called()
+        host.set_timer.assert_not_called()
+        host.run_worker.assert_not_called()
+
     def test_the_engine_is_consulted_with_the_read_values(self, monkeypatch):
         calls: list[dict] = []
 
@@ -597,6 +711,110 @@ class TestYtmReportWiring:
 
         host.set_timer.assert_not_called()
         host.run_worker.assert_not_called()
+
+
+# ── The report-chain identity gates' arms ──────────────────────────────────
+
+
+class TestLocalReportGatesArms:
+    """``_local_report_gates``'s verdict, on whichever backend."""
+
+    def test_the_live_claim_with_every_service_passes(self):
+        claim = SimpleNamespace(finalized=False)
+        assert _local_report_gates(claim, claim, object(), object()) is True
+
+    def test_a_superseded_claim_is_dropped(self):
+        live = SimpleNamespace(finalized=False)
+        stale = SimpleNamespace(finalized=False)
+        assert _local_report_gates(stale, live, object(), object()) is False
+
+    def test_a_none_live_claim_is_not_the_none_claim(self):
+        # A None live claim means the host armed no chain; a None claim
+        # is still "not the live claim" identity-wise only when the
+        # host holds a different object — None against None is the
+        # identity pass, and the flag read raises its own error below.
+        assert _local_report_gates(None, object(), object(), object()) is False
+
+    def test_a_none_claim_against_a_none_live_claim_raises_the_flag_read(self):
+        with pytest.raises(AttributeError, match="finalized"):
+            _local_report_gates(None, None, object(), object())
+
+    def test_a_superseded_claims_finalized_flag_is_never_read(self):
+        # The or-chain short-circuits: identity fails, the stale
+        # claim's own flag is never consulted.
+        class BoomFinalized:
+            @property
+            def finalized(self):
+                raise RuntimeError("must not read finalized on this arm")
+
+        assert _local_report_gates(BoomFinalized(), object(), object(), object()) is False
+
+    def test_a_consumed_live_claim_is_dropped(self):
+        claim = SimpleNamespace(finalized=True)
+        assert _local_report_gates(claim, claim, object(), object()) is False
+
+    def test_a_falsy_flag_still_passes(self):
+        # The reference reads the flag's truthiness, never identity.
+        for falsy in (0, "", []):
+            claim = SimpleNamespace(finalized=falsy)
+            assert _local_report_gates(claim, claim, object(), object()) is True
+
+    def test_a_missing_history_manager_is_dropped(self):
+        claim = SimpleNamespace(finalized=False)
+        assert _local_report_gates(claim, claim, None, object()) is False
+
+    def test_a_falsy_history_manager_is_dropped(self):
+        claim = SimpleNamespace(finalized=False)
+        assert _local_report_gates(claim, claim, 0, object()) is False
+
+    def test_a_missing_player_is_dropped(self):
+        claim = SimpleNamespace(finalized=False)
+        assert _local_report_gates(claim, claim, object(), None) is False
+
+
+class TestYtmReportGatesArms:
+    """``_ytm_report_gates``'s verdict, on whichever backend."""
+
+    def test_the_current_unreported_play_passes(self):
+        assert _ytm_report_gates(3, 3, -1, True, object(), object()) is True
+
+    def test_a_stale_generation_is_dropped(self):
+        assert _ytm_report_gates(2, 3, -1, True, object(), object()) is False
+
+    def test_an_already_reported_generation_is_dropped(self):
+        assert _ytm_report_gates(3, 3, 3, True, object(), object()) is False
+
+    def test_a_bool_generation_matches_an_int_one_exactly_like_cpython(self):
+        # True == 1 through CPython's own ==, so the gate proceeds.
+        assert _ytm_report_gates(True, 1, -1, True, object(), object()) is True
+
+    def test_the_opted_out_setting_is_dropped(self):
+        assert _ytm_report_gates(3, 3, -1, False, object(), object()) is False
+
+    def test_a_falsy_setting_value_is_dropped(self):
+        # The reference reads the setting's truthiness, never identity.
+        assert _ytm_report_gates(3, 3, -1, 0, object(), object()) is False
+
+    def test_a_missing_ytmusic_service_is_dropped(self):
+        assert _ytm_report_gates(3, 3, -1, True, None, object()) is False
+
+    def test_a_missing_player_is_dropped(self):
+        assert _ytm_report_gates(3, 3, -1, True, object(), None) is False
+
+    def test_a_non_numeric_generation_is_dropped_not_raised(self):
+        # Equality between unlike types answers False (never raising —
+        # that is ordering's own error), so a str generation is simply
+        # not this play's generation.
+        assert _ytm_report_gates("x", 3, -1, True, object(), object()) is False
+
+    def test_a_non_numeric_play_generation_is_dropped_not_raised(self):
+        assert _ytm_report_gates(3, "x", -1, True, object(), object()) is False
+
+    def test_a_string_generation_matches_its_own(self):
+        # The generation check is CPython's own ==/!=, so any equal
+        # pair passes — the same str against itself included, and a
+        # non-numeric reported marker never raises == against it.
+        assert _ytm_report_gates("x", "x", -1, True, object(), object()) is True
 
 
 # ── The stale-attempt gate's arms ──────────────────────────────────────────
@@ -2059,6 +2277,320 @@ class TestRadioSeedWiring:
         host.notify.assert_called_with("Playing: My Radio", timeout=4)
 
 
+# ── The play/pause toggle branch's arms ─────────────────────────────────────
+
+
+class TestTogglePlanArms:
+    """``_toggle_plan``'s answer, on whichever backend."""
+
+    def test_an_idle_player_with_a_queued_track_starts(self):
+        player = SimpleNamespace(current_track=None)
+        queue = SimpleNamespace(current_track=_TRACK)
+        assert _toggle_plan(player, queue) == {"action": "start"}
+
+    def test_a_busy_player_toggles(self):
+        player = SimpleNamespace(current_track=_TRACK)
+        assert _toggle_plan(player, SimpleNamespace(current_track=_TRACK)) == {"action": "toggle"}
+
+    def test_an_idle_player_with_an_empty_queue_toggles(self):
+        player = SimpleNamespace(current_track=None)
+        assert _toggle_plan(player, SimpleNamespace(current_track=None)) == {"action": "toggle"}
+
+    def test_a_falsy_queued_track_does_not_start(self):
+        # The queue arm is truthiness, never identity.
+        player = SimpleNamespace(current_track=None)
+        for falsy in ("", 0, [], {}):
+            assert _toggle_plan(player, SimpleNamespace(current_track=falsy)) == {
+                "action": "toggle"
+            }
+
+    def test_a_falsy_but_present_player_track_is_not_idle(self):
+        # The player arm is identity, never truthiness — a falsy but
+        # present track still toggles.
+        player = SimpleNamespace(current_track={})
+        assert _toggle_plan(player, SimpleNamespace(current_track=_TRACK)) == {"action": "toggle"}
+
+    def test_a_falsy_player_answers_none(self):
+        assert _toggle_plan(None, SimpleNamespace(current_track=_TRACK)) == {"action": "none"}
+
+    def test_a_busy_player_never_touches_the_queue(self):
+        class BoomQueue:
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read the queue on this arm")
+
+        assert _toggle_plan(SimpleNamespace(current_track=_TRACK), BoomQueue()) == {
+            "action": "toggle"
+        }
+
+    def test_a_falsy_player_never_touches_the_queue(self):
+        class BoomQueue:
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read the queue on this arm")
+
+        assert _toggle_plan(None, BoomQueue()) == {"action": "none"}
+
+
+# ── The next-track branch's arms ────────────────────────────────────────────
+
+
+class TestNextPlanArms:
+    """``_next_plan``'s answer, on whichever backend."""
+
+    def test_the_queues_own_next_track_plays(self):
+        pulls = _pulls_the_queue()
+        verdict = _next_plan(pulls, False, None, None)
+        assert verdict == {"action": "play", "track": _TRACK}
+        assert pulls.pulls == 1  # type: ignore[attr-defined]
+
+    def test_a_falsy_pull_is_not_played(self):
+        # The pull's gate is truthiness, never identity.
+        for falsy in ("", 0, [], {}):
+            assert _next_plan(lambda f=falsy: f, False, None, None)["action"] == "end_of_queue"
+
+    def test_a_truthy_pull_never_walks_the_seed(self):
+        class BoomPlayer:
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read current_track on this arm")
+
+        verdict = _next_plan(lambda: _TRACK, True, None, BoomPlayer())
+        assert verdict == {"action": "play", "track": _TRACK}
+
+    def test_disabled_autoplay_answers_end_of_queue(self):
+        class BoomPlayer:
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read current_track on this arm")
+
+        assert _next_plan(lambda: None, False, None, BoomPlayer()) == {"action": "end_of_queue"}
+
+    def test_the_ended_track_seeds_the_radio(self):
+        ended = {"video_id": "e"}
+        assert _next_plan(lambda: None, True, ended, None) == {"action": "radio", "seed": ended}
+
+    def test_a_truthy_ended_track_never_reads_the_player(self):
+        class BoomPlayer:
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read current_track on this arm")
+
+        ended = {"video_id": "e"}
+        verdict = _next_plan(lambda: None, True, ended, BoomPlayer())
+        assert verdict == {"action": "radio", "seed": ended}
+
+    def test_a_falsy_ended_track_falls_back_to_the_players_track(self):
+        player = SimpleNamespace(current_track=_TRACK)
+        assert _next_plan(lambda: None, True, None, player) == {
+            "action": "radio",
+            "seed": _TRACK,
+        }
+
+    def test_a_falsy_player_answers_no_seed(self):
+        assert _next_plan(lambda: None, True, None, None) == {"action": "end_of_queue"}
+
+    def test_a_players_missing_track_answers_no_seed(self):
+        assert _next_plan(lambda: None, True, None, SimpleNamespace(current_track=None)) == {
+            "action": "end_of_queue"
+        }
+
+    def test_a_falsy_players_track_does_not_seed(self):
+        # The seed gate is truthiness, never identity.
+        player = SimpleNamespace(current_track={})
+        assert _next_plan(lambda: None, True, None, player)["action"] == "end_of_queue"
+
+
+# ── The toggle and next wiring ──────────────────────────────────────────────
+
+
+class TestToggleWiring:
+    """``_toggle_play_pause`` routes through the engine name."""
+
+    async def test_the_engine_is_consulted_with_the_player_and_queue(self, monkeypatch):
+        calls: list[tuple] = []
+        player = MagicMock()
+        player.current_track = None
+        player.toggle_pause = AsyncMock()
+        queue = MagicMock()
+        queue.current_track = _TRACK
+
+        def recording_plan(player_arg, queue_arg):
+            calls.append((player_arg, queue_arg))
+            return {"action": "none"}
+
+        monkeypatch.setattr(playback_module, "_toggle_plan", recording_plan)
+
+        host = MagicMock()
+        host.player = player
+        host.queue = queue
+        host.play_track = AsyncMock()
+
+        await PlaybackMixin._toggle_play_pause.__get__(host)()
+
+        assert calls == [(player, queue)]
+        host.player.toggle_pause.assert_not_awaited()
+        host.play_track.assert_not_awaited()
+
+    async def test_the_start_verdict_plays_the_queues_current_track(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_toggle_plan", lambda p, q: {"action": "start"})
+
+        host = MagicMock()
+        host.queue.current_track = _TRACK
+        host.play_track = AsyncMock()
+        host.player.toggle_pause = AsyncMock()
+
+        await PlaybackMixin._toggle_play_pause.__get__(host)()
+
+        # The reference re-reads the queue's current track for the
+        # play call — its own second read.
+        host.play_track.assert_awaited_once_with(_TRACK)
+        host.player.toggle_pause.assert_not_awaited()
+
+    async def test_the_toggle_verdict_flips_the_players_pause(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_toggle_plan", lambda p, q: {"action": "toggle"})
+
+        host = MagicMock()
+        host.play_track = AsyncMock()
+        host.player.toggle_pause = AsyncMock()
+
+        await PlaybackMixin._toggle_play_pause.__get__(host)()
+
+        host.player.toggle_pause.assert_awaited_once()
+        host.play_track.assert_not_awaited()
+
+    async def test_the_none_verdict_touches_nothing(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_toggle_plan", lambda p, q: {"action": "none"})
+
+        host = MagicMock()
+        host.play_track = AsyncMock()
+        host.player.toggle_pause = AsyncMock()
+
+        await PlaybackMixin._toggle_play_pause.__get__(host)()
+
+        host.play_track.assert_not_awaited()
+        host.player.toggle_pause.assert_not_awaited()
+
+
+class TestPlayNextWiring:
+    """``_play_next`` routes through the engine name and keeps the
+    ownership and re-pull plumbing."""
+
+    def _host(self):
+        host = MagicMock()
+        host._play_request = 0
+        host.settings.playback.autoplay = False
+        host.player = MagicMock()
+        host.player.current_track = None
+        host.queue.next_track = MagicMock(return_value=None)
+        host.notify = MagicMock()
+        host.play_track = AsyncMock()
+        host._fetch_and_play_radio = AsyncMock()
+        return host
+
+    async def test_the_engine_is_consulted_with_the_read_values(self, monkeypatch):
+        calls: list[dict] = []
+
+        def recording_plan(next_track, autoplay_enabled, ended_track, player):
+            calls.append(
+                {
+                    "next_track": next_track,
+                    "autoplay_enabled": autoplay_enabled,
+                    "ended_track": ended_track,
+                    "player": player,
+                }
+            )
+            return {"action": "end_of_queue"}
+
+        monkeypatch.setattr(playback_module, "_next_plan", recording_plan)
+
+        host = self._host()
+        host.settings.playback.autoplay = True
+        ended = {"video_id": "e"}
+
+        await PlaybackMixin._play_next.__get__(host)(ended_track=ended)
+
+        assert calls == [
+            {
+                "next_track": host.queue.next_track,
+                "autoplay_enabled": True,
+                "ended_track": ended,
+                "player": host.player,
+            }
+        ]
+        # The stub never pulled the queue; nothing else ran.
+        host.queue.next_track.assert_not_called()
+        host.play_track.assert_not_awaited()
+        host._fetch_and_play_radio.assert_not_awaited()
+
+    async def test_the_play_verdict_plays_the_engines_track(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_next_plan", lambda *args: {"action": "play", "track": _TRACK}
+        )
+
+        host = self._host()
+        await PlaybackMixin._play_next.__get__(host)()
+
+        host.play_track.assert_awaited_once_with(_TRACK)
+        host.notify.assert_not_called()
+
+    async def test_the_radio_verdict_fetches_then_plays_the_refilled_head(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_next_plan", lambda *args: {"action": "radio", "seed": _TRACK}
+        )
+
+        host = self._host()
+        host.queue.next_track = MagicMock(side_effect=[_TRACK])
+
+        await PlaybackMixin._play_next.__get__(host)()
+
+        host._fetch_and_play_radio.assert_awaited_once_with(seed_track=_TRACK, append=True)
+        host.play_track.assert_awaited_once_with(_TRACK)
+        host.notify.assert_not_called()
+
+    async def test_the_radio_verdict_with_an_empty_refill_toasts(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_next_plan", lambda *args: {"action": "radio", "seed": _TRACK}
+        )
+
+        host = self._host()
+
+        await PlaybackMixin._play_next.__get__(host)()
+
+        host._fetch_and_play_radio.assert_awaited_once_with(seed_track=_TRACK, append=True)
+        host.notify.assert_called_once_with("End of queue.", timeout=2)
+        host.play_track.assert_not_awaited()
+
+    async def test_a_superseded_radio_fetch_never_re_pulls_the_queue(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_next_plan", lambda *args: {"action": "radio", "seed": _TRACK}
+        )
+
+        host = self._host()
+
+        async def bumping_fetch(**kwargs):
+            host._play_request = 99  # a newer request landed while the fetch ran
+            return None
+
+        host._fetch_and_play_radio = bumping_fetch
+
+        await PlaybackMixin._play_next.__get__(host)()
+
+        host.queue.next_track.assert_not_called()
+        host.play_track.assert_not_awaited()
+        host.notify.assert_not_called()
+
+    async def test_the_end_verdict_toasts(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_next_plan", lambda *args: {"action": "end_of_queue"})
+
+        host = self._host()
+        await PlaybackMixin._play_next.__get__(host)()
+
+        host.notify.assert_called_once_with("End of queue.", timeout=2)
+        host.play_track.assert_not_awaited()
+        host._fetch_and_play_radio.assert_not_awaited()
+
+
 # ── The play-track toast and cache-hit wiring ──────────────────────────────
 
 
@@ -2437,6 +2969,77 @@ _RADIO_LABEL_PARITY_CASES = [
     [[7]],
 ]
 
+# Local-report-gate cases: [claim desc (null | the finalized flag value |
+# "boom"), claim is the live claim, history, player]. The "boom" spelling
+# pins the identity short-circuit — a superseded claim's flag is never
+# read, a read surfacing as the stand-in's own error instead of False.
+_LOCAL_GATES_PARITY_CASES = [
+    [False, True, True, True],
+    [0, True, True, True],
+    [True, True, True, True],
+    [False, False, True, True],
+    ["boom", False, True, True],
+    [None, True, True, True],
+    [False, True, False, True],
+    [False, True, None, True],
+    [False, True, True, False],
+    [False, True, True, None],
+]
+
+# YTM-report-gate cases: [generation, play_generation,
+# reported_generation, sync_enabled, ytmusic, player] — scalars only,
+# the outcome row or the error's own shape.
+_YTM_GATES_PARITY_CASES = [
+    [3, 3, -1, True, True, True],
+    [3, 3, -1, True, True, False],
+    [2, 3, -1, True, True, True],
+    [3, 3, 3, True, True, True],
+    [3, 3, -1, False, True, True],
+    [3, 3, -1, 0, True, True],
+    [3, 3, -1, True, False, True],
+    [3, 3, -1, True, None, True],
+    [3, 3, -1, True, True, None],
+    [True, 1, -1, True, True, True],
+    ["x", 3, -1, True, True, True],
+    [3, "x", -1, True, True, True],
+    ["x", "x", -1, True, True, True],
+]
+
+# Toggle-plan cases: [player desc (null | [current_track] | "boom"),
+# queue desc ("boom" | [current_track])]. The "boom" spellings pin the
+# arms that must never read the queue — a read would surface as the
+# stand-in's own error instead of a verdict.
+_TOGGLE_PARITY_CASES = [
+    [None, "boom"],
+    [[None], [{"video_id": "t"}]],
+    [[{"video_id": "t"}], "boom"],
+    [[None], [None]],
+    [[None], [0]],
+    [[None], [""]],
+    [[None], [{}]],
+    [[0], [{"video_id": "t"}]],
+]
+
+# Next-plan cases: [next_track desc ("track" | "empty_str" | null |
+# "raises"), autoplay, ended, player desc (null | [current_track] |
+# "boom")]. The "boom" player spells the read the seed walk must make
+# exactly when the reference reaches it — and only then.
+_NEXT_PARITY_CASES = [
+    ["track", False, None, "boom"],
+    ["track", True, {"video_id": "e"}, "boom"],
+    ["empty_str", False, None, "boom"],
+    [None, False, None, "boom"],
+    ["empty_str", True, {"video_id": "e"}, "boom"],
+    [None, True, {"video_id": "e"}, "boom"],
+    [None, True, "", [{"video_id": "t"}]],
+    [None, True, None, [{"video_id": "t"}]],
+    [None, True, None, [None]],
+    [None, True, None, [0]],
+    [None, True, None, None],
+    [None, True, None, "boom"],
+    ["raises", True, None, None],
+]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -2524,6 +3127,52 @@ def make_cache_path(desc):
     if desc == "boom":
         return 42
     return SimpleNamespace(suffix=desc)
+
+
+class BoomFinalized:
+    @property
+    def finalized(self):
+        raise RuntimeError("must not read finalized on this arm")
+
+
+def make_local_claim(desc):
+    if desc == "boom":
+        return BoomFinalized()
+    if desc is None:
+        return None
+    return SimpleNamespace(finalized=desc)
+
+
+class BoomToggleQueue:
+    @property
+    def current_track(self):
+        raise RuntimeError("must not read the queue on this arm")
+
+
+def make_toggle_player(desc):
+    if desc is None:
+        return None
+    return SimpleNamespace(current_track=desc[0])
+
+
+def make_toggle_queue(desc):
+    if desc == "boom":
+        return BoomToggleQueue()
+    return SimpleNamespace(current_track=desc[0])
+
+
+class BoomCurrentTrack:
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+def make_next_player(desc):
+    if desc is None:
+        return None
+    if desc == "boom":
+        return BoomCurrentTrack()
+    return SimpleNamespace(current_track=desc[0])
 
 
 def failure_outcome(case):
@@ -2763,6 +3412,47 @@ def radio_label_outcome(case):
     return {"ok": result}
 
 
+def local_gates_outcome(case):
+    claim_desc, is_live, history_desc, player_desc = case
+    claim = make_local_claim(claim_desc)
+    live = claim if is_live else SimpleNamespace(finalized=False)
+    try:
+        result = _playback._local_report_gates(claim, live, history_desc, player_desc)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def ytm_gates_outcome(case):
+    try:
+        result = _playback._ytm_report_gates(*case)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def toggle_outcome(case):
+    player_desc, queue_desc = case
+    try:
+        result = _playback._toggle_plan(
+            make_toggle_player(player_desc), make_toggle_queue(queue_desc)
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def next_outcome(case):
+    nt_desc, autoplay, ended, player_desc = case
+    try:
+        result = _playback._next_plan(
+            make_next_track(nt_desc), autoplay, ended, make_next_player(player_desc)
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
 FAMILIES = {
     "failure": failure_outcome,
     "step": step_outcome,
@@ -2787,6 +3477,10 @@ FAMILIES = {
     "cache_hit": cache_hit_outcome,
     "radio_ids": radio_ids_outcome,
     "radio_label": radio_label_outcome,
+    "local_gates": local_gates_outcome,
+    "ytm_gates": ytm_gates_outcome,
+    "toggle": toggle_outcome,
+    "next": next_outcome,
 }
 
 payload = json.load(sys.stdin)
@@ -2890,6 +3584,62 @@ def _parent_cache_path(desc):
     if desc == "boom":
         return 42
     return SimpleNamespace(suffix=desc)
+
+
+class _ParityBoomFinalized:
+    """The parent-side twin of the child program's raising claim."""
+
+    @property
+    def finalized(self):
+        raise RuntimeError("must not read finalized on this arm")
+
+
+def _parent_local_claim(desc):
+    """The parent-side twin of the child program's claim builder."""
+    if desc == "boom":
+        return _ParityBoomFinalized()
+    if desc is None:
+        return None
+    return SimpleNamespace(finalized=desc)
+
+
+class _ParityBoomToggleQueue:
+    """The parent-side twin of the child program's raising queue."""
+
+    @property
+    def current_track(self):
+        raise RuntimeError("must not read the queue on this arm")
+
+
+def _parent_toggle_player(desc):
+    """The parent-side twin of the child program's toggle-player builder."""
+    if desc is None:
+        return None
+    return SimpleNamespace(current_track=desc[0])
+
+
+def _parent_toggle_queue(desc):
+    """The parent-side twin of the child program's toggle-queue builder."""
+    if desc == "boom":
+        return _ParityBoomToggleQueue()
+    return SimpleNamespace(current_track=desc[0])
+
+
+class _ParityBoomCurrentTrack:
+    """The parent-side twin of the child program's raising player."""
+
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+def _parent_next_player(desc):
+    """The parent-side twin of the child program's next-player builder."""
+    if desc is None:
+        return None
+    if desc == "boom":
+        return _ParityBoomCurrentTrack()
+    return SimpleNamespace(current_track=desc[0])
 
 
 def _native_new_family_outcomes(family):
@@ -3074,6 +3824,45 @@ def _native_new_family_outcomes(family):
         except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
             return {"error": f"{type(exc).__name__}: {exc}"}
 
+    def local_gates(case):
+        claim_desc, is_live, history_desc, player_desc = case
+        claim = _parent_local_claim(claim_desc)
+        live = claim if is_live else SimpleNamespace(finalized=False)
+        try:
+            return {
+                "ok": playback_module._local_report_gates(claim, live, history_desc, player_desc)
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def ytm_gates(case):
+        try:
+            return {"ok": playback_module._ytm_report_gates(*case)}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def toggle(case):
+        player_desc, queue_desc = case
+        try:
+            return {
+                "ok": playback_module._toggle_plan(
+                    _parent_toggle_player(player_desc), _parent_toggle_queue(queue_desc)
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def next(case):
+        nt_desc, autoplay, ended, player_desc = case
+        try:
+            return {
+                "ok": playback_module._next_plan(
+                    _child_next_track(nt_desc), autoplay, ended, _parent_next_player(player_desc)
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     builders = {
         "gate": gate,
         "poll": poll,
@@ -3096,6 +3885,10 @@ def _native_new_family_outcomes(family):
         "cache_hit": cache_hit,
         "radio_ids": radio_ids,
         "radio_label": radio_label,
+        "local_gates": local_gates,
+        "ytm_gates": ytm_gates,
+        "toggle": toggle,
+        "next": next,
     }
     cases = _FAMILY_CASES
     return [builders[family](case) for case in cases[family]]
@@ -3123,6 +3916,10 @@ _FAMILY_ENGINE_NAMES = {
     "cache_hit": "_cache_hit_stream_info",
     "radio_ids": "_radio_seed_ids",
     "radio_label": "_radio_fallback_label",
+    "local_gates": "_local_report_gates",
+    "ytm_gates": "_ytm_report_gates",
+    "toggle": "_toggle_plan",
+    "next": "_next_plan",
 }
 
 _FAMILY_CASES = {
@@ -3147,6 +3944,10 @@ _FAMILY_CASES = {
     "cache_hit": _CACHE_HIT_PARITY_CASES,
     "radio_ids": _RADIO_IDS_PARITY_CASES,
     "radio_label": _RADIO_LABEL_PARITY_CASES,
+    "local_gates": _LOCAL_GATES_PARITY_CASES,
+    "ytm_gates": _YTM_GATES_PARITY_CASES,
+    "toggle": _TOGGLE_PARITY_CASES,
+    "next": _NEXT_PARITY_CASES,
 }
 
 
@@ -3297,3 +4098,19 @@ class TestNativeParity:
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     def test_the_radio_fallback_label_matches_the_fallback(self):
         _assert_family_parity("radio_label")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_local_report_gates_match_the_fallback(self):
+        _assert_family_parity("local_gates")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_ytm_report_gates_match_the_fallback(self):
+        _assert_family_parity("ytm_gates")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_toggle_plan_matches_the_fallback(self):
+        _assert_family_parity("toggle")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_next_plan_matches_the_fallback(self):
+        _assert_family_parity("next")

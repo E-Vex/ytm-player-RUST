@@ -2030,6 +2030,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         app::playback::playback_radio_fallback_label,
         module
     )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_local_report_gates,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_ytm_report_gates,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_toggle_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_next_plan,
+        module
+    )?)?;
 
     // Track-action engines (app/_track_actions.py equivalents): the
     // occurrence gate behind the actions popup's queue-entry naming

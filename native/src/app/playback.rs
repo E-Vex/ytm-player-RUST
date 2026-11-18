@@ -1098,3 +1098,209 @@ pub(crate) fn playback_radio_fallback_label<'py>(
     let text = format!("Radio from {}", py_str(&title)?);
     Ok(text.into_pyobject(py)?.into_any())
 }
+
+/// The local report chain's identity gates — `app/_playback.py`'s
+/// `_report_local_play` decision core: whether the local-history
+/// report timer chain is still armed for the very play it was
+/// scheduled for, so the tick may measure the listen and consult the
+/// step engine at all.
+///
+/// Mirrors the reference's guard pair exactly, every read through the
+/// *claim* object's own attributes, every truthiness through CPython's
+/// own protocol, in the reference's own order: a *claim* that is not
+/// the live *live_claim* (the `is` identity check — every committed
+/// play replaces the host's `_local_history_claim`, so a newer chain
+/// owns the row) answers false without ever consulting the claim's
+/// own `finalized` flag (the or-chain's short circuit), and a truthy
+/// flag on the live claim answers false too — the finalize path
+/// already wrote the row, the claim is consumed. Then the two service
+/// guards: a falsy *history* manager or a falsy *player* ends the
+/// chain — each read by the caller exactly when the reference's own
+/// chain reaches it. The position read, the min-listen resolution,
+/// the timer re-arms and the insert worker stay Python-side in the
+/// mixin.
+#[pyfunction]
+#[pyo3(signature = (claim, live_claim, history, player))]
+pub(crate) fn playback_local_report_gates(
+    claim: &Bound<'_, PyAny>,
+    live_claim: &Bound<'_, PyAny>,
+    history: &Bound<'_, PyAny>,
+    player: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    // claim is not live_claim or claim.finalized — the identity check
+    // first, the claim's own flag read only for the live claim.
+    if !claim.is(live_claim) {
+        return Ok(false);
+    }
+    if claim.getattr("finalized")?.is_truthy()? {
+        return Ok(false);
+    }
+    // not history or not player — the two service guards.
+    if !history.is_truthy()? || !player.is_truthy()? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The account report chain's identity gates — `app/_playback.py`'s
+/// `_report_ytm_play` decision core: whether the YT Music history
+/// report timer chain is still armed for the very play it was
+/// scheduled for, so the tick may measure the listen and consult the
+/// step engine at all.
+///
+/// Mirrors the reference's guard quartet exactly, every comparison
+/// through CPython's own protocol, every guard in the reference's own
+/// order: a *generation* that no longer equals *play_generation*
+/// (CPython's own `!=` — a quick skip bumped the generation before
+/// the timer fired) ends the chain; a *reported_generation* that
+/// equals *generation* (CPython's own `==`) ends it too — the account
+/// already accepted this play and the push worker marked it, so a
+/// second poll would duplicate it; a falsy *sync_enabled* setting or
+/// a falsy *ytmusic* service ends the chain — the opt-out read by the
+/// caller exactly when the reference's own chain reaches it; and a
+/// falsy *player* ends it. The position read, the min-listen
+/// resolution, the timer re-arms and the push worker stay Python-side
+/// in the mixin.
+#[pyfunction]
+#[pyo3(signature = (generation, play_generation, reported_generation, sync_enabled, ytmusic, player))]
+pub(crate) fn playback_ytm_report_gates(
+    generation: &Bound<'_, PyAny>,
+    play_generation: &Bound<'_, PyAny>,
+    reported_generation: &Bound<'_, PyAny>,
+    sync_enabled: &Bound<'_, PyAny>,
+    ytmusic: &Bound<'_, PyAny>,
+    player: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    // generation != play_generation — CPython's own !=.
+    if generation.ne(play_generation)? {
+        return Ok(false);
+    }
+    // reported_generation == generation — CPython's own ==.
+    if reported_generation.eq(generation)? {
+        return Ok(false);
+    }
+    // not sync_enabled or not ytmusic — the opt-out and the service.
+    if !sync_enabled.is_truthy()? || !ytmusic.is_truthy()? {
+        return Ok(false);
+    }
+    // not player — the player guard.
+    if !player.is_truthy()? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The play/pause toggle branch — `app/_playback.py`'s
+/// `_toggle_play_pause` decision core: which of the transport's three
+/// outcomes a toggle press takes.
+///
+/// Mirrors the reference's branch exactly, every read through the
+/// *player* and *queue* objects' own attributes, in the reference's
+/// own order: a truthy *player* whose own `current_track` is `None`
+/// (the identity check — the player is idle, a falsy-but-present
+/// track is not idle) and whose *queue* object's own `current_track`
+/// is truthy answers `start` — the caller restarts playback from the
+/// queue's current track, re-reading it exactly like the reference's
+/// second read; the player's read first, the queue's read only once
+/// the player proved idle, so a short-circuited chain never touches
+/// the queue. A truthy player without that idle-and-armed pair
+/// answers `toggle` — the caller flips the player's pause; a falsy
+/// player answers `none` — nothing to toggle. The `play_track` /
+/// `toggle_pause` awaits stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (player, queue))]
+pub(crate) fn playback_toggle_plan<'py>(
+    py: Python<'py>,
+    player: &Bound<'py, PyAny>,
+    queue: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // if player — the player guard.
+    if player.is_truthy()? {
+        // player.current_track is None — the identity check; and
+        // queue.current_track — the queue's own current track, read
+        // exactly here, only for an idle player.
+        let current_track = player.getattr("current_track")?;
+        if current_track.is_none() && queue.getattr("current_track")?.is_truthy()? {
+            out.set_item("action", "start")
+                .expect("dict insertion with a str key cannot fail");
+            return Ok(out);
+        }
+        // elif self.player — the toggle arm.
+        out.set_item("action", "toggle")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    out.set_item("action", "none")
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The next-track branch — `app/_playback.py`'s `_play_next` decision
+/// core: where a next-press (or a consumed track end) goes from here.
+///
+/// Mirrors the reference's branch exactly, every pull and read
+/// through the caller's own objects, in the reference's own order:
+/// the queue's own advance-and-read — pulled through *next_track*
+/// exactly here, exactly once, the reference's own `next_track()` —
+/// answers `play` carrying the very track it produced. An empty pull
+/// consults *autoplay_enabled*: a falsy setting answers
+/// `end_of_queue`. A truthy one walks the radio seed — *ended_track*
+/// under CPython's own truthiness first (the track that just ended,
+/// passed by the track-end handler), and for a falsy ended track the
+/// *player* object's own `current_track` (read exactly here, a falsy
+/// player answering `None`) — a truthy seed answers `radio` carrying
+/// the very object, anything else `end_of_queue`. The `play_track`
+/// and radio-fetch awaits, the request-ownership re-check after the
+/// fetch, the second queue pull and the end-of-queue toasts stay
+/// Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (next_track, autoplay_enabled, ended_track, player))]
+pub(crate) fn playback_next_plan<'py>(
+    py: Python<'py>,
+    next_track: &Bound<'py, PyAny>,
+    autoplay_enabled: &Bound<'py, PyAny>,
+    ended_track: &Bound<'py, PyAny>,
+    player: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // track = next_track() — the queue's own advance-and-read, pulled
+    // through the callable exactly here, exactly once.
+    let track = next_track.call0()?;
+    // if track — the pull's truthiness.
+    if track.is_truthy()? {
+        out.set_item("action", "play")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("track", &track)
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    // elif autoplay — the setting's truthiness.
+    if !autoplay_enabled.is_truthy()? {
+        out.set_item("action", "end_of_queue")
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    // seed = ended_track or (player.current_track if player else
+    // None) — the ended track's truthiness first, the player's own
+    // current track read only for a falsy ended track on a truthy
+    // player.
+    let seed: Bound<'py, PyAny> = if ended_track.is_truthy()? {
+        ended_track.clone()
+    } else if player.is_truthy()? {
+        player.getattr("current_track")?
+    } else {
+        py.None().into_bound(py)
+    };
+    // if seed — the seed's truthiness.
+    if seed.is_truthy()? {
+        out.set_item("action", "radio")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("seed", &seed)
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    out.set_item("action", "end_of_queue")
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
