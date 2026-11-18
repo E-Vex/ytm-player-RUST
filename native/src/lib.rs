@@ -1932,9 +1932,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     // listen and the update-row / stash-pending / direct-log branch),
     // the insert-finalize plan (the pending stash's
     // beats-the-threshold gate and the still-current generation check
-    // behind the optimistic add), and the history-report timer arm
+    // behind the optimistic add), the history-report timer arm
     // pair (the min-listen clamp and the never-zero arm delay — the
-    // poll interval read through the playback module's own name). The
+    // poll interval read through the playback module's own name),
+    // the previous-track branch behind _play_previous (the restart
+    // threshold with the player's own position, current_attempt
+    // and current_track reads — the reclaim arm's attempt walk with
+    // its PyLong_Check acceptance set — and the queue's own
+    // rewind-and-read pulled exactly once, only off the restart
+    // path), the report-schedule arming gates behind the two
+    // _schedule_* heads (the local chain's history-manager and
+    // video-id guards; the account chain's opt-out, service and
+    // video-id guards — each consulted exactly when the reference's
+    // own chain reaches it), and the track-end stale-play gate
+    // behind _on_track_end's post-consume recheck (the player's own
+    // current_track read through identity — a newer committed play
+    // already superseded the end). The
     // failure counter, the queue state, the resolver reset, the timer
     // re-arms, the report workers, the claim writes and every awaited
     // history call stay Python-side in the mixin.
@@ -2044,6 +2057,22 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
     )?)?;
     module.add_function(pyo3::wrap_pyfunction!(
         app::playback::playback_next_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_previous_plan,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_local_schedule_gates,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_ytm_schedule_gates,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        app::playback::playback_track_end_stale_play,
         module
     )?)?;
 

@@ -2,8 +2,9 @@
 //! failure policy, the history-report poll step, the stale-attempt
 //! consume gates, the poll-step failure reset, the track-change
 //! notification, the prefetch gate, the queue-refill plan, the
-//! local-history finalize and insert-finalize plans, and the
-//! history-report timer arm pair.
+//! local-history finalize and insert-finalize plans, the
+//! history-report timer arm pair, the previous-track branch, the
+//! report-schedule arming gates, and the track-end stale-play gate.
 
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
@@ -1303,4 +1304,170 @@ pub(crate) fn playback_next_plan<'py>(
     out.set_item("action", "end_of_queue")
         .expect("dict insertion with a str key cannot fail");
     Ok(out)
+}
+
+/// The previous-track branch — `app/_playback.py`'s `_play_previous`
+/// decision core: which of the previous-press's four outcomes fires.
+///
+/// Mirrors the reference's branch exactly, every read through the
+/// *player* object's own attributes, every comparison through
+/// CPython's own protocol, in the reference's own order: a truthy
+/// *player* whose own `position` is over the restart threshold
+/// (`position > 3.0` — CPython's own `>`, so a non-numeric position
+/// raises the comparison's own `TypeError`) takes the restart path,
+/// whose own branch comes first: the player's own `current_attempt`
+/// read exactly here, only for a position over the threshold; an
+/// attempt that is an `int` (the `PyLong_Check` acceptance set — a
+/// `bool` is an `int`, exactly like CPython) that no longer equals
+/// *play_generation* (CPython's own `!=`) answers `replay` carrying
+/// the player's own `current_track` (the very object the reference
+/// re-reads for its `play_track` call — another selection was
+/// resolving and this press explicitly reclaims the audible track
+/// instead of leaving its events superseded); any other attempt
+/// answers `seek_start` — the caller rewinds to the start of the
+/// audible track. A falsy player, or a position at or under the
+/// threshold, pulls the queue's own rewind-and-read — through
+/// *previous_track* exactly here, exactly once, the reference's own
+/// `previous_track()` — a truthy pull answering `play` carrying the
+/// very track it produced, a falsy one `none`. The `play_track` /
+/// `seek_start` awaits stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (player, play_generation, previous_track))]
+pub(crate) fn playback_previous_plan<'py>(
+    py: Python<'py>,
+    player: &Bound<'py, PyAny>,
+    play_generation: &Bound<'py, PyAny>,
+    previous_track: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    // if player — the player guard.
+    if player.is_truthy()? {
+        // player.position > 3.0 — CPython's own >, the restart
+        // threshold, the position read exactly here, only for a
+        // truthy player.
+        let threshold: Bound<'py, PyAny> = 3.0f64.into_pyobject(py)?.into_any();
+        if player.getattr("position")?.gt(&threshold)? {
+            // attempt = player.current_attempt — read exactly here,
+            // only for a position over the threshold.
+            let attempt = player.getattr("current_attempt")?;
+            // isinstance(attempt, int) and attempt != play_generation
+            // — the PyLong_Check acceptance set with bools included,
+            // CPython's own !=.
+            if attempt.is_instance_of::<PyInt>() && attempt.ne(play_generation)? {
+                // player.current_track — the reclaim arm's own read,
+                // the very object the caller replays.
+                let current_track = player.getattr("current_track")?;
+                out.set_item("action", "replay")
+                    .expect("dict insertion with a str key cannot fail");
+                out.set_item("track", &current_track)
+                    .expect("dict insertion with a str key cannot fail");
+                return Ok(out);
+            }
+            out.set_item("action", "seek_start")
+                .expect("dict insertion with a str key cannot fail");
+            return Ok(out);
+        }
+    }
+    // track = previous_track() — the queue's own rewind-and-read,
+    // pulled through the callable exactly here, exactly once.
+    let track = previous_track.call0()?;
+    // if track — the pull's truthiness.
+    if track.is_truthy()? {
+        out.set_item("action", "play")
+            .expect("dict insertion with a str key cannot fail");
+        out.set_item("track", &track)
+            .expect("dict insertion with a str key cannot fail");
+        return Ok(out);
+    }
+    out.set_item("action", "none")
+        .expect("dict insertion with a str key cannot fail");
+    Ok(out)
+}
+
+/// The local report chain's arming gates — `app/_playback.py`'s
+/// `_schedule_local_history_log` decision core: whether the
+/// local-history report timer chain is armed for a play at all.
+///
+/// Mirrors the reference's guard pair exactly, every truthiness
+/// through CPython's own protocol, in the reference's own order: a
+/// falsy *history* manager answers false without ever consulting
+/// *video_id* (the or-chain's short circuit — no row destination
+/// means no chain), and a falsy *video_id* answers false too. The
+/// claim build and write and the timer arm stay Python-side in the
+/// mixin.
+#[pyfunction]
+#[pyo3(signature = (history, video_id))]
+pub(crate) fn playback_local_schedule_gates(
+    history: &Bound<'_, PyAny>,
+    video_id: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    // not history — the row-destination guard, short-circuited
+    // before the video id.
+    if !history.is_truthy()? {
+        return Ok(false);
+    }
+    // not video_id — the play-identity guard.
+    if !video_id.is_truthy()? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The account report chain's arming gates — `app/_playback.py`'s
+/// `_schedule_ytm_history_report` decision core: whether the YT Music
+/// history report timer chain is armed for a play at all.
+///
+/// Mirrors the reference's guard pair exactly, every truthiness
+/// through CPython's own protocol, in the reference's own order: a
+/// falsy *sync_enabled* setting (the opt-out, read by the caller
+/// exactly when the reference's own chain reaches it) answers false
+/// without ever consulting *ytmusic* or *video_id* (the first guard's
+/// own arm); a falsy *ytmusic* service or a falsy *video_id* answers
+/// false too. The timer arm stays Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (sync_enabled, ytmusic, video_id))]
+pub(crate) fn playback_ytm_schedule_gates(
+    sync_enabled: &Bound<'_, PyAny>,
+    ytmusic: &Bound<'_, PyAny>,
+    video_id: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    // not sync_enabled — the opt-out guard, its own arm.
+    if !sync_enabled.is_truthy()? {
+        return Ok(false);
+    }
+    // not ytmusic or not video_id — the service and play-identity
+    // guards, the video id consulted only for a truthy service.
+    if !ytmusic.is_truthy()? || !video_id.is_truthy()? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The stale-play gate — `app/_playback.py`'s `_on_track_end`
+/// decision core after the consume gate: whether a consumed track end
+/// is already superseded by a newer committed play.
+///
+/// Mirrors the reference's check exactly, the read through the
+/// *player* object's own attributes: a truthy *player* whose own
+/// `current_track` is not `None` (the identity check, not
+/// truthiness — Player clears the attribute BEFORE dispatching the
+/// end event, so it can only be non-None again if a play() ran
+/// since) answers true — the whole event is stale: finalizing could
+/// consume the new play's claim (a same-video replay) or log with
+/// its position, while a natural-EOF finalize writes nothing anyway
+/// (mpv reads position 0.0 once idle), and advancing would skip
+/// straight over the track that is already playing. Anything else
+/// answers false. The listen logging, the still-current re-check
+/// and the advance stay Python-side in the mixin.
+#[pyfunction]
+#[pyo3(signature = (player))]
+pub(crate) fn playback_track_end_stale_play(player: &Bound<'_, PyAny>) -> PyResult<bool> {
+    // if player — the player guard.
+    if player.is_truthy()? {
+        // player.current_track is not None — the identity check.
+        if !player.getattr("current_track")?.is_none() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

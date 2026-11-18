@@ -55,11 +55,23 @@ the already-reported dedup, the opt-out setting and service guards
 behind ``_report_ytm_play``). The transport branches: ``_toggle_plan``,
 the idle-vs-pause verdict behind ``_toggle_play_pause`` (the player's
 own current-track read through identity, the queue's own through
-truthiness, each exactly when the reference's chain reaches it), and
+truthiness, each exactly when the reference's chain reaches it),
 ``_next_plan``, the advance-vs-radio-vs-end verdict behind
 ``_play_next`` (the queue's own advance-and-read pulled through the
 caller's bound method exactly once, and the ended-track-or-player
-radio seed walk).
+radio seed walk), and ``_previous_plan``, the
+restart-vs-reclaim-vs-previous verdict behind ``_play_previous`` (the
+player's own position/current_attempt/current_track reads in the
+reference's own order, and the queue's own rewind-and-read pulled
+exactly once, only off the restart path). The report-schedule arming
+gates: ``_local_schedule_gates`` behind ``_schedule_local_history_log``
+(the history-manager and video-id guards) and ``_ytm_schedule_gates``
+behind ``_schedule_ytm_history_report`` (the opt-out, service and
+video-id guards), each consulted exactly when the reference's own
+chain reaches it. The track-end stale-play gate:
+``_track_end_stale_play``, the post-consume recheck inside
+``_on_track_end`` (the player's own current_track read through
+identity — a newer committed play already superseded the end).
 
 The engines run with two interchangeable backends: the pure-Python
 transcriptions in the module and, when the Rust extension is built, the
@@ -96,7 +108,16 @@ and queue objects, its verdict steering the queue restart, the pause
 flip or nothing; and the next consults the plan engine with the
 queue's own bound pull, the autoplay setting, the ended track and the
 very player, its verdicts steering the play, the radio fetch with its
-ownership re-check and second pull, and the end-of-queue toast.
+ownership re-check and second pull, and the end-of-queue toast; the
+previous consults the plan engine with the very player, its own play
+generation and the queue's own bound rewind, its verdicts steering
+the reclaim replay, the rewind or the previous-track play; the two
+schedule heads consult their gate engines before building any claim
+or arming any timer (a gated-out arm never touches the claim or the
+timer); and the track-end handler consults the stale-play gate with
+the very player object once the consume gate passed, a stale verdict
+stopping the handler before the listen is logged or the queue
+advanced.
 """
 
 from __future__ import annotations
@@ -123,6 +144,7 @@ from ytm_player.app._playback import (
     _like_toggle_plan,
     _local_listen_plan,
     _local_report_gates,
+    _local_schedule_gates,
     _LocalHistoryClaim,
     _min_listen_seconds,
     _next_plan,
@@ -133,6 +155,7 @@ from ytm_player.app._playback import (
     _play_failure_policy,
     _poll_failure_reset,
     _prefetch_next_id,
+    _previous_plan,
     _radio_fallback_label,
     _radio_seed_ids,
     _refill_plan,
@@ -140,8 +163,10 @@ from ytm_player.app._playback import (
     _stream_failed_twice_toast,
     _timer_arm_delay,
     _toggle_plan,
+    _track_end_stale_play,
     _unavailable_toast,
     _ytm_report_gates,
+    _ytm_schedule_gates,
 )
 from ytm_player.config.settings import DEFAULT_HISTORY_MIN_LISTEN_SECONDS
 
@@ -1282,6 +1307,47 @@ class TestOnTrackEndWiring:
 
         host._play_next.assert_awaited_once()
 
+    async def test_the_stale_play_gate_is_consulted_with_the_very_player(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_stale(player_arg):
+            calls.append((player_arg,))
+            return False
+
+        monkeypatch.setattr(playback_module, "_track_end_stale_play", recording_stale)
+
+        host = _event_host()
+        host._log_listen_for = AsyncMock()
+        host._play_next = AsyncMock()
+        host.player = MagicMock()
+        host.player.current_track = None
+        ended = {"video_id": "old"}
+
+        await PlaybackMixin._on_track_end.__get__(host)({"attempt": 3, "track": ended})
+
+        assert calls == [(host.player,)]
+        host._log_listen_for.assert_awaited_once_with(ended)
+        host._play_next.assert_awaited_once()
+
+    async def test_a_stale_verdict_stops_the_handler_before_anything(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_track_end_stale_play", lambda player_arg: True)
+
+        host = _event_host()
+        host._log_listen_for = AsyncMock()
+        host._play_next = AsyncMock()
+        host.player = MagicMock()
+        host.player.current_track = {"video_id": "new"}
+
+        await PlaybackMixin._on_track_end.__get__(host)(
+            {"attempt": 3, "track": {"video_id": "old"}}
+        )
+
+        # The end is consumed (the gate already passed) but stale: the
+        # listen is never logged and the queue never advances.
+        assert host._handled_end_attempt == 3
+        host._log_listen_for.assert_not_awaited()
+        host._play_next.assert_not_awaited()
+
 
 # ── The poll / notification / prefetch / refill wiring ─────────────────────
 
@@ -2401,6 +2467,254 @@ class TestNextPlanArms:
         assert _next_plan(lambda: None, True, None, player)["action"] == "end_of_queue"
 
 
+# ── The previous-track branch's arms ────────────────────────────────────────
+
+
+class TestPreviousPlanArms:
+    """``_previous_plan``'s answer, on whichever backend."""
+
+    def test_a_superseded_attempt_reclaims_the_audible_track(self):
+        player = SimpleNamespace(position=10.0, current_attempt=5, current_track=_TRACK)
+        verdict = _previous_plan(player, 7, _must_not_pull())
+        assert verdict == {"action": "replay", "track": _TRACK}
+
+    def test_the_live_attempt_seeks_start(self):
+        player = SimpleNamespace(position=10.0, current_attempt=7, current_track=_TRACK)
+        assert _previous_plan(player, 7, _must_not_pull()) == {"action": "seek_start"}
+
+    def test_a_non_int_attempt_seeks_start(self):
+        player = SimpleNamespace(position=10.0, current_attempt=None, current_track=_TRACK)
+        assert _previous_plan(player, 7, _must_not_pull()) == {"action": "seek_start"}
+
+    def test_a_bool_attempt_is_an_int(self):
+        # True is an int exactly like CPython's isinstance — and the
+        # equality semantics are its own too.
+        player = SimpleNamespace(position=10.0, current_attempt=True, current_track=_TRACK)
+        assert _previous_plan(player, 7, _must_not_pull()) == {
+            "action": "replay",
+            "track": _TRACK,
+        }
+        assert _previous_plan(player, 1, _must_not_pull()) == {"action": "seek_start"}
+
+    def test_a_falsy_but_present_reclaim_track_is_still_replayed(self):
+        # The reclaim arm carries the player's own current track without
+        # any truthiness gate of its own.
+        player = SimpleNamespace(position=10.0, current_attempt=5, current_track=0)
+        assert _previous_plan(player, 7, _must_not_pull()) == {"action": "replay", "track": 0}
+
+    def test_the_threshold_boundary_falls_through_to_the_queue(self):
+        # 3.0 is at, not over, the restart threshold.
+        player = SimpleNamespace(position=3.0, current_attempt=5, current_track=_TRACK)
+        pulls = _pulls_the_queue()
+        verdict = _previous_plan(player, 7, pulls)
+        assert verdict == {"action": "play", "track": _TRACK}
+        assert pulls.pulls == 1  # type: ignore[attr-defined]
+
+    def test_a_position_under_the_threshold_pulls_the_queue(self):
+        player = SimpleNamespace(position=2.5, current_attempt=5, current_track=_TRACK)
+        assert _previous_plan(player, 7, lambda: _TRACK) == {"action": "play", "track": _TRACK}
+
+    def test_a_falsy_player_pulls_the_queue(self):
+        pulls = _pulls_the_queue()
+        assert _previous_plan(None, 7, pulls) == {"action": "play", "track": _TRACK}
+        assert pulls.pulls == 1  # type: ignore[attr-defined]
+
+    def test_a_falsy_pull_answers_none(self):
+        # The pull's gate is truthiness, never identity.
+        for falsy in ("", 0, [], {}, None):
+            assert _previous_plan(None, 7, lambda f=falsy: f)["action"] == "none"
+
+    def test_an_under_threshold_player_never_reads_the_attempt(self):
+        # The attempt is read only for a position over the threshold —
+        # an under-threshold position never reaches it.
+        class BoomAttempt:
+            position = 2.5
+
+            @property
+            def current_attempt(self):
+                raise RuntimeError("must not read current_attempt on this arm")
+
+        assert _previous_plan(BoomAttempt(), 7, lambda: _TRACK) == {
+            "action": "play",
+            "track": _TRACK,
+        }
+
+    def test_a_falsy_player_never_reads_the_position(self):
+        class FalsyBoomPosition:
+            def __bool__(self):
+                return False
+
+            @property
+            def position(self):
+                raise RuntimeError("must not read position on this arm")
+
+        assert _previous_plan(FalsyBoomPosition(), 7, lambda: _TRACK) == {
+            "action": "play",
+            "track": _TRACK,
+        }
+
+
+class TestPreviousPlanErrorShapes:
+    """The reads and comparisons raise CPython's own errors — the engine
+    never pre-validates."""
+
+    def test_a_non_numeric_position_raises_the_gt_error(self):
+        player = SimpleNamespace(position="4.0", current_attempt=5, current_track=_TRACK)
+        with pytest.raises(TypeError, match="'>' not supported"):
+            _previous_plan(player, 7, lambda: _TRACK)
+
+    def test_a_raising_position_propagates(self):
+        class BoomPosition:
+            @property
+            def position(self):
+                raise RuntimeError("boom position")
+
+        with pytest.raises(RuntimeError, match="boom position"):
+            _previous_plan(BoomPosition(), 7, lambda: _TRACK)
+
+    def test_a_raising_attempt_propagates_only_over_the_threshold(self):
+        class BoomAttempt:
+            position = 4.0
+
+            @property
+            def current_attempt(self):
+                raise RuntimeError("boom current_attempt")
+
+        with pytest.raises(RuntimeError, match="boom current_attempt"):
+            _previous_plan(BoomAttempt(), 7, lambda: _TRACK)
+
+    def test_a_raising_reclaim_track_propagates(self):
+        class BoomTrack:
+            position = 4.0
+            current_attempt = 5
+
+            @property
+            def current_track(self):
+                raise RuntimeError("boom current_track")
+
+        with pytest.raises(RuntimeError, match="boom current_track"):
+            _previous_plan(BoomTrack(), 7, lambda: _TRACK)
+
+    def test_the_seek_arm_never_reads_the_reclaim_track(self):
+        class BoomTrack:
+            position = 4.0
+            current_attempt = 7
+
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read current_track on this arm")
+
+        assert _previous_plan(BoomTrack(), 7, _must_not_pull()) == {"action": "seek_start"}
+
+    def test_a_raising_previous_pull_propagates(self):
+        def boom():
+            raise RuntimeError("queue locked")
+
+        player = SimpleNamespace(position=1.0, current_attempt=5, current_track=_TRACK)
+        with pytest.raises(RuntimeError, match="queue locked"):
+            _previous_plan(player, 7, boom)
+
+
+# ── The report-schedule arming gates' arms ───────────────────────────────────
+
+
+class TestLocalScheduleGatesArms:
+    """``_local_schedule_gates``'s answer, on whichever backend."""
+
+    def test_a_history_manager_and_video_id_arm_the_chain(self):
+        assert _local_schedule_gates(object(), "vid1") is True
+
+    def test_no_history_manager_disarms_the_chain(self):
+        for falsy in (None, 0, "", {}, []):
+            assert _local_schedule_gates(falsy, "vid1") is False
+
+    def test_no_video_id_disarms_the_chain(self):
+        for falsy in (None, 0, "", {}, []):
+            assert _local_schedule_gates(object(), falsy) is False
+
+    def test_a_falsy_history_never_consults_the_video_id(self):
+        class BoomBool:
+            def __bool__(self):
+                raise RuntimeError("must not consult the video id on this arm")
+
+        assert _local_schedule_gates(None, BoomBool()) is False
+
+
+class TestYtmScheduleGatesArms:
+    """``_ytm_schedule_gates``'s answer, on whichever backend."""
+
+    def test_an_enabled_sync_with_a_service_and_video_id_arms_the_chain(self):
+        assert _ytm_schedule_gates(True, object(), "vid1") is True
+
+    def test_a_disabled_sync_disarms_the_chain(self):
+        for falsy in (False, None, 0, "", {}, []):
+            assert _ytm_schedule_gates(falsy, object(), "vid1") is False
+
+    def test_no_service_disarms_the_chain(self):
+        for falsy in (None, 0, "", {}, []):
+            assert _ytm_schedule_gates(True, falsy, "vid1") is False
+
+    def test_no_video_id_disarms_the_chain(self):
+        for falsy in (None, 0, "", {}, []):
+            assert _ytm_schedule_gates(True, object(), falsy) is False
+
+    def test_a_disabled_sync_never_consults_the_service_or_video_id(self):
+        class BoomBool:
+            def __bool__(self):
+                raise RuntimeError("must not consult this arm")
+
+        assert _ytm_schedule_gates(False, BoomBool(), BoomBool()) is False
+
+    def test_no_service_never_consults_the_video_id(self):
+        class BoomBool:
+            def __bool__(self):
+                raise RuntimeError("must not consult the video id on this arm")
+
+        assert _ytm_schedule_gates(True, None, BoomBool()) is False
+
+
+# ── The track-end stale-play gate's arms ────────────────────────────────────
+
+
+class TestTrackEndStalePlayArms:
+    """``_track_end_stale_play``'s answer, on whichever backend."""
+
+    def test_a_newer_play_marked_current_answers_stale(self):
+        assert _track_end_stale_play(SimpleNamespace(current_track=_TRACK)) is True
+
+    def test_an_idle_player_answers_not_stale(self):
+        assert _track_end_stale_play(SimpleNamespace(current_track=None)) is False
+
+    def test_a_falsy_but_present_track_is_stale(self):
+        # The check is identity, never truthiness — a falsy but present
+        # track still means a play() ran since the end event.
+        for falsy in (0, "", [], {}):
+            assert _track_end_stale_play(SimpleNamespace(current_track=falsy)) is True
+
+    def test_a_falsy_player_answers_not_stale(self):
+        assert _track_end_stale_play(None) is False
+
+    def test_a_falsy_player_never_reads_the_current_track(self):
+        class FalsyBoomTrack:
+            def __bool__(self):
+                return False
+
+            @property
+            def current_track(self):
+                raise RuntimeError("must not read current_track on this arm")
+
+        assert _track_end_stale_play(FalsyBoomTrack()) is False
+
+    def test_a_raising_current_track_propagates(self):
+        class BoomTrack:
+            @property
+            def current_track(self):
+                raise RuntimeError("boom current_track")
+
+        with pytest.raises(RuntimeError, match="boom current_track"):
+            _track_end_stale_play(BoomTrack())
+
+
 # ── The toggle and next wiring ──────────────────────────────────────────────
 
 
@@ -2589,6 +2903,180 @@ class TestPlayNextWiring:
         host.notify.assert_called_once_with("End of queue.", timeout=2)
         host.play_track.assert_not_awaited()
         host._fetch_and_play_radio.assert_not_awaited()
+
+
+class TestPlayPreviousWiring:
+    """``_play_previous`` routes through the engine name."""
+
+    def _host(self):
+        host = MagicMock()
+        host._play_request = 0
+        host._play_generation = 7
+        host.queue.generation = 7
+        host.player = MagicMock()
+        host.player.position = 10.0
+        host.player.current_attempt = 7
+        host.player.current_track = _TRACK
+        host.player.seek_start = AsyncMock()
+        host.queue.previous_track = MagicMock(return_value=_OTHER)
+        host.play_track = AsyncMock()
+        return host
+
+    async def test_the_engine_is_consulted_with_the_read_values(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_plan(player, play_generation, previous_track):
+            calls.append((player, play_generation, previous_track))
+            return {"action": "none"}
+
+        monkeypatch.setattr(playback_module, "_previous_plan", recording_plan)
+
+        host = self._host()
+
+        await PlaybackMixin._play_previous.__get__(host)()
+
+        assert calls == [(host.player, 7, host.queue.previous_track)]
+        # The stub never pulled the queue; nothing else ran.
+        host.queue.previous_track.assert_not_called()
+        host.play_track.assert_not_awaited()
+        host.player.seek_start.assert_not_awaited()
+
+    async def test_the_replay_verdict_replays_the_players_track(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_previous_plan", lambda *args: {"action": "replay", "track": _TRACK}
+        )
+
+        host = self._host()
+
+        await PlaybackMixin._play_previous.__get__(host)()
+
+        host.play_track.assert_awaited_once_with(_TRACK)
+        host.player.seek_start.assert_not_awaited()
+
+    async def test_the_seek_verdict_rewinds_the_player(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_previous_plan", lambda *args: {"action": "seek_start"}
+        )
+
+        host = self._host()
+
+        await PlaybackMixin._play_previous.__get__(host)()
+
+        host.player.seek_start.assert_awaited_once()
+        host.play_track.assert_not_awaited()
+
+    async def test_the_play_verdict_plays_the_engines_track(self, monkeypatch):
+        monkeypatch.setattr(
+            playback_module, "_previous_plan", lambda *args: {"action": "play", "track": _OTHER}
+        )
+
+        host = self._host()
+
+        await PlaybackMixin._play_previous.__get__(host)()
+
+        host.play_track.assert_awaited_once_with(_OTHER)
+        host.player.seek_start.assert_not_awaited()
+
+    async def test_the_none_verdict_touches_nothing(self, monkeypatch):
+        monkeypatch.setattr(playback_module, "_previous_plan", lambda *args: {"action": "none"})
+
+        host = self._host()
+
+        await PlaybackMixin._play_previous.__get__(host)()
+
+        host.play_track.assert_not_awaited()
+        host.player.seek_start.assert_not_awaited()
+
+
+class TestScheduleWiring:
+    """The two ``_schedule_*`` heads route through their gate engine
+    names before any claim or timer exists."""
+
+    def _host(self, *, enabled=True, ytmusic="default", history="default"):
+        # A SimpleNamespace host: unlike a MagicMock it does not invent
+        # ``_local_history_claim``, so the no-write arms stay pinned.
+        host = SimpleNamespace(
+            settings=SimpleNamespace(
+                playback=SimpleNamespace(
+                    sync_history_to_ytmusic=enabled,
+                    history_min_listen_seconds=DEFAULT_HISTORY_MIN_LISTEN_SECONDS,
+                )
+            ),
+            ytmusic=object() if ytmusic == "default" else ytmusic,
+            history=object() if history == "default" else history,
+            set_timer=MagicMock(),
+        )
+        host._history_min_listen_seconds = PlaybackMixin._history_min_listen_seconds.__get__(host)
+        host._history_timer_delay = PlaybackMixin._history_timer_delay.__get__(host)
+        return host
+
+    def test_the_local_gates_are_consulted_with_the_history_and_video_id(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_gates(history_arg, video_id_arg):
+            calls.append((history_arg, video_id_arg))
+            return False
+
+        monkeypatch.setattr(playback_module, "_local_schedule_gates", recording_gates)
+
+        host = self._host()
+
+        PlaybackMixin._schedule_local_history_log.__get__(host)(_TRACK, "vid1", 3)
+
+        assert calls == [(host.history, "vid1")]
+        host.set_timer.assert_not_called()
+        assert not hasattr(host, "_local_history_claim")
+
+    def test_a_gated_out_local_arm_builds_no_claim_and_arms_no_timer(self):
+        host = self._host(history=None)
+
+        PlaybackMixin._schedule_local_history_log.__get__(host)(_TRACK, "vid1", 3)
+
+        host.set_timer.assert_not_called()
+        assert not hasattr(host, "_local_history_claim")
+
+    def test_an_armed_local_arm_writes_the_claim_and_arms_the_timer(self):
+        host = self._host()
+
+        PlaybackMixin._schedule_local_history_log.__get__(host)(_TRACK, "vid1", 3)
+
+        host.set_timer.assert_called_once()
+        claim = host._local_history_claim
+        assert claim is not None
+        assert claim.video_id == "vid1"
+        assert claim.generation == 3
+
+    def test_the_ytm_gates_are_consulted_with_the_setting_service_and_video_id(self, monkeypatch):
+        calls: list[tuple] = []
+
+        def recording_gates(sync_arg, ytmusic_arg, video_id_arg):
+            calls.append((sync_arg, ytmusic_arg, video_id_arg))
+            return False
+
+        monkeypatch.setattr(playback_module, "_ytm_schedule_gates", recording_gates)
+
+        host = self._host()
+        host.settings.playback.sync_history_to_ytmusic = True
+
+        PlaybackMixin._schedule_ytm_history_report.__get__(host)(_TRACK, "vid1", 3)
+
+        assert calls == [(True, host.ytmusic, "vid1")]
+        host.set_timer.assert_not_called()
+
+    def test_a_gated_out_ytm_arm_arms_no_timer(self):
+        for enabled, ytmusic in ((False, "default"), (True, None)):
+            host = self._host(enabled=enabled, ytmusic=ytmusic)
+
+            PlaybackMixin._schedule_ytm_history_report.__get__(host)(_TRACK, "vid1", 3)
+
+            host.set_timer.assert_not_called()
+
+    def test_an_armed_ytm_arm_arms_the_timer(self):
+        host = self._host()
+
+        PlaybackMixin._schedule_ytm_history_report.__get__(host)(_TRACK, "vid1", 3)
+
+        host.set_timer.assert_called_once()
 
 
 # ── The play-track toast and cache-hit wiring ──────────────────────────────
@@ -3040,6 +3528,94 @@ _NEXT_PARITY_CASES = [
     ["raises", True, None, None],
 ]
 
+# Previous-plan cases: [player desc (null | [position, attempt,
+# current_track] | "boom_position" | "boom_attempt" | "boom_track_ne" |
+# "boom_track_eq"), play_generation, previous-track desc ("track" |
+# "empty_str" | null | "raises")]. The "boom" players spell the reads
+# the branch must make exactly when the reference reaches them — and
+# only then: boom_position is a truthy player whose position read
+# raises, boom_attempt a position of 4.0 whose attempt read raises,
+# boom_track_ne a reclaim-shaped player (attempt 5 against generation
+# 7) whose current_track read raises, and boom_track_eq a
+# seek-shaped one (attempt 7 against generation 7) whose current_track
+# read must never happen; the "raises" pull pins the never-pulled
+# restart arms.
+_PREVIOUS_PARITY_CASES = [
+    # The reclaim arm: the attempt no longer names the live play.
+    [[4.0, 5, {"video_id": "t"}], 7, "raises"],
+    # A bool is an int, and True is not 7 — the reclaim arm again.
+    [[4.0, True, {"video_id": "t"}], 7, "raises"],
+    # A falsy-but-present reclaim track is carried without its own gate.
+    [[4.0, 5, 0], 7, "raises"],
+    # The seek arm: the attempt is the live play (a bool equals 1).
+    [[4.0, 7, {"video_id": "t"}], 7, "raises"],
+    [[4.0, True, {"video_id": "t"}], 1, "raises"],
+    # The seek arm: the attempt is not an int at all.
+    [[4.0, None, {"video_id": "t"}], 7, "raises"],
+    # The threshold boundary: 3.0 is at, not over — the queue is pulled.
+    [[3.0, 5, {"video_id": "t"}], 7, "track"],
+    # Under the threshold, and a falsy player, pull the queue.
+    [[2.5, 5, {"video_id": "t"}], 7, "track"],
+    [None, 7, "track"],
+    # Falsy pulls answer none.
+    [None, 7, "empty_str"],
+    [None, 7, None],
+    # Error shapes: the reads and the comparison raise their own errors.
+    ["boom_position", 7, "raises"],
+    ["boom_attempt", 7, "raises"],
+    ["boom_track_ne", 7, "raises"],
+    # The seek arm never reads current_track — no error, no pull.
+    ["boom_track_eq", 7, "raises"],
+    # A non-numeric position raises the comparison's own TypeError.
+    [["4.0", 5, {"video_id": "t"}], 7, "raises"],
+]
+
+# Local-schedule cases: [history desc, video id desc] — each a plain
+# value (its own truthiness decides) or "boom" (a truthiness that
+# raises, pinning the or-chain's short circuit).
+_LOCAL_SCHED_PARITY_CASES = [
+    ["h", "vid1"],
+    [None, "vid1"],
+    [0, "vid1"],
+    ["", "boom"],
+    [{}, "vid1"],
+    ["h", ""],
+    ["h", None],
+    ["h", 0],
+    ["h", "boom"],
+]
+
+# YT-schedule cases: [sync enabled, ytmusic desc, video id desc] — the
+# setting a plain value, the service and the video id plain values or
+# "boom" (a truthiness that raises, pinning each guard's own arm).
+_YTM_SCHED_PARITY_CASES = [
+    [True, "y", "vid1"],
+    [False, "boom", "boom"],
+    [0, "y", "vid1"],
+    ["", None, None],
+    [True, None, "boom"],
+    [True, 0, "vid1"],
+    [True, "", "vid1"],
+    [True, "y", ""],
+    [True, "y", None],
+    [True, "y", 0],
+    [True, "boom", "vid1"],
+    [True, "y", "boom"],
+]
+
+# Track-end stale-play cases: [player desc (null | [current_track] |
+# "boom")] — the same player builder the next family uses, its
+# current_track read spelled through the gate's own identity check.
+_TRACK_END_STALE_PARITY_CASES = [
+    [None],
+    [[None]],
+    [[{"video_id": "t"}]],
+    [[0]],
+    [[""]],
+    [[{}]],
+    ["boom"],
+]
+
 _CHILD_PROG = """
 import json
 import sys
@@ -3173,6 +3749,64 @@ def make_next_player(desc):
     if desc == "boom":
         return BoomCurrentTrack()
     return SimpleNamespace(current_track=desc[0])
+
+
+class BoomPositionPrev:
+    @property
+    def position(self):
+        raise RuntimeError("boom position")
+
+
+class BoomCurrentAttemptPrev:
+    position = 4.0
+
+    @property
+    def current_attempt(self):
+        raise RuntimeError("boom current_attempt")
+
+
+class BoomTrackReclaim:
+    position = 4.0
+    current_attempt = 5
+
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+class BoomTrackSeek:
+    position = 4.0
+    current_attempt = 7
+
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+def make_previous_player(desc):
+    if desc is None:
+        return None
+    if desc == "boom_position":
+        return BoomPositionPrev()
+    if desc == "boom_attempt":
+        return BoomCurrentAttemptPrev()
+    if desc == "boom_track_ne":
+        return BoomTrackReclaim()
+    if desc == "boom_track_eq":
+        return BoomTrackSeek()
+    position, attempt, current = desc
+    return SimpleNamespace(position=position, current_attempt=attempt, current_track=current)
+
+
+class BoomBool:
+    def __bool__(self):
+        raise RuntimeError("boom bool")
+
+
+def make_bool_value(desc):
+    if desc == "boom":
+        return BoomBool()
+    return desc
 
 
 def failure_outcome(case):
@@ -3453,6 +4087,48 @@ def next_outcome(case):
     return {"ok": result}
 
 
+def previous_outcome(case):
+    player_desc, generation, prev_desc = case
+    try:
+        result = _playback._previous_plan(
+            make_previous_player(player_desc), generation, make_next_track(prev_desc)
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def local_sched_outcome(case):
+    history_desc, video_id_desc = case
+    try:
+        result = _playback._local_schedule_gates(
+            make_bool_value(history_desc), make_bool_value(video_id_desc)
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def ytm_sched_outcome(case):
+    sync, ytmusic_desc, video_id_desc = case
+    try:
+        result = _playback._ytm_schedule_gates(
+            sync, make_bool_value(ytmusic_desc), make_bool_value(video_id_desc)
+        )
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
+def track_end_stale_outcome(case):
+    (player_desc,) = case
+    try:
+        result = _playback._track_end_stale_play(make_next_player(player_desc))
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": result}
+
+
 FAMILIES = {
     "failure": failure_outcome,
     "step": step_outcome,
@@ -3481,6 +4157,10 @@ FAMILIES = {
     "ytm_gates": ytm_gates_outcome,
     "toggle": toggle_outcome,
     "next": next_outcome,
+    "previous": previous_outcome,
+    "local_sched": local_sched_outcome,
+    "ytm_sched": ytm_sched_outcome,
+    "track_end_stale": track_end_stale_outcome,
 }
 
 payload = json.load(sys.stdin)
@@ -3640,6 +4320,76 @@ def _parent_next_player(desc):
     if desc == "boom":
         return _ParityBoomCurrentTrack()
     return SimpleNamespace(current_track=desc[0])
+
+
+class _ParityBoomPositionPrev:
+    """The parent-side twin of the child program's raising position."""
+
+    @property
+    def position(self):
+        raise RuntimeError("boom position")
+
+
+class _ParityBoomCurrentAttemptPrev:
+    """The parent-side twin of the child program's raising attempt."""
+
+    position = 4.0
+
+    @property
+    def current_attempt(self):
+        raise RuntimeError("boom current_attempt")
+
+
+class _ParityBoomTrackReclaim:
+    """The parent-side twin of the child program's reclaim-shaped player."""
+
+    position = 4.0
+    current_attempt = 5
+
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+class _ParityBoomTrackSeek:
+    """The parent-side twin of the child program's seek-shaped player."""
+
+    position = 4.0
+    current_attempt = 7
+
+    @property
+    def current_track(self):
+        raise RuntimeError("boom current_track")
+
+
+def _parent_previous_player(desc):
+    """The parent-side twin of the child program's previous-player builder."""
+    if desc is None:
+        return None
+    if desc == "boom_position":
+        return _ParityBoomPositionPrev()
+    if desc == "boom_attempt":
+        return _ParityBoomCurrentAttemptPrev()
+    if desc == "boom_track_ne":
+        return _ParityBoomTrackReclaim()
+    if desc == "boom_track_eq":
+        return _ParityBoomTrackSeek()
+    position, attempt, current = desc
+    return SimpleNamespace(position=position, current_attempt=attempt, current_track=current)
+
+
+class _ParityBoomBool:
+    """The parent-side twin of the child program's raising truthiness."""
+
+    def __bool__(self):
+        raise RuntimeError("boom bool")
+
+
+def _parent_bool_value(desc):
+    """The parent-side twin of the child program's bool-value builder."""
+    if desc == "boom":
+        return _ParityBoomBool()
+    return desc
 
 
 def _native_new_family_outcomes(family):
@@ -3863,6 +4613,46 @@ def _native_new_family_outcomes(family):
         except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
             return {"error": f"{type(exc).__name__}: {exc}"}
 
+    def previous(case):
+        player_desc, generation, prev_desc = case
+        try:
+            return {
+                "ok": playback_module._previous_plan(
+                    _parent_previous_player(player_desc), generation, _child_next_track(prev_desc)
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def local_sched(case):
+        history_desc, video_id_desc = case
+        try:
+            return {
+                "ok": playback_module._local_schedule_gates(
+                    _parent_bool_value(history_desc), _parent_bool_value(video_id_desc)
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def ytm_sched(case):
+        sync, ytmusic_desc, video_id_desc = case
+        try:
+            return {
+                "ok": playback_module._ytm_schedule_gates(
+                    sync, _parent_bool_value(ytmusic_desc), _parent_bool_value(video_id_desc)
+                )
+            }
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def track_end_stale(case):
+        (player_desc,) = case
+        try:
+            return {"ok": playback_module._track_end_stale_play(_parent_next_player(player_desc))}
+        except Exception as exc:  # noqa: BLE001 - parity-pinned error shape
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     builders = {
         "gate": gate,
         "poll": poll,
@@ -3889,6 +4679,10 @@ def _native_new_family_outcomes(family):
         "ytm_gates": ytm_gates,
         "toggle": toggle,
         "next": next,
+        "previous": previous,
+        "local_sched": local_sched,
+        "ytm_sched": ytm_sched,
+        "track_end_stale": track_end_stale,
     }
     cases = _FAMILY_CASES
     return [builders[family](case) for case in cases[family]]
@@ -3920,6 +4714,10 @@ _FAMILY_ENGINE_NAMES = {
     "ytm_gates": "_ytm_report_gates",
     "toggle": "_toggle_plan",
     "next": "_next_plan",
+    "previous": "_previous_plan",
+    "local_sched": "_local_schedule_gates",
+    "ytm_sched": "_ytm_schedule_gates",
+    "track_end_stale": "_track_end_stale_play",
 }
 
 _FAMILY_CASES = {
@@ -3948,6 +4746,10 @@ _FAMILY_CASES = {
     "ytm_gates": _YTM_GATES_PARITY_CASES,
     "toggle": _TOGGLE_PARITY_CASES,
     "next": _NEXT_PARITY_CASES,
+    "previous": _PREVIOUS_PARITY_CASES,
+    "local_sched": _LOCAL_SCHED_PARITY_CASES,
+    "ytm_sched": _YTM_SCHED_PARITY_CASES,
+    "track_end_stale": _TRACK_END_STALE_PARITY_CASES,
 }
 
 
@@ -4114,3 +4916,19 @@ class TestNativeParity:
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     def test_the_next_plan_matches_the_fallback(self):
         _assert_family_parity("next")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_previous_plan_matches_the_fallback(self):
+        _assert_family_parity("previous")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_local_schedule_gates_match_the_fallback(self):
+        _assert_family_parity("local_sched")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_ytm_schedule_gates_match_the_fallback(self):
+        _assert_family_parity("ytm_sched")
+
+    @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
+    def test_the_track_end_stale_play_matches_the_fallback(self):
+        _assert_family_parity("track_end_stale")

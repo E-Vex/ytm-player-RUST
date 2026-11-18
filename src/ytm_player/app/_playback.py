@@ -1,6 +1,6 @@
 """Playback coordination mixin for YTMPlayerApp.
 
-Twenty-seven decision cores are implemented by the Rust extension
+Thirty-one decision cores are implemented by the Rust extension
 when it is built, with pure-Python transcriptions as the fallback
 otherwise:
 the playback-failure policy ``_play_failure_policy`` (the verdict
@@ -35,9 +35,15 @@ pause-change pair ``_pause_status`` / ``_pause_discord_plan`` (behind
 pair ``_radio_seed_ids`` / ``_radio_fallback_label`` (behind
 ``_fetch_and_play_radio``), plus the report-chain identity gate pair
 ``_local_report_gates`` / ``_ytm_report_gates`` (the liveness checks
-that head ``_report_local_play`` and ``_report_ytm_play``) and the
+that head ``_report_local_play`` and ``_report_ytm_play``), the
 transport branch pair ``_toggle_plan`` / ``_next_plan`` (behind
-``_toggle_play_pause`` and ``_play_next``). The asyncio/request-
+``_toggle_play_pause`` and ``_play_next``), the previous-track branch
+``_previous_plan`` (behind ``_play_previous``), the report-schedule
+arming gate pair ``_local_schedule_gates`` /
+``_ytm_schedule_gates`` (the guards that head
+``_schedule_local_history_log`` and ``_schedule_ytm_history_report``),
+and the track-end stale-play gate ``_track_end_stale_play`` (the
+post-consume recheck inside ``_on_track_end``). The asyncio/request-
 ownership glue, the failure counter, the queue state, the timer
 chains, the claim writes, the widget queries, the awaited I/O
 coordination and every await stay Python-side in this mixin.
@@ -820,6 +826,118 @@ def _next_plan(
     return {"action": "end_of_queue"}
 
 
+def _previous_plan(player: Any, play_generation: Any, previous_track: Any) -> dict[str, Any]:
+    """The previous-track branch behind ``_play_previous``.
+
+    Which of the previous-press's four outcomes fires: a truthy
+    *player* whose own ``position`` is over the restart threshold
+    (3.0 seconds, CPython's own ``>`` so a non-numeric position
+    raises the comparison's own ``TypeError``) restarts the audible
+    track — and the restart's own branch comes first: the player's
+    own ``current_attempt`` read exactly here, only for a position
+    over the threshold; an attempt that is an ``int`` (bools
+    included, exactly like CPython's ``isinstance``) that no longer
+    equals *play_generation* answers ``replay`` carrying the
+    player's own ``current_track`` (the very object the reference
+    re-reads for its ``play_track`` call — another selection was
+    resolving and this press explicitly reclaims the audible track
+    instead of leaving its events superseded); any other attempt
+    answers ``seek_start`` — the caller rewinds to the start of the
+    audible track. A falsy player, or a position at or under the
+    threshold, pulls the queue's own rewind-and-read — through
+    *previous_track* exactly here, exactly once, the reference's own
+    ``previous_track()`` — a truthy pull answering ``play`` carrying
+    the very track, a falsy one ``none``. The ``play_track`` /
+    ``seek_start`` awaits stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_previous_plan``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if player:
+        if player.position > 3.0:
+            attempt = player.current_attempt
+            if isinstance(attempt, int) and attempt != play_generation:
+                return {"action": "replay", "track": player.current_track}
+            return {"action": "seek_start"}
+    track = previous_track()
+    if track:
+        return {"action": "play", "track": track}
+    return {"action": "none"}
+
+
+def _local_schedule_gates(history: Any, video_id: Any) -> bool:
+    """The local report chain's arming gates behind
+    ``_schedule_local_history_log``.
+
+    Whether the local-history report timer chain is armed for a play
+    at all: a falsy *history* manager answers false without ever
+    consulting *video_id* (the or-chain's short circuit — no row
+    destination means no chain), and a falsy *video_id* answers
+    false too. The claim build and write and the timer arm stay in
+    the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_local_schedule_gates``) when it
+    is built; this pure-Python transcription is the fallback
+    otherwise.
+    """
+    if not history:
+        return False
+    if not video_id:
+        return False
+    return True
+
+
+def _ytm_schedule_gates(sync_enabled: Any, ytmusic: Any, video_id: Any) -> bool:
+    """The account report chain's arming gates behind
+    ``_schedule_ytm_history_report``.
+
+    Whether the YT Music history report timer chain is armed for a
+    play at all: a falsy *sync_enabled* setting (the opt-out, read
+    by the caller exactly when the reference's own chain reaches it)
+    answers false without ever consulting the service or the video
+    id (the first guard's own arm); a falsy *ytmusic* service or a
+    falsy *video_id* answers false too. The timer arm stays in the
+    mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_ytm_schedule_gates``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if not sync_enabled:
+        return False
+    if not ytmusic or not video_id:
+        return False
+    return True
+
+
+def _track_end_stale_play(player: Any) -> bool:
+    """The stale-play gate behind ``_on_track_end``'s post-consume recheck.
+
+    Whether a consumed track end is already superseded by a newer
+    committed play: a truthy *player* whose own ``current_track`` is
+    not ``None`` (the identity check, not truthiness — Player clears
+    the attribute BEFORE dispatching the end event, so it can only
+    be non-None again if a play() ran since) answers true — the whole
+    event is stale: finalizing could consume the new play's claim
+    (a same-video replay) or log with its position, while a
+    natural-EOF finalize writes nothing anyway (mpv reads position
+    0.0 once idle), and advancing would skip straight over the
+    track that is already playing. Anything else answers false.
+    The listen logging, the still-current re-check and the advance
+    stay in the mixin.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_track_end_stale_play``) when it
+    is built; this pure-Python transcription is the fallback
+    otherwise.
+    """
+    if player and player.current_track is not None:
+        return True
+    return False
+
+
 @dataclass
 class _LocalHistoryClaim:
     """Ownership token for one play's local-history row.
@@ -1271,19 +1389,30 @@ class PlaybackMixin(YTMHostBase):
     @playback_request
     async def _play_previous(self) -> None:
         """Go back to the previous track in the queue."""
-        # If we're more than 3 seconds into a track, restart it instead.
-        if self.player and self.player.position > 3.0:
-            attempt = self.player.current_attempt
-            if isinstance(attempt, int) and attempt != self._play_generation:
-                # Another selection was resolving; explicitly reclaim this
-                # audible track instead of leaving its events superseded.
-                await self.play_track(self.player.current_track)
-                return
-            await self.player.seek_start()
+        # The restart-vs-reclaim-vs-previous branch — whether this
+        # press restarts the audible track (rewinding to its start
+        # or explicitly reclaiming it when another selection was
+        # resolving) or pulls the queue's own previous track — is
+        # resolved by the ``_previous_plan`` engine (native when the
+        # Rust extension is built, the pure-Python transcription
+        # otherwise), which reads the player's own position,
+        # current_attempt and current_track exactly when the
+        # reference's chain reaches them, and pulls the queue's own
+        # rewind-and-read exactly once, only off the restart path.
+        plan = _previous_plan(self.player, self._play_generation, self.queue.previous_track)
+        action = plan["action"]
+        if action == "replay":
+            # Another selection was resolving; explicitly reclaim this
+            # audible track instead of leaving its events superseded.
+            await self.play_track(plan["track"])
             return
-
-        track = self.queue.previous_track()
-        if track:
+        if action == "seek_start":
+            # The plan's seek verdict is answered only for a truthy
+            # player — the cast narrows for the type checker alone.
+            await cast("Player", self.player).seek_start()
+            return
+        if action == "play":
+            track = plan["track"]
             await self.play_track(track)
 
     @playback_request
@@ -1397,8 +1526,13 @@ class PlaybackMixin(YTMHostBase):
             # claim (same-video replay) or log with its position — while a
             # natural-EOF finalize writes nothing anyway (mpv reads position
             # 0.0 once idle) — and advancing would skip straight over the
-            # track that is already playing.
-            if self.player and self.player.current_track is not None:
+            # track that is already playing. The stale-play verdict is
+            # resolved by the ``_track_end_stale_play`` engine (native when
+            # the Rust extension is built, the pure-Python transcription
+            # otherwise), which reads the player's own current_track
+            # through identity exactly when the reference's chain
+            # reaches it.
+            if _track_end_stale_play(self.player):
                 logger.debug("Ignoring stale track-end; a newer play is already current")
                 return
             # Log listen time using the ended track passed in the event,
@@ -1771,7 +1905,13 @@ class PlaybackMixin(YTMHostBase):
 
     def _schedule_local_history_log(self, track: dict, video_id: str, generation: int) -> None:
         """Insert the current play into SQLite once it crosses the threshold."""
-        if not self.history or not video_id:
+        # The arming gates — whether the local-history report timer
+        # chain is armed for this play at all — are resolved by the
+        # ``_local_schedule_gates`` engine (native when the Rust
+        # extension is built, the pure-Python transcription
+        # otherwise), the history manager consulted exactly when the
+        # reference's own chain reaches it.
+        if not _local_schedule_gates(self.history, video_id):
             return
         claim = _LocalHistoryClaim(video_id=video_id, track=dict(track), generation=generation)
         self._local_history_claim = claim
@@ -1926,9 +2066,17 @@ class PlaybackMixin(YTMHostBase):
         ``player.position`` until the same play crosses the threshold. Skips
         are ignored because play generation changes.
         """
-        if not self.settings.playback.sync_history_to_ytmusic:
-            return
-        if not self.ytmusic or not video_id:
+        # The arming gates — whether the YT Music history report timer
+        # chain is armed for this play at all — are resolved by the
+        # ``_ytm_schedule_gates`` engine (native when the Rust
+        # extension is built, the pure-Python transcription
+        # otherwise), the opt-out setting and the service consulted
+        # exactly when the reference's own chain reaches them.
+        if not _ytm_schedule_gates(
+            self.settings.playback.sync_history_to_ytmusic,
+            self.ytmusic,
+            video_id,
+        ):
             return
         self.set_timer(
             self._history_timer_delay(),
@@ -2169,6 +2317,9 @@ try:
         playback_local_report_gates as _native_local_report_gates,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_local_schedule_gates as _native_local_schedule_gates,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_next_plan as _native_next_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -2190,6 +2341,9 @@ try:
         playback_prefetch_next_id as _native_prefetch_next_id,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_previous_plan as _native_previous_plan,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_radio_fallback_label as _native_radio_fallback_label,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
@@ -2205,10 +2359,16 @@ try:
         playback_toggle_plan as _native_toggle_plan,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_track_end_stale_play as _native_track_end_stale_play,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_unavailable_toast as _native_unavailable_toast,
     )
     from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
         playback_ytm_report_gates as _native_ytm_report_gates,
+    )
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_ytm_schedule_gates as _native_ytm_schedule_gates,
     )
 except ImportError:
     pass
@@ -2240,3 +2400,7 @@ else:
     _ytm_report_gates = _native_ytm_report_gates  # type: ignore[assignment]
     _toggle_plan = _native_toggle_plan  # type: ignore[assignment]
     _next_plan = _native_next_plan  # type: ignore[assignment]
+    _previous_plan = _native_previous_plan  # type: ignore[assignment]
+    _local_schedule_gates = _native_local_schedule_gates  # type: ignore[assignment]
+    _ytm_schedule_gates = _native_ytm_schedule_gates  # type: ignore[assignment]
+    _track_end_stale_play = _native_track_end_stale_play  # type: ignore[assignment]
