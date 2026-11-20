@@ -70,7 +70,7 @@ native/src/
 └── utils/          # formatting, bidi, doctor, pycompat, terminal, transliteration
 ```
 
-When porting a new core, place it in the module that mirrors its Python home and register it in the `#[pymodule]` with a qualified path (`wrap_pyfunction!(services::ytmusic::ytm_auth_expired, module)`). The CI `native` job builds the extension with `native/build.sh` and re-runs the full test suite with it loaded, alongside `cargo fmt --check` and `cargo clippy -D warnings`.
+When porting a new core, place it in the module that mirrors its Python home and register it in the `#[pymodule]` with a qualified path (`wrap_pyfunction!(services::ytmusic::ytm_auth_expired, module)`). The CI `native` job builds the extension with `native/build.sh` and re-runs the full test suite with it loaded, alongside `cargo fmt --check` and `cargo clippy -D warnings`, on every supported OS (Linux, macOS, Windows — `build.sh` resolves the cargo artifact and the module filename per platform, since Windows has no `.abi3.pyd` import suffix).
 
 ## Stack
 

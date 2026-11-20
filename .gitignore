@@ -61,5 +61,8 @@ broad-except-audit.local.md
 reasoning/
 
 # Rust build artifacts
+# (*.pyd is the Windows native module — native/build.sh copies it next to
+# the .so, and hatchling reads this file, so it must never reach a build.)
 native/target/
 *.so
+*.pyd

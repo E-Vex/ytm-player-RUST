@@ -78,11 +78,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every supported OS: the extension is a per-platform artifact
+        # (.abi3.so from a .so on Linux and a .dylib on macOS, .pyd from a
+        # .dll on Windows), so the build itself and the native-parity test
+        # legs must run everywhere the app ships — a platform-specific
+        # regression would otherwise only surface as a silent fallback on
+        # the OSes this job skipped.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         # Both ends of the supported Python range: 3.10 is the abi3 floor,
         # 3.15 exercises the PYO3_USE_ABI3_FORWARD_COMPATIBILITY path in
         # native/build.sh.
         python-version: ["3.10", "3.15"]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     env:
       # pyo3 0.23 supports interpreters up to 3.13; the 3.15 leg needs
       # the abi3 forward-compatibility escape hatch. build.sh exports it
@@ -98,9 +105,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      # ubuntu-latest images ship rustup; install the stable toolchain with
-      # the lint components explicitly so the job is independent of whatever
-      # toolchain version happens to be preinstalled.
+      # The GitHub runner images (ubuntu, macos, windows) all ship rustup;
+      # install the stable toolchain with the lint components explicitly so
+      # the job is independent of whatever toolchain version happens to be
+      # preinstalled.
       - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: rustfmt
         run: cargo fmt --check
