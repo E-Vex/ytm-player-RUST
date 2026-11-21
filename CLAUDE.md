@@ -163,6 +163,8 @@ Trigger `Publish` manually from the Actions tab → `Run workflow` → target `t
 
 `aur-publish.yml` runs after `Publish` succeeds: it checks out the release commit, derives the version from `__version__`, rewrites `pkgver=` in the copied `aur/PKGBUILD` (the committed value is only a placeholder), regenerates `.SRCINFO`, and pushes to AUR. No manual version step.
 
+The AUR package builds the Rust extension from source: `build()` runs `native/build.sh` (cargo is a makedepend) and `package()` installs the compiled module beside the wheel's files at `ytm_player/utils/_ytm_player_native.abi3.so` — it cannot ride in the wheel because hatchling honours `.gitignore` (which excludes `*.so`). `arch` is `('x86_64' 'aarch64')`, matching the PyPI binary-wheel platforms. The `source=` URL points at **this** repository (the one carrying `native/`), not the homepage — switching it to a repo without `native/` breaks the AUR build (a packaging test pins this).
+
 Still manual: if dependencies changed, update `depends`/`optdepends`/`makedepends` in `aur/PKGBUILD` before tagging. Manual push fallback (if the workflow fails) is documented in `RELEASING.md`.
 
 AUR package URL: https://aur.archlinux.org/packages/ytm-player-git
@@ -174,6 +176,6 @@ Published on four channels:
   `cp310-abi3` native wheels (manylinux x86_64/aarch64, macOS universal2, Windows amd64) plus the
   pure-Python fallback wheel; pip picks the platform wheel where one matches and falls back to
   pure Python elsewhere (musl Linux, 32-bit Windows, …)
-- **AUR:** `yay -S ytm-player-git` — https://aur.archlinux.org/packages/ytm-player-git
-- **NixOS:** `flake.nix` with `ytm-player` and `ytm-player-full` packages
+- **AUR:** `yay -S ytm-player-git` — https://aur.archlinux.org/packages/ytm-player-git — compiles the Rust extension from source (cargo makedepend)
+- **NixOS:** `flake.nix` with `ytm-player` and `ytm-player-full` packages; the flake builds the Rust extension in a `ytm-player-native` `buildRustPackage` derivation (deps vendored from `native/Cargo.lock` via `cargoLock.lockFile` — no cargoHash to maintain) and installs it beside the wheel's files, proven loadable by `pythonImportsCheck`. The nixpkgs lock must ship rust ≥ the crate's `rust-version` floor (a packaging test guards the pin's age)
 - **Gentoo:** `emerge media-sound/ytm-player` via GURU overlay (community-maintained by @dsafxP)

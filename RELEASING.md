@@ -56,7 +56,9 @@ No API tokens — auth is via OIDC trusted-publisher entries at PyPI and TestPyP
 
 ### `Publish AUR` workflow (`.github/workflows/aur-publish.yml`)
 
-Triggered after `Publish` succeeds. Checks out the exact commit the `Publish` run built (the one the tag guard verified), reads the version from `__version__` in `src/ytm_player/__init__.py`, clones `ssh://aur@aur.archlinux.org/ytm-player-git.git` via SSH key, copies `PKGBUILD`, rewrites its `pkgver=` line to the real version (the committed `pkgver=` is only a placeholder), regenerates `.SRCINFO` via `scripts/regenerate_srcinfo.py` (pure Python — no Arch dependency on Ubuntu CI runners), commits and pushes.
+Triggered after `Publish` succeeds. Checks out the default branch, derives the version from the triggering tag (falling back to `__version__` for manual dispatch), clones `ssh://aur@aur.archlinux.org/ytm-player-git.git` via SSH key, copies `PKGBUILD`, rewrites its `pkgver=` line to the real version (the committed `pkgver=` is only a placeholder), regenerates `.SRCINFO` via `scripts/regenerate_srcinfo.py` (pure Python — no Arch dependency on Ubuntu CI runners), commits and pushes.
+
+The published PKGBUILD compiles the Rust extension from source: `cargo` is a makedepend, `build()` runs `native/build.sh`, and `package()` installs the compiled module beside the wheel's files (hatchling honours `.gitignore`, which excludes `*.so`, so the module cannot ride in the wheel). `arch` is `('x86_64' 'aarch64')`. The `source=` URL must point at the repository that carries `native/` (this Rust-transition repo) — a packaging test (`tests/test_packaging/test_aur_pkgbuild_native.py`) fails CI if it is pointed at a repo without the Rust code.
 
 The `regenerate_srcinfo.py` script handles shell variable expansion (`${url}`, `$pkgname`) so PKGBUILD constructs like `source=("git+${url}.git")` resolve correctly in the emitted `.SRCINFO`.
 
@@ -130,9 +132,9 @@ The AUR workflow does NOT trigger on TestPyPI dry-runs — it gates on the Publi
 | Channel | Maintained by | Update mechanism |
 |---------|---------------|------------------|
 | PyPI (native wheels: manylinux x86_64/aarch64, macOS universal2, Windows amd64 + pure fallback) | Us | Automated via `publish.yml` on tag push |
-| AUR (`ytm-player-git`) | Us | Automated via `aur-publish.yml` after PyPI succeeds |
+| AUR (`ytm-player-git`) | Us | Automated via `aur-publish.yml` after PyPI succeeds; the package builds the Rust extension from source (cargo makedepend) |
 | GitHub Release | Us | Automated via `publish.yml` on tag push |
-| NixOS (`flake.nix`) | Us | Manual — bump in repo on release |
+| NixOS (`flake.nix`) | Us | Manual — bump in repo on release; the flake compiles the Rust extension itself (`ytm-player-native` `buildRustPackage`, deps vendored from `native/Cargo.lock`) |
 | Gentoo (GURU overlay) | @dsafxP (community) | Out of our hands — community maintainer updates the ebuild on their schedule |
 
 ## After the release

@@ -1,9 +1,12 @@
 # Maintainer: Peter <peternaame@gmail.com>
 pkgname=ytm-player-git
 pkgver=2.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc="A full-featured YouTube Music TUI client with vim-style navigation"
-arch=('any')
+# The package ships the compiled Rust/PyO3 extension (built by build() below),
+# so it is no longer architecture-independent. Match the platforms the PyPI
+# binary wheels cover: manylinux x86_64 + aarch64.
+arch=('x86_64' 'aarch64')
 url="https://ytm-player.com"
 license=('MIT')
 depends=(
@@ -21,7 +24,7 @@ depends=(
     'python-ytmusicapi'
     'yt-dlp'
 )
-makedepends=('git' 'python-build' 'python-installer' 'python-hatchling')
+makedepends=('cargo' 'git' 'python-build' 'python-installer' 'python-hatchling')
 optdepends=(
     'python-anyascii: lyrics transliteration to ASCII'
     'python-pylast: Last.fm scrobbling'
@@ -31,9 +34,12 @@ optdepends=(
 )
 provides=('ytm-player')
 conflicts=('ytm-player')
-# url is the package homepage (AUR display). source is the build fetch location.
-# They intentionally differ. Do not collapse them via "git+${url}.git".
-source=("git+https://github.com/peternaame-boop/ytm-player.git")
+# url is the package homepage (AUR display). source is the build fetch
+# location — the Rust-transition repository that carries native/ (the
+# upstream peternaame-boop/ytm-player master does not contain the Rust
+# extension, so native/build.sh below would fail there). They intentionally
+# differ. Do not collapse them via "git+${url}.git".
+source=("git+https://github.com/E-Vex/ytm-player-RUST.git")
 sha256sums=('SKIP')
 
 pkgver() {
@@ -45,10 +51,21 @@ pkgver() {
 build() {
     cd ytm-player
     python -m build --wheel --no-isolation
+    # Compile the Rust/PyO3 extension. build.sh resolves the per-platform
+    # artifact and module names and copies the result into the source tree.
+    # It cannot ride along in the wheel above: hatchling honours .gitignore
+    # (which excludes *.so as build artifacts), so package() installs the
+    # module beside the wheel's files instead — the exact path the package's
+    # `from .utils._ytm_player_native import ...` sites import from.
+    native/build.sh
 }
 
 package() {
     cd ytm-player
     python -m installer --destdir="$pkgdir" dist/*.whl
+    local site_packages
+    site_packages="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    install -Dm755 src/ytm_player/utils/_ytm_player_native.abi3.so \
+        "$pkgdir${site_packages}/ytm_player/utils/_ytm_player_native.abi3.so"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

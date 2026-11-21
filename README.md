@@ -46,7 +46,7 @@
 
 - **Python 3.10+**
 - **[mpv](https://mpv.io/)** (audio playback backend, must be installed system-wide)
-- **[Rust toolchain](https://rustup.rs/) (1.98+)** — only needed to build the native Rust extension from source. The PyPI wheels for Linux (manylinux x86_64/aarch64), macOS (universal2) and Windows (win_amd64) already ship the compiled extension, and the pure-Python fallback covers every other platform.
+- **[Rust toolchain](https://rustup.rs/) (1.98+)** — only needed to build the native Rust extension from source yourself. The PyPI wheels for Linux (manylinux x86_64/aarch64), macOS (universal2) and Windows (win_amd64) already ship the compiled extension; the AUR package and the Nix flake compile it from source during install (pulling the toolchain in automatically); and the pure-Python fallback covers every other platform.
 - A YouTube Music account (free or Premium)
 
 ## Install
@@ -56,7 +56,8 @@
 # one matches your platform, pure Python elsewhere
 pip install ytm-player
 
-# Arch / CachyOS / Manjaro (AUR)
+# Arch / CachyOS / Manjaro (AUR) — compiles the Rust extension from
+# source (cargo is pulled in as a build dependency)
 yay -S ytm-player-git
 ```
 

@@ -54,18 +54,73 @@
           };
         };
 
+        # Shared package version, parsed from the single source of truth
+        # (src/ytm_player/__init__.py). The Rust crate's version in
+        # native/Cargo.toml is pinned equal to it by a packaging test
+        # (tests/test_packaging/test_native_wheel_config.py), so both
+        # derivations can use this one value.
+        version = (builtins.head (
+          builtins.match ''.*__version__[[:space:]]*=[[:space:]]*"([^"]+)".*'' (
+            builtins.readFile ./src/ytm_player/__init__.py
+          )
+        ));
+
+        # The Rust/PyO3 extension, compiled separately from the Python
+        # package. buildRustPackage vendors the dependencies from
+        # native/Cargo.lock (importCargoLock — no cargoHash to maintain,
+        # and the lock has no git dependencies), builds the cdylib and its
+        # default install phase puts libytm_player_native.{so,dylib} in
+        # $out/lib (cargoInstallHook copies the release-dir shared
+        # libraries). pyo3's build script needs the interpreter (and its
+        # headers) at build time to generate its config — any Python
+        # >= 3.10 works, the abi3-py310 feature pins the limited-API
+        # floor, so the binary loads on the interpreter the app runs on.
+        ytm-player-native = pkgs.rustPlatform.buildRustPackage {
+          pname = "ytm-player-native";
+          inherit version;
+
+          src = ./native;
+
+          cargoLock.lockFile = ./native/Cargo.lock;
+
+          # No test targets in the crate; skip cargo test entirely.
+          doCheck = false;
+
+          nativeBuildInputs = [ python ];
+
+          # Same forward-compat escape hatch native/build.sh exports: lets
+          # the build keep working if nixpkgs' python moves past the newest
+          # interpreter this pyo3 release knows.
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1";
+        };
+
         ytm-player = python.pkgs.buildPythonApplication {
           pname = "ytm-player";
-          version = (builtins.head (
-            builtins.match ''.*__version__[[:space:]]*=[[:space:]]*"([^"]+)".*'' (
-              builtins.readFile ./src/ytm_player/__init__.py
-            )
-          ));
+          inherit version;
 
           pyproject = true;
           src = ./.;
 
           build-system = [ python.pkgs.hatchling ];
+
+          # Install the compiled Rust/PyO3 extension beside the pure-Python
+          # tree the wheel installs. It cannot ride along in the wheel:
+          # hatchling honours .gitignore (which excludes *.so / *.pyd as
+          # build artifacts) even in the git-less flake source, so the
+          # module is placed after the wheel install instead — at the exact
+          # import path (ytm_player/utils/_ytm_player_native.abi3.so) the
+          # package's `from .utils._ytm_player_native import ...` sites and
+          # native/build.sh use. Artifact name per platform matches
+          # cargo's cdylib naming (see native/build.sh).
+          postInstall =
+            let
+              # cargo's cdylib artifact name per platform
+              libext = if pkgs.stdenv.hostPlatform.isDarwin then "dylib" else "so";
+            in
+            ''
+              install -Dm755 ${ytm-player-native}/lib/libytm_player_native.${libext} \
+                $out/${python.sitePackages}/ytm_player/utils/_ytm_player_native.abi3.so
+            '';
 
           # Relax upper bounds that may conflict with nixpkgs versions.
           # nixpkgs may ship textual 9.x while pyproject.toml caps at <9.0.
@@ -127,6 +182,9 @@
             "ytm_player"
             "ytm_player.cli"
             "ytm_player.services.update_check"
+            # The compiled extension must actually load from the installed
+            # tree — this is what proves the postInstall copy above works.
+            "ytm_player.utils._ytm_player_native"
           ];
 
           meta = {
@@ -176,6 +234,15 @@
               thefuzz
               anyascii
             ])
+            # Rust toolchain so `native/build.sh` (extension build) and
+            # `cargo fmt` / `cargo clippy` work straight out of the dev
+            # shell — mirroring what the CI native job runs.
+            ++ (with pkgs; [
+              cargo
+              rustc
+              rustfmt
+              clippy
+            ])
             # dbus-fast is Linux-only (socket.CMSG_LEN); guard it so `nix develop`
             # still works on darwin.
             ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ python.pkgs.dbus-fast ]
@@ -189,6 +256,7 @@
             echo "  run:    ytm"
             echo "  test:   pytest"
             echo "  lint:   ruff check src/ tests/"
+            echo "  native: native/build.sh"
           '';
         };
       }

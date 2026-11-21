@@ -33,6 +33,11 @@ yay -S ytm-player-git
 
 (Or any other AUR helper.) Package: [ytm-player-git](https://aur.archlinux.org/packages/ytm-player-git).
 
+The package compiles the Rust extension from source, so AUR installs get the
+same native performance as the PyPI binary wheels — no separate Rust setup
+needed; `cargo` is pulled in as a build dependency automatically (which is
+also why the package is now architecture-specific: `x86_64` and `aarch64`).
+
 ### Gentoo (GURU)
 
 Enable the [GURU repository](https://wiki.gentoo.org/wiki/Project:GURU/Information_for_End_Users) then:
@@ -59,7 +64,7 @@ py -m ytm_player
 
 ### NixOS (Flake)
 
-ytm-player provides a `flake.nix` with two packages, a dev shell, and an overlay.
+ytm-player provides a `flake.nix` with two packages, a dev shell, and an overlay. The flake compiles the Rust extension from source and installs it beside the Python package, so NixOS installs run the native code path too.
 
 **Try it without installing:**
 
@@ -103,6 +108,10 @@ git clone https://github.com/peternaame-boop/ytm-player.git
 cd ytm-player
 nix develop
 ```
+
+The dev shell includes the Rust toolchain (`cargo`, `rustc`, `rustfmt`,
+`clippy`), so `native/build.sh` and the same `cargo fmt` / `cargo clippy`
+checks the CI native job runs work straight out of the shell.
 
 > **Note for pip-on-NixOS users:** if you install via `pip` instead of the flake, NixOS doesn't expose `libmpv.so` in standard library paths. Add to your shell config:
 > ```fish
