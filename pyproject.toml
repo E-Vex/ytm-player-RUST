@@ -124,6 +124,18 @@ only-include = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/ytm_player"]
 
+# maturin builds the binary wheels (the publish workflow); hatchling keeps
+# building the sdist, the pure-Python py3-none-any fallback wheel and any
+# editable/source install. module-name places the compiled extension at
+# ytm_player/utils/_ytm_player_native — the exact path and file name the
+# package's import sites expect (matching native/build.sh), and it is what
+# makes the "PyInit__ytm_player_native" export resolve. python-source
+# packages the pure-Python tree from src/ just like the hatchling wheel
+# target above.
+[tool.maturin]
+python-source = "src"
+module-name = "ytm_player.utils._ytm_player_native"
+
 [tool.hatch.version]
 path = "src/ytm_player/__init__.py"
 

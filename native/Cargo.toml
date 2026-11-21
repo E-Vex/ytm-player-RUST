@@ -12,7 +12,15 @@ name = "ytm_player_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["abi3", "extension-module"] }
+# abi3-py310 pins the stable-ABI floor to Python 3.10 — the project's
+# requires-python floor. This is what makes a wheel tagged cp310-abi3 honest:
+# pyo3 restricts the generated code to the 3.10 limited-API surface at compile
+# time, so the one binary loads on every 3.10+ interpreter and one wheel per
+# platform covers the whole supported Python range. (Plain "abi3" without a
+# version pin compiles against pyo3's oldest supported limited API; the
+# explicit floor documents the contract and matches the wheel tag maturin
+# emits for these features.)
+pyo3 = { version = "0.23", features = ["abi3", "abi3-py310", "extension-module"] }
 once_cell = "1.20"
 sha2 = "0.10"
 

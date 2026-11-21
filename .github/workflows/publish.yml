@@ -15,16 +15,83 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned like ruff in ci.yml so release artifacts are reproducible; bump
+  # deliberately and re-verify the wheel tags with
+  # .github/scripts/check_native_wheel.py.
+  MATURIN_VERSION: "1.16.0"
+  ZIGLANG_VERSION: "0.17.1"
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One wheel per platform plus the pure-Python fallback:
+        #
+        # - the binary legs build the Rust/PyO3 extension with maturin.
+        #   abi3-py310 (native/Cargo.toml) pins the stable-ABI floor to
+        #   requires-python, so every binary wheel is tagged cp310-abi3 and
+        #   one artifact per platform covers the whole 3.10+ interpreter
+        #   range. The Linux legs build through zig (pure-Rust crate, no C
+        #   toolchain needed) to link against glibc 2.17 — the manylinux
+        #   baseline — instead of the runner's newer glibc; aarch64 is
+        #   cross-compiled the same way. macOS ships one universal2 wheel
+        #   (x86_64 + arm64 slices, deployment target 11.0); Windows builds
+        #   natively on MSVC.
+        # - the pure leg keeps hatchling building the py3-none-any fallback
+        #   wheel and the sdist. pip prefers the platform wheels wherever
+        #   one matches (musl Linux, 32-bit and arm64 Windows, and anything
+        #   else untagged) and falls back to pure Python there, where the
+        #   extension-less code path runs by design.
+        include:
+          - name: pure
+            os: ubuntu-latest
+          - name: manylinux-x86_64
+            os: ubuntu-latest
+            binary: true
+            rustup-targets: "x86_64-unknown-linux-gnu"
+            maturin-target: "x86_64-unknown-linux-gnu"
+            zig: true
+            platform-tag: "manylinux2014_x86_64.manylinux_2_17_x86_64"
+            arch-check: "--elf-machine 62"
+            smoke: true
+          - name: manylinux-aarch64
+            os: ubuntu-latest
+            binary: true
+            rustup-targets: "aarch64-unknown-linux-gnu"
+            maturin-target: "aarch64-unknown-linux-gnu"
+            zig: true
+            platform-tag: "manylinux2014_aarch64.manylinux_2_17_aarch64"
+            arch-check: "--elf-machine 183"
+          - name: macos-universal2
+            os: macos-latest
+            binary: true
+            rustup-targets: "aarch64-apple-darwin x86_64-apple-darwin"
+            maturin-target: "universal2-apple-darwin"
+            platform-tag: "macosx_11_0_universal2"
+            arch-check: "--macho-universal2"
+            smoke: true
+          - name: windows-amd64
+            os: windows-latest
+            binary: true
+            platform-tag: "win_amd64"
+            arch-check: "--pe-machine 0x8664"
+            smoke: true
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       # For tag-triggered runs, refuse to publish if the pushed tag doesn't
       # match __version__ — a mistagged push would upload the WRONG version to
       # PyPI, which is irreversible. Skipped for workflow_dispatch (no v-tag).
+      # This guard runs in the pure leg only, but it protects every leg:
+      # the pypi/testpypi jobs need the whole matrix to succeed, so a failed
+      # guard blocks all uploads.
       - name: Verify tag matches package version
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && matrix.name == 'pure'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/ytm_player/__init__.py || true)
@@ -35,18 +102,103 @@ jobs:
           fi
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          # 3.10 is the abi3 floor: the binary legs build and smoke-test on
+          # the oldest interpreter the cp310-abi3 wheels claim to support,
+          # which is the direction a stable-ABI mistake would break.
+          python-version: "3.10"
           cache: pip
-      - run: pip install --upgrade build
-      - run: python -m build
-      - name: Verify wheel installs and CLI runs
+      # --- pure leg: hatchling sdist + fallback wheel (as before) ---
+      - name: Build sdist and pure wheel
+        if: matrix.name == 'pure'
+        run: |
+          pip install --upgrade build
+          python -m build
+      - name: Verify pure wheel installs and CLI runs
+        if: matrix.name == 'pure'
         run: |
           python -m venv /tmp/smoke
           /tmp/smoke/bin/pip install dist/*.whl
           /tmp/smoke/bin/ytm --version
+      # --- binary legs: maturin wheels carrying the Rust extension ---
+      - name: Install Rust toolchain
+        if: matrix.binary
+        run: rustup toolchain install stable --profile minimal
+      - name: Add Rust cross-targets
+        if: matrix.rustup-targets
+        run: rustup target add ${{ matrix.rustup-targets }}
+      - name: Install maturin (and zig for the manylinux legs)
+        if: matrix.binary
+        run: |
+          pip install "maturin==$MATURIN_VERSION"
+          if [ "$ZIG" = "true" ]; then
+            pip install "ziglang==$ZIGLANG_VERSION"
+          fi
+        env:
+          ZIG: ${{ matrix.zig }}
+      - name: Build wheel with maturin
+        if: matrix.binary
+        run: |
+          MATURIN_ARGS=()
+          if [ -n "$TARGET" ]; then
+            MATURIN_ARGS+=(--target "$TARGET")
+          fi
+          if [ "$ZIG" = "true" ]; then
+            MATURIN_ARGS+=(--zig)
+          fi
+          maturin build --release --locked \
+            --manifest-path native/Cargo.toml \
+            --out dist \
+            "${MATURIN_ARGS[@]}"
+        env:
+          # Matrix values enter via env, never ${{ }} inline in the script —
+          # inline expression splicing is the CodeQL actions/code-injection
+          # sink (same policy as aur-publish.yml).
+          TARGET: ${{ matrix.maturin-target }}
+          ZIG: ${{ matrix.zig }}
+          # Pin the minimum macOS the universal2 wheel claims (matches the
+          # macosx_11_0_universal2 platform tag; inert on Linux/Windows).
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+      - name: Verify wheel tagging and payload
+        if: matrix.binary
+        run: |
+          python .github/scripts/check_native_wheel.py dist/*.whl \
+            --python-tag cp310 --abi-tag abi3 \
+            --platform-tag "$PLATFORM_TAG" \
+            $ARCH_CHECK
+        env:
+          # Matrix values enter via env, never ${{ }} inline in the script —
+          # inline expression splicing is the CodeQL actions/code-injection
+          # sink (same policy as aur-publish.yml).
+          PLATFORM_TAG: ${{ matrix.platform-tag }}
+          ARCH_CHECK: ${{ matrix.arch-check }}
+      - name: Smoke-test the wheel
+        if: matrix.smoke
+        run: |
+          python -m venv /tmp/smoke
+          SMOKE_PY=/tmp/smoke/bin/python
+          if [ -f /tmp/smoke/Scripts/python.exe ]; then
+            SMOKE_PY=/tmp/smoke/Scripts/python.exe
+          fi
+          "$SMOKE_PY" -m pip install dist/*.whl
+          "$SMOKE_PY" -m ytm_player --version
+          "$SMOKE_PY" - <<'PY'
+          from ytm_player import __version__
+          from ytm_player.utils import _ytm_player_native
+          import importlib.metadata
+
+          exports = [name for name in dir(_ytm_player_native) if not name.startswith("_")]
+          assert exports, "extension module loaded but exports nothing"
+          # maturin stamps the wheel version from native/Cargo.toml; the
+          # importable package carries __version__. They must agree.
+          assert importlib.metadata.version("ytm-player") == __version__, (
+              f"wheel version {importlib.metadata.version('ytm-player')!r} "
+              f"!= __version__ {__version__!r}"
+          )
+          print(f"native extension loads from the wheel: {len(exports)} exports, version {__version__}")
+          PY
       - uses: actions/upload-artifact@v7
         with:
-          name: dist
+          name: dist-${{ matrix.name }}
           path: dist/
 
   testpypi:
@@ -59,7 +211,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -75,7 +228,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -89,7 +243,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - name: Extract changelog section for this tag
         run: python .github/scripts/extract_changelog.py "${GITHUB_REF_NAME}" CHANGELOG.md > release_notes.md

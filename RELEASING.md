@@ -4,9 +4,13 @@ The release flow is **tag-driven**. Pushing a `vX.Y.Z` tag triggers PyPI publish
 
 ## Quick checklist
 
-1. **Bump version** — `src/ytm_player/__init__.py` → `__version__ = "X.Y.Z"` (this is the
-   single source of truth: the tag guard checks it and the AUR workflow derives `pkgver`
-   from it — do NOT hand-edit `pkgver=` in `aur/PKGBUILD`, CI overwrites it)
+1. **Bump version** — `src/ytm_player/__init__.py` → `__version__ = "X.Y.Z"` **and** `native/Cargo.toml` →
+   `version = "X.Y.Z"`, then refresh the lock from `native/` with `cargo update --workspace --quiet`
+   (a changed crate version must reach `Cargo.lock`; `maturin build --locked` in the Publish workflow
+   fails otherwise). `__version__` is the single source of truth the tag guard checks and the AUR
+   workflow derives `pkgver` from — do NOT hand-edit `pkgver=` in `aur/PKGBUILD`, CI overwrites it.
+   A packaging test (`tests/test_packaging/test_native_wheel_config.py`) fails CI if the two
+   versions drift apart, because maturin stamps the binary wheels from the Cargo version.
 2. **Fold CHANGELOG** — collapse all `### Unreleased` blocks into one `### vX.Y.Z (YYYY-MM-DD)` entry
 3. **Lint + test**:
    ```bash
@@ -31,7 +35,22 @@ The release flow is **tag-driven**. Pushing a `vX.Y.Z` tag triggers PyPI publish
 
 ### `Publish` workflow (`.github/workflows/publish.yml`)
 
-Triggered on tag push. Builds wheel + sdist, smoke-tests against `ytm --version` in a fresh venv, uploads to PyPI via OIDC trusted publishing, creates a GitHub Release with the matching CHANGELOG section attached.
+Triggered on tag push. Builds the full artifact set on a per-OS matrix, smoke-tests every wheel
+against `ytm --version` in a fresh venv, uploads to PyPI via OIDC trusted publishing, creates a
+GitHub Release with the matching CHANGELOG section and all artifacts attached.
+
+- **Binary legs (maturin):** one `cp310-abi3` wheel per platform carrying the Rust extension —
+  `manylinux2014/manylinux_2_17` for x86_64 and aarch64 (built on ubuntu through zig against the
+  glibc 2.17 baseline; aarch64 is cross-compiled, which is why it has no install smoke test), a
+  macOS `universal2` wheel (`MACOSX_DEPLOYMENT_TARGET=11.0`) and a Windows `win_amd64` wheel.
+  Every leg verifies its wheel with `.github/scripts/check_native_wheel.py` — file name tag,
+  WHEEL `Tag:` headers, `Root-Is-Purelib`, extension placement and the binary's machine type —
+  so a mis-tagged or wrong-architecture wheel fails the release instead of reaching PyPI.
+- **Pure leg (hatchling):** the sdist and the `py3-none-any` fallback wheel, exactly as before.
+  The tag-matches-`__version__` guard runs here; a failure blocks every upload because the
+  publish jobs need the whole matrix to succeed.
+- The `wheels` job in `ci.yml` builds the same binary matrix (same pinned maturin/ziglang) on
+  every push, so wheel-config regressions surface long before a release tag.
 
 No API tokens — auth is via OIDC trusted-publisher entries at PyPI and TestPyPI.
 
@@ -110,7 +129,7 @@ The AUR workflow does NOT trigger on TestPyPI dry-runs — it gates on the Publi
 
 | Channel | Maintained by | Update mechanism |
 |---------|---------------|------------------|
-| PyPI | Us | Automated via `publish.yml` on tag push |
+| PyPI (native wheels: manylinux x86_64/aarch64, macOS universal2, Windows amd64 + pure fallback) | Us | Automated via `publish.yml` on tag push |
 | AUR (`ytm-player-git`) | Us | Automated via `aur-publish.yml` after PyPI succeeds |
 | GitHub Release | Us | Automated via `publish.yml` on tag push |
 | NixOS (`flake.nix`) | Us | Manual — bump in repo on release |

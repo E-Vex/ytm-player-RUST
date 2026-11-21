@@ -46,13 +46,14 @@
 
 - **Python 3.10+**
 - **[mpv](https://mpv.io/)** (audio playback backend, must be installed system-wide)
-- **[Rust toolchain](https://rustup.rs/) (1.98+)** — optional; only needed to build the native Rust extension. The pure-Python fallback is used automatically when the extension is not compiled.
+- **[Rust toolchain](https://rustup.rs/) (1.98+)** — only needed to build the native Rust extension from source. The PyPI wheels for Linux (manylinux x86_64/aarch64), macOS (universal2) and Windows (win_amd64) already ship the compiled extension, and the pure-Python fallback covers every other platform.
 - A YouTube Music account (free or Premium)
 
 ## Install
 
 ```bash
-# PyPI (Linux / macOS / Windows)
+# PyPI (Linux / macOS / Windows) — installs a prebuilt native wheel where
+# one matches your platform, pure Python elsewhere
 pip install ytm-player
 
 # Arch / CachyOS / Manjaro (AUR)
@@ -79,7 +80,7 @@ cd native
 
 This compiles `native/src/lib.rs` into `_ytm_player_native.abi3.so` (Linux and macOS) or `_ytm_player_native.pyd` (Windows — CPython has no `.abi3.pyd` import suffix there) and copies it into `src/ytm_player/utils/`. The script resolves the cargo artifact for the platform it runs on; run it under Git Bash on Windows. Re-run `./build.sh` after any change to the Rust source.
 
-The extension is built with PyO3's stable ABI (`abi3`), so it remains loadable across Python minor versions within the same 3.x series.
+The extension is built with PyO3's stable ABI (`abi3`, floor pinned to Python 3.10 — the project's `requires-python`), so each published binary wheel is tagged `cp310-abi3` and its one compiled artifact loads on every 3.10+ interpreter. maturin builds those wheels for the release matrix — `manylinux_2_17` x86_64 and aarch64 (linked through zig against the glibc 2.17 baseline), a macOS `universal2` wheel covering both Intel and Apple Silicon, and a Windows `win_amd64` wheel — while the pure-Python `py3-none-any` wheel stays published as the fallback for platforms without a binary wheel (musl Linux, 32-bit Windows, …). Every wheel build is verified by `.github/scripts/check_native_wheel.py` (tag set, extension placement, binary architecture) before it can reach PyPI.
 
 ## Quickstart
 

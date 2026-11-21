@@ -17,11 +17,13 @@ mpv is required for audio playback. Install it with your system package manager:
 
 ## Step 2: Install ytm-player
 
-### PyPI (Linux / macOS)
+### PyPI (Linux / macOS / Windows)
 
 ```bash
 pip install ytm-player
 ```
+
+The PyPI release ships prebuilt native wheels — `cp310-abi3` binaries for manylinux x86_64 and aarch64, macOS universal2 (Intel + Apple Silicon) and Windows `win_amd64` — so `pip` installs the compiled Rust extension wherever one matches your platform, with no Rust toolchain involved. On platforms without a binary wheel (musl Linux/Alpine, 32-bit Windows, …) pip falls back to the pure-Python wheel, which runs the extension-less fallback path automatically. Building from source (the sdist) also works without Rust; run `native/build.sh` if you want the extension in a source install.
 
 ### Arch Linux / CachyOS / EndeavourOS / Manjaro (AUR)
 

@@ -27,13 +27,19 @@ from hatchling.builders.wheel import WheelBuilder  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Without these the sdist could not build, install or run its own tests.
+# The native/ trio keeps the sdist able to build the Rust extension
+# (native/build.sh) and the maturin binary wheels (cargo + lock).
 REQUIRED_SDIST_FILES = (
     "src/ytm_player/__init__.py",
     "tests/conftest.py",
     "docs/installation.md",
     ".github/scripts/extract_changelog.py",
+    ".github/scripts/check_native_wheel.py",
     "scripts/regenerate_srcinfo.py",
     "aur/PKGBUILD",
+    "native/Cargo.toml",
+    "native/Cargo.lock",
+    "native/build.sh",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",

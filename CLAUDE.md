@@ -119,9 +119,9 @@ The codebase uses ~263 `except Exception:` blocks as a deliberate graceful-degra
 
 Three GitHub Actions workflows live in `.github/workflows/`:
 
-- `ci.yml` — runs ruff lint + format check, then pytest on the matrix `[3.10, 3.15]` × `[ubuntu, macos, windows]` (6 jobs total), plus a `native` job on `[3.10, 3.15]` × `[ubuntu, macos, windows]` (6 jobs) that runs `cargo fmt --check` + `cargo clippy -D warnings`, builds the PyO3 extension via `native/build.sh` (which resolves the cargo artifact and module filename per platform — `.abi3.so` on Linux/macOS, `.pyd` on Windows), and re-runs pytest with the extension loaded — so every `skipif(not _HAVE_NATIVE)` parity test actually executes and native/fallback divergence fails the build.
+- `ci.yml` — runs ruff lint + format check, then pytest on the matrix `[3.10, 3.15]` × `[ubuntu, macos, windows]` (6 jobs total), plus a `native` job on `[3.10, 3.15]` × `[ubuntu, macos, windows]` (6 jobs) that runs `cargo fmt --check` + `cargo clippy -D warnings`, builds the PyO3 extension via `native/build.sh` (which resolves the cargo artifact and module filename per platform — `.abi3.so` on Linux/macOS, `.pyd` on Windows), and re-runs pytest with the extension loaded — so every `skipif(not _HAVE_NATIVE)` parity test actually executes and native/fallback divergence fails the build. A `wheels` job on `[ubuntu, ubuntu, macos, windows]` (4 jobs) builds the published binary-wheel matrix with maturin (pinned, same as `publish.yml`): zig-linked `manylinux_2_17` x86_64 + cross-compiled aarch64, macOS `universal2`, Windows `win_amd64`, each verified by `.github/scripts/check_native_wheel.py` (tag set, extension placement, binary machine type) and, where the runner can install the wheel, smoke-tested (extension imports, wheel version equals `__version__`).
 - `check-python-versions.yml` — runs monthly (1st of each month, 09:00 UTC) and opens a maintenance issue when CPython releases a new stable major.minor version newer than our matrix ceiling. Idempotent — won't reopen if an issue is already open. Uses pyyaml to parse the matrix robustly.
-- `publish.yml` — tag-triggered (`v*`) and `workflow_dispatch`. Builds wheel + sdist, smoke-tests the wheel against `ytm --version` in a fresh venv, uploads to PyPI via OIDC trusted publishing (no API tokens), then creates a GitHub Release with the matching CHANGELOG section attached. Manual dispatch can target TestPyPI for dry-runs.
+- `publish.yml` — tag-triggered (`v*`) and `workflow_dispatch`. Builds the artifact set on the same per-OS matrix: maturin binary wheels carrying the Rust extension (`cp310-abi3`, floor pinned by the `abi3-py310` pyo3 feature in `native/Cargo.toml`) plus the hatchling sdist and pure-Python `py3-none-any` fallback wheel; every wheel is verified by `.github/scripts/check_native_wheel.py` and smoke-tested in a fresh venv, then uploaded to PyPI via OIDC trusted publishing (no API tokens), then a GitHub Release is created with the matching CHANGELOG section and all artifacts attached. Manual dispatch can target TestPyPI for dry-runs.
 
 ## Dependabot
 
@@ -146,11 +146,14 @@ GitHub Environments `pypi` and `testpypi` exist in repo settings. No API tokens 
 
 ### Cutting a release
 
-1. Bump `__version__` in `src/ytm_player/__init__.py`.
+1. Bump `__version__` in `src/ytm_player/__init__.py` **and** `version` in `native/Cargo.toml` (maturin
+   stamps the binary wheels from the Cargo version; a packaging test fails CI on drift), then refresh
+   `native/Cargo.lock` with `cargo update --workspace --quiet` — `maturin build --locked` fails on a
+   stale lock.
 2. Add a `### vX.Y.Z (YYYY-MM-DD)` section to the top of `CHANGELOG.md` (the publish workflow extracts it for the GitHub Release body).
 3. Run `ruff format src/ tests/ && ruff check src/ tests/ && pytest`.
 4. Commit (`chore(release): vX.Y.Z`), tag (`git tag vX.Y.Z`), push both (`git push && git push --tags`).
-5. Watch the `Publish` workflow on GitHub Actions — it builds, smoke-tests, uploads to PyPI, and creates the release in roughly a minute.
+5. Watch the `Publish` workflow on GitHub Actions — it builds the wheel matrix, smoke-tests, uploads to PyPI, and creates the release in a few minutes.
 
 ### Dry-run via TestPyPI (paranoid release)
 
@@ -167,7 +170,10 @@ AUR package URL: https://aur.archlinux.org/packages/ytm-player-git
 ## Distribution
 
 Published on four channels:
-- **PyPI:** `pip install ytm-player` — https://pypi.org/project/ytm-player/
+- **PyPI:** `pip install ytm-player` — https://pypi.org/project/ytm-player/ — ships prebuilt
+  `cp310-abi3` native wheels (manylinux x86_64/aarch64, macOS universal2, Windows amd64) plus the
+  pure-Python fallback wheel; pip picks the platform wheel where one matches and falls back to
+  pure Python elsewhere (musl Linux, 32-bit Windows, …)
 - **AUR:** `yay -S ytm-player-git` — https://aur.archlinux.org/packages/ytm-player-git
 - **NixOS:** `flake.nix` with `ytm-player` and `ytm-player-full` packages
 - **Gentoo:** `emerge media-sound/ytm-player` via GURU overlay (community-maintained by @dsafxP)

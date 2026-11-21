@@ -72,6 +72,8 @@ native/src/
 
 When porting a new core, place it in the module that mirrors its Python home and register it in the `#[pymodule]` with a qualified path (`wrap_pyfunction!(services::ytmusic::ytm_auth_expired, module)`). The CI `native` job builds the extension with `native/build.sh` and re-runs the full test suite with it loaded, alongside `cargo fmt --check` and `cargo clippy -D warnings`, on every supported OS (Linux, macOS, Windows — `build.sh` resolves the cargo artifact and the module filename per platform, since Windows has no `.abi3.pyd` import suffix).
 
+The extension ships in the published wheels: maturin builds one `cp310-abi3` binary wheel per platform (manylinux x86_64/aarch64 via zig against glibc 2.17, a macOS universal2 wheel, a Windows `win_amd64` wheel) under the `[tool.maturin]` table in `pyproject.toml`, which places the extension at `ytm_player/utils/_ytm_player_native` — the same path `build.sh` produces for source builds. The `wheels` CI job builds and verifies that matrix on every push; hatchling keeps building the sdist and the pure-Python `py3-none-any` fallback wheel, which pip selects on platforms without a binary wheel (musl Linux, 32-bit Windows, …) and where the extension-less fallback path runs by design.
+
 ## Stack
 
 | Library | Purpose |

@@ -25,6 +25,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Pinned to match publish.yml so CI proves the exact release toolchain;
+  # bump both together.
+  MATURIN_VERSION: "1.16.0"
+  ZIGLANG_VERSION: "0.17.1"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -122,3 +128,116 @@ jobs:
         working-directory: native
       - name: pytest with native extension
         run: pytest
+
+  # Prove the published binary wheels on every push, not only at release
+  # time: each leg builds the maturin wheel exactly the way publish.yml
+  # does (same pinned maturin, same zig-linked manylinux targets) and
+  # verifies tags, payload and — wherever the runner can install the
+  # wheel — that the extension actually loads from it. A maturin or
+  # pyproject [tool.maturin] regression would otherwise only surface when
+  # a release tag is pushed.
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: manylinux-x86_64
+            os: ubuntu-latest
+            rustup-targets: "x86_64-unknown-linux-gnu"
+            maturin-target: "x86_64-unknown-linux-gnu"
+            zig: true
+            platform-tag: "manylinux2014_x86_64.manylinux_2_17_x86_64"
+            arch-check: "--elf-machine 62"
+            smoke: true
+          - name: manylinux-aarch64
+            os: ubuntu-latest
+            rustup-targets: "aarch64-unknown-linux-gnu"
+            maturin-target: "aarch64-unknown-linux-gnu"
+            zig: true
+            platform-tag: "manylinux2014_aarch64.manylinux_2_17_aarch64"
+            arch-check: "--elf-machine 183"
+          - name: macos-universal2
+            os: macos-latest
+            rustup-targets: "aarch64-apple-darwin x86_64-apple-darwin"
+            maturin-target: "universal2-apple-darwin"
+            platform-tag: "macosx_11_0_universal2"
+            arch-check: "--macho-universal2"
+            smoke: true
+          - name: windows-amd64
+            os: windows-latest
+            platform-tag: "win_amd64"
+            arch-check: "--pe-machine 0x8664"
+            smoke: true
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # The abi3 floor: the wheels claim cp310-abi3, so build and
+          # smoke-test on the oldest supported interpreter.
+          python-version: "3.10"
+          cache: pip
+      - run: rustup toolchain install stable --profile minimal
+      - name: Add Rust cross-targets
+        if: matrix.rustup-targets
+        run: rustup target add ${{ matrix.rustup-targets }}
+      - name: Install maturin (and zig for the manylinux legs)
+        run: |
+          pip install "maturin==$MATURIN_VERSION"
+          if [ "$ZIG" = "true" ]; then
+            pip install "ziglang==$ZIGLANG_VERSION"
+          fi
+        env:
+          ZIG: ${{ matrix.zig }}
+      - name: Build wheel with maturin
+        run: |
+          MATURIN_ARGS=()
+          if [ -n "$TARGET" ]; then
+            MATURIN_ARGS+=(--target "$TARGET")
+          fi
+          if [ "$ZIG" = "true" ]; then
+            MATURIN_ARGS+=(--zig)
+          fi
+          maturin build --release --locked \
+            --manifest-path native/Cargo.toml \
+            --out dist \
+            "${MATURIN_ARGS[@]}"
+        env:
+          TARGET: ${{ matrix.maturin-target }}
+          ZIG: ${{ matrix.zig }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+      - name: Verify wheel tagging and payload
+        run: |
+          python .github/scripts/check_native_wheel.py dist/*.whl \
+            --python-tag cp310 --abi-tag abi3 \
+            --platform-tag "$PLATFORM_TAG" \
+            $ARCH_CHECK
+        env:
+          PLATFORM_TAG: ${{ matrix.platform-tag }}
+          ARCH_CHECK: ${{ matrix.arch-check }}
+      - name: Smoke-test the wheel
+        if: matrix.smoke
+        run: |
+          python -m venv /tmp/smoke
+          SMOKE_PY=/tmp/smoke/bin/python
+          if [ -f /tmp/smoke/Scripts/python.exe ]; then
+            SMOKE_PY=/tmp/smoke/Scripts/python.exe
+          fi
+          "$SMOKE_PY" -m pip install dist/*.whl
+          "$SMOKE_PY" -m ytm_player --version
+          "$SMOKE_PY" - <<'PY'
+          from ytm_player import __version__
+          from ytm_player.utils import _ytm_player_native
+          import importlib.metadata
+
+          exports = [name for name in dir(_ytm_player_native) if not name.startswith("_")]
+          assert exports, "extension module loaded but exports nothing"
+          assert importlib.metadata.version("ytm-player") == __version__, (
+              f"wheel version {importlib.metadata.version('ytm-player')!r} "
+              f"!= __version__ {__version__!r}"
+          )
+          print(f"native extension loads from the wheel: {len(exports)} exports, version {__version__}")
+          PY
