@@ -37,8 +37,9 @@ jobs:
         #   toolchain needed) to link against glibc 2.17 — the manylinux
         #   baseline — instead of the runner's newer glibc; aarch64 is
         #   cross-compiled the same way. macOS ships one universal2 wheel
-        #   (x86_64 + arm64 slices, deployment target 11.0); Windows builds
-        #   natively on MSVC.
+        #   (x86_64 + arm64 slices, deployment target 11.0), tagged with the
+        #   compressed arm64/universal2/x86_64 tag set maturin emits for a
+        #   fat binary; Windows builds natively on MSVC.
         # - the pure leg keeps hatchling building the py3-none-any fallback
         #   wheel and the sdist. pip prefers the platform wheels wherever
         #   one matches (musl Linux, 32-bit and arm64 Windows, and anything
@@ -69,7 +70,12 @@ jobs:
             binary: true
             rustup-targets: "aarch64-apple-darwin x86_64-apple-darwin"
             maturin-target: "universal2-apple-darwin"
-            platform-tag: "macosx_11_0_universal2"
+            # maturin (cargo-zigbuild) lipo's both slices into one binary and
+            # tags the wheel with every macOS platform the fat binary
+            # satisfies — arm64, universal2 and x86_64 — as a compressed
+            # PEP 425 tag set. The checker expands it and expects one Tag:
+            # header per part.
+            platform-tag: "macosx_11_0_arm64.macosx_11_0_universal2.macosx_11_0_x86_64"
             arch-check: "--macho-universal2"
             smoke: true
           - name: windows-amd64
@@ -156,7 +162,7 @@ jobs:
           TARGET: ${{ matrix.maturin-target }}
           ZIG: ${{ matrix.zig }}
           # Pin the minimum macOS the universal2 wheel claims (matches the
-          # macosx_11_0_universal2 platform tag; inert on Linux/Windows).
+          # macosx_11_0_* platform tags; inert on Linux/Windows).
           MACOSX_DEPLOYMENT_TARGET: "11.0"
       - name: Verify wheel tagging and payload
         if: matrix.binary

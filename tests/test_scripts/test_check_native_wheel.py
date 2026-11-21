@@ -125,10 +125,15 @@ def test_accepts_manylinux_aarch64_wheel(tmp_path):
 
 
 def test_accepts_macos_universal2_wheel(tmp_path):
-    wheel = _build_wheel(tmp_path, platform="macosx_11_0_universal2", payload=_macho_universal2())
-    check_native_wheel.check_wheel(
-        str(wheel), "cp310", "abi3", "macosx_11_0_universal2", macho_universal2=True
-    )
+    # The real maturin 1.16 output: the fat binary satisfies every macOS
+    # platform, so the wheel name and the WHEEL Tag: headers carry the
+    # compressed arm64/universal2/x86_64 tag set (one Tag: line per part —
+    # exactly what a wheel built with --target universal2-apple-darwin
+    # carries; a single macosx_11_0_universal2 expectation rejects it, which
+    # is how the first TestPyPI dry-run failed).
+    platform = "macosx_11_0_arm64.macosx_11_0_universal2.macosx_11_0_x86_64"
+    wheel = _build_wheel(tmp_path, platform=platform, payload=_macho_universal2())
+    check_native_wheel.check_wheel(str(wheel), "cp310", "abi3", platform, macho_universal2=True)
 
 
 def test_accepts_windows_wheel(tmp_path):

@@ -160,7 +160,10 @@ jobs:
             os: macos-latest
             rustup-targets: "aarch64-apple-darwin x86_64-apple-darwin"
             maturin-target: "universal2-apple-darwin"
-            platform-tag: "macosx_11_0_universal2"
+            # maturin (cargo-zigbuild) tags the fat wheel with every macOS
+            # platform it satisfies — arm64, universal2 and x86_64 — as a
+            # compressed PEP 425 tag set (mirrors publish.yml).
+            platform-tag: "macosx_11_0_arm64.macosx_11_0_universal2.macosx_11_0_x86_64"
             arch-check: "--macho-universal2"
             smoke: true
           - name: windows-amd64

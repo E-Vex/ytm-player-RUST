@@ -95,6 +95,7 @@ dev = [
     "pre-commit>=4.6",
     "pyright>=1.1",
     "hatchling>=1.14",  # tests/test_packaging inspects and builds distributions
+    "pyyaml>=6.0",  # tests/test_packaging pins the workflow wheel matrices
 ]
 
 [project.urls]
