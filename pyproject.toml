@@ -42,7 +42,12 @@ dependencies = [
     "pycryptodomex>=3.19.1",
     "python-mpv>=1.0.0",
     "aiosqlite>=0.20.0",
-    "click>=8.1.0",
+    # The floor matches what the test suite verifies: click 8.2 made
+    # CliRunner capture stderr separately by default, and two CLI tests
+    # assert on result.stderr — with 8.1.x installed they fail with
+    # "stderr not separately captured" for reasons unrelated to any
+    # change of their own. Runtime code is compatible either way.
+    "click>=8.2",
     "packaging>=21.0",
     "Pillow>=10.0",
     "pynput>=1.7.6; sys_platform == 'win32'",
