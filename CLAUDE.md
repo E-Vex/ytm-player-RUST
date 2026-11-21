@@ -131,16 +131,18 @@ Three GitHub Actions workflows live in `.github/workflows/`:
 
 The flow is **tag-driven**. Pushing a `vX.Y.Z` tag triggers `publish.yml`, which handles PyPI + the GitHub Release end-to-end; `aur-publish.yml` then pushes to AUR automatically, deriving `pkgver` from `__version__` (never hand-bump `pkgver=` in `aur/PKGBUILD` — CI overwrites it).
 
-### One-time setup (already done)
+### One-time setup (partly done — see the pending entry)
 
-Before the first tag, two PyPI trusted-publisher entries are configured at https://pypi.org/manage/account/publishing/ and https://test.pypi.org/manage/account/publishing/:
+PyPI trusted publishing requires one entry per **repository** at https://pypi.org/manage/account/publishing/ and https://test.pypi.org/manage/account/publishing/. The upstream `peternaame-boop/ytm-player` entries exist; the Rust-transition repository publishes from **this** repo, so it needs its own (GitHub OIDC claims name the exact repository, and a fork's claims do not match the upstream's entry):
 
 | Field | Value |
 |-------|-------|
-| Owner | `peternaame-boop` |
-| Repository | `ytm-player` |
+| Owner | `E-Vex` |
+| Repository | `ytm-player-RUST` |
 | Workflow | `publish.yml` |
 | Environment | `pypi` (or `testpypi` on TestPyPI) |
+
+Status: the **TestPyPI entry is still missing** — the 2026-11-21 dry-run's full build matrix passed (all five legs), but the upload leg failed with `invalid-publisher: valid token, but no corresponding publisher` because no entry matches `E-Vex/ytm-player-RUST` yet. Add it at the TestPyPI link above (same for PyPI before the first real tag), then re-dispatch the dry-run.
 
 GitHub Environments `pypi` and `testpypi` exist in repo settings. No API tokens stored anywhere — auth is OIDC.
 
@@ -158,6 +160,8 @@ GitHub Environments `pypi` and `testpypi` exist in repo settings. No API tokens 
 ### Dry-run via TestPyPI (paranoid release)
 
 Trigger `Publish` manually from the Actions tab → `Run workflow` → target `testpypi`. Builds + uploads to https://test.pypi.org/project/ytm-player/ without touching production. Useful when changing build config or pyproject metadata.
+
+The 2026-11-21 dry-run proved the full build matrix (pure + manylinux x86_64/aarch64 + macOS universal2 + Windows, every wheel verified and smoke-tested). The upload leg still needs the TestPyPI trusted-publisher entry for this repository (see "One-time setup" above) — until it is added, the upload fails with `invalid-publisher`, which is an account configuration step, not a build problem.
 
 ### AUR (automated)
 

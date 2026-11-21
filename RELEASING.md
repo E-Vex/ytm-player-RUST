@@ -110,20 +110,22 @@ gh secret list --repo peternaame-boop/ytm-player | grep AUR
 
 ### 3. PyPI trusted publishing
 
-Both PyPI and TestPyPI have a trusted-publisher entry pointing at this repo's `publish.yml`. No tokens stored anywhere — auth is via OIDC at workflow runtime.
+Trusted publishing is configured per **repository** — the OIDC claims name the exact repository, so this repo needs its own entries (the upstream `peternaame-boop/ytm-player` has its own, which do not match a fork's claims). No tokens stored anywhere — auth is via OIDC at workflow runtime.
 
 | Field | Value |
 |-------|-------|
-| Owner | `peternaame-boop` |
-| Repository | `ytm-player` |
+| Owner | `E-Vex` |
+| Repository | `ytm-player-RUST` |
 | Workflow | `publish.yml` |
 | Environment | `pypi` (or `testpypi` on TestPyPI) |
 
-Configured at https://pypi.org/manage/account/publishing/ and https://test.pypi.org/manage/account/publishing/.
+Configured at https://pypi.org/manage/account/publishing/ and https://test.pypi.org/manage/account/publishing/. **Status:** the TestPyPI entry is still missing — the 2026-11-21 dry-run passed the full build matrix but the upload leg failed with `invalid-publisher` until it is added.
 
 ## Dry-run via TestPyPI
 
 Trigger `Publish` manually from Actions → **Run workflow** → target `testpypi`. Builds + uploads to https://test.pypi.org/project/ytm-player/ without touching production.
+
+The 2026-11-21 dry-run proved the full build matrix end-to-end: the pure leg (sdist + fallback wheel) and all four maturin binary legs (manylinux x86_64/aarch64 through zig, macOS universal2 with the compressed arm64/universal2/x86_64 tag set, Windows amd64) built, verified and smoke-tested clean — after the macOS leg fix (the first dry-run caught a wrong expected platform tag; see the changelog's Unreleased fixes). The upload leg requires the TestPyPI trusted-publisher entry for `E-Vex/ytm-player-RUST` (see the first-time-setup section above) — until that account-side entry exists, the upload fails with `invalid-publisher`, which is not a build problem.
 
 The AUR workflow does NOT trigger on TestPyPI dry-runs — it gates on the Publish workflow's `event=push` condition (i.e., real tag pushes only).
 
