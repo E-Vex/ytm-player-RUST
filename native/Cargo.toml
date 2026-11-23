@@ -24,6 +24,13 @@ pyo3 = { version = "0.23", features = ["abi3", "abi3-py310", "extension-module"]
 once_cell = "1.20"
 sha2 = "0.10"
 
+# Runs from OUR build.rs (see there): emits the macOS
+# `-undefined dynamic_lookup` cdylib link args that a bare `cargo build`
+# of the extension needs — maturin passes them itself, build.sh / the
+# AUR build / Nix's buildRustPackage do not. Must track pyo3's version.
+[build-dependencies]
+pyo3-build-config = "0.23.5"
+
 [dependencies.regex]
 version = "1.10"
 default-features = false

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 SECURE_FILE_MODE = 0o600
 SECURE_DIR_MODE = 0o700
@@ -25,50 +25,61 @@ def _compute_paths(platform: str, home: str, env: dict[str, str]) -> dict[str, s
     is exercisable from any host). An absent entry means the constant is
     ``None`` on that platform — ``SOCKET_PATH`` on Windows,
     ``IPC_PORT_FILE`` elsewhere.
+
+    Every join goes through the *simulated platform's* path flavour —
+    ``PurePosixPath`` for the XDG branches, ``PureWindowsPath`` for the
+    win32 branch — never the host ``Path``: the table must render the
+    same string on any host (the native ``paths_core``'s ``/``-joined
+    spelling is reconciled with this one at the same flavour lens by the
+    parity tests), and on a native host the flavour is exactly the
+    host ``Path``'s own rendering, so the import-time constants are
+    unchanged.
     """
     table: dict[str, str] = {}
 
     if platform == "win32":
+        pure = PureWindowsPath
         # get-with-default: the fallback fires only when the variable is
-        # *unset* — an empty APPDATA stays empty (and Path("") then
-        # lands on the relative table, exactly like the reference).
+        # *unset* — an empty APPDATA stays empty (and the flavour path
+        # then lands on the relative table, exactly like the reference).
         app_data = env.get("APPDATA")
         if app_data is None:
-            app_data = str(Path(home) / "AppData" / "Roaming")
+            app_data = str(pure(home) / "AppData" / "Roaming")
         local_data = env.get("LOCALAPPDATA")
         if local_data is None:
-            local_data = str(Path(home) / "AppData" / "Local")
+            local_data = str(pure(home) / "AppData" / "Local")
 
-        config_dir = str(Path(app_data) / "ytm-player")
+        config_dir = str(pure(app_data) / "ytm-player")
         table["CONFIG_DIR"] = config_dir
-        table["CACHE_DIR"] = str(Path(local_data) / "ytm-player" / "audio")
-        table["CACHE_DB"] = str(Path(local_data) / "ytm-player" / "cache.db")
+        table["CACHE_DIR"] = str(pure(local_data) / "ytm-player" / "audio")
+        table["CACHE_DB"] = str(pure(local_data) / "ytm-player" / "cache.db")
         # Windows uses TCP; the port file lives in the config dir.
-        table["IPC_PORT_FILE"] = str(Path(config_dir) / "ipc_port")
+        table["IPC_PORT_FILE"] = str(pure(config_dir) / "ipc_port")
     else:
+        pure = PurePosixPath
         # Truthiness gates: None *or* the empty string reads as unset.
         xdg_config = env.get("XDG_CONFIG_HOME")
         if xdg_config:
-            config_dir = str(Path(xdg_config) / "ytm-player")
+            config_dir = str(pure(xdg_config) / "ytm-player")
         else:
-            config_dir = str(Path(home) / ".config" / "ytm-player")
+            config_dir = str(pure(home) / ".config" / "ytm-player")
         table["CONFIG_DIR"] = config_dir
 
         xdg_cache = env.get("XDG_CACHE_HOME")
         if xdg_cache:
-            table["CACHE_DIR"] = str(Path(xdg_cache) / "ytm-player" / "audio")
-            table["CACHE_DB"] = str(Path(xdg_cache) / "ytm-player" / "cache.db")
+            table["CACHE_DIR"] = str(pure(xdg_cache) / "ytm-player" / "audio")
+            table["CACHE_DB"] = str(pure(xdg_cache) / "ytm-player" / "cache.db")
         else:
-            table["CACHE_DIR"] = str(Path(home) / ".cache" / "ytm-player" / "audio")
-            table["CACHE_DB"] = str(Path(home) / ".cache" / "ytm-player" / "cache.db")
+            table["CACHE_DIR"] = str(pure(home) / ".cache" / "ytm-player" / "audio")
+            table["CACHE_DB"] = str(pure(home) / ".cache" / "ytm-player" / "cache.db")
 
         # Unix sockets have a ~108 byte path limit. Prefer
         # XDG_RUNTIME_DIR (short, per-user, tmpfs) when available.
         xdg_runtime = env.get("XDG_RUNTIME_DIR")
         if xdg_runtime:
-            table["SOCKET_PATH"] = str(Path(xdg_runtime) / "ytm-player.sock")
+            table["SOCKET_PATH"] = str(pure(xdg_runtime) / "ytm-player.sock")
         else:
-            table["SOCKET_PATH"] = str(Path(config_dir) / "ytm.sock")
+            table["SOCKET_PATH"] = str(pure(config_dir) / "ytm.sock")
 
     for key, leaf in (
         ("CONFIG_FILE", "config.toml"),
@@ -87,14 +98,14 @@ def _compute_paths(platform: str, home: str, env: dict[str, str]) -> dict[str, s
         ("UPDATE_CHECK_CACHE", "update_check.json"),
         ("HISTORY_DB", "history.db"),
     ):
-        table[key] = str(Path(config_dir) / leaf)
+        table[key] = str(pure(config_dir) / leaf)
 
-    log_dir = str(Path(config_dir) / "logs")
+    log_dir = str(pure(config_dir) / "logs")
     table["LOG_DIR"] = log_dir
-    table["LOG_FILE"] = str(Path(log_dir) / "ytm.log")
-    crash_dir = str(Path(config_dir) / "crashes")
+    table["LOG_FILE"] = str(pure(log_dir) / "ytm.log")
+    crash_dir = str(pure(config_dir) / "crashes")
     table["CRASH_DIR"] = crash_dir
-    table["CRASH_LOG"] = str(Path(crash_dir) / "ytm-crash.log")
+    table["CRASH_LOG"] = str(pure(crash_dir) / "ytm-crash.log")
     return table
 
 

@@ -306,6 +306,7 @@ dependencies = [
  "any_ascii",
  "once_cell",
  "pyo3",
+ "pyo3-build-config",
  "regex",
  "sha2",
  "unicode-bidi",

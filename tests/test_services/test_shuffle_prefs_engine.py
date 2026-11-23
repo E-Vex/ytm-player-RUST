@@ -782,7 +782,14 @@ _FILE_PARITY_CASES: list = [
     [["preset", "prefs.json", "{'x': 1}"], ["read", "prefs.json"]],
     [["preset", "prefs.json", '{"a": }'], ["read", "prefs.json"]],
     [["preset", "prefs.json", "<undecodable>"], ["read", "prefs.json"]],
-    [["preset", "<dir>", ""], ["read", "<dir>"]],
+    # The prefs path itself is a directory (the payload token "<dir>"
+    # presets a directory): both engines drive the path object's own
+    # read_text, so the host's directory-read error class —
+    # IsADirectoryError on POSIX, PermissionError on Windows — is what
+    # both raise. (The case previously spelled the name and payload
+    # swapped — an empty *file* at a literal "<dir>" path, which no
+    # filesystem but POSIX's would even let you create.)
+    [["preset", "prefs.json", "<dir>"], ["read", "prefs.json"]],
     [["read", "missing.json"]],
     [
         ["preset", "prefs.json", "old"],

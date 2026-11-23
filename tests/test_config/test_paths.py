@@ -5,7 +5,7 @@ backends: the pure-Python transcription in the module and, when the
 Rust extension is built, the native ``paths_core`` the module's table
 is computed through. The engine: the platform-aware base directories —
 win32's ``APPDATA``/``LOCALAPPDATA`` (defaults only when the variable
-is *unset*; an empty ``APPDATA`` stays empty, and ``Path("")`` then
+is *unset*; an empty ``APPDATA`` stays empty, and the empty base then
 lands on the relative table) and the XDG ``XDG_CONFIG_HOME`` /
 ``XDG_CACHE_HOME`` / ``XDG_RUNTIME_DIR`` gates (an empty string reads
 as unset, matching the reference's truthiness checks) — plus the
@@ -16,13 +16,17 @@ is the ``None`` constant on that platform.
 The engine is a pure function of ``(platform, home, env)``, so the
 unit tests below assert its contract on synthetic triples — the win32
 branch exercisable from any host — on whichever backend is loaded.
+Comparisons go through the *simulated platform's* flavour lens
+(``PurePosixPath`` / ``PureWindowsPath``, never the host ``Path`` —
+the host lens re-spelled ``/`` as ``\\`` on Windows and broke the
+posix contract on the Windows CI legs), which is also the level the
+module's constants render at once re-wrapped in the native host's
+``Path()``.
 When the extension is built, the parity tests additionally compare the
-native engine against the pure-Python reference case for case, at the
-``str(Path(v))`` level (the level the module's constants live at —
-``Path()``'s lexical normalisation reconciles the engine's joined
-spelling with the pathlib one). The module-level tests pin the
-import-time constants via reload and ``ensure_dirs``' directory
-creation; ``secure_chmod``'s no-op on Windows is pinned alongside.
+native engine against the pure-Python reference case for case at the
+same lens. The module-level tests pin the import-time constants via
+reload and ``ensure_dirs``' directory creation; ``secure_chmod``'s
+no-op on Windows is pinned alongside.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ import importlib
 import os
 import sys
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterator
 
 import pytest
@@ -91,9 +95,18 @@ def _engine(platform: str, home: str, env: dict[str, str]) -> dict[str, str]:
     return _compute_paths(platform, home, env)
 
 
-def _norm(table: dict[str, str]) -> dict[str, str]:
-    """The level the module's constants live at: every value a ``Path``."""
-    return {key: str(Path(value)) for key, value in table.items()}
+def _norm(table: dict[str, str], platform: str) -> dict[str, str]:
+    """Render every value through the *simulated platform's* flavour —
+    ``PurePosixPath`` for the XDG branches, ``PureWindowsPath`` for the
+    win32 branch — never the host ``Path``: the engine is a pure function
+    of ``(platform, home, env)`` and must read identically on any host
+    (the host lens re-spelled ``/`` as ``\\`` on Windows, which is what
+    broke the posix contract on the Windows CI legs). The flavour lens
+    also lexically normalises the native engine's joined spelling
+    (collapsing ``//``, converting ``/`` to ``\\`` under the win32
+    flavour), reconciling it with the fallback's."""
+    pure = PureWindowsPath if platform == "win32" else PurePosixPath
+    return {key: str(pure(value)) for key, value in table.items()}
 
 
 @contextmanager
@@ -126,10 +139,10 @@ class TestEngineContract:
 
     def test_posix_default_tree(self):
         table = _engine("linux", "/home/u", {})
-        assert _norm(table)["CONFIG_DIR"] == "/home/u/.config/ytm-player"
-        assert _norm(table)["CACHE_DIR"] == "/home/u/.cache/ytm-player/audio"
-        assert _norm(table)["CACHE_DB"] == "/home/u/.cache/ytm-player/cache.db"
-        assert _norm(table)["SOCKET_PATH"] == "/home/u/.config/ytm-player/ytm.sock"
+        assert _norm(table, "linux")["CONFIG_DIR"] == "/home/u/.config/ytm-player"
+        assert _norm(table, "linux")["CACHE_DIR"] == "/home/u/.cache/ytm-player/audio"
+        assert _norm(table, "linux")["CACHE_DB"] == "/home/u/.cache/ytm-player/cache.db"
+        assert _norm(table, "linux")["SOCKET_PATH"] == "/home/u/.config/ytm-player/ytm.sock"
         assert "IPC_PORT_FILE" not in table
 
     def test_posix_xdg_bases(self):
@@ -142,19 +155,19 @@ class TestEngineContract:
                 "XDG_RUNTIME_DIR": "/run/user/1000",
             },
         )
-        assert _norm(table)["CONFIG_DIR"] == "/xdg/c/ytm-player"
-        assert _norm(table)["CACHE_DIR"] == "/xdg/cache/ytm-player/audio"
-        assert _norm(table)["CACHE_DB"] == "/xdg/cache/ytm-player/cache.db"
-        assert _norm(table)["SOCKET_PATH"] == "/run/user/1000/ytm-player.sock"
+        assert _norm(table, "linux")["CONFIG_DIR"] == "/xdg/c/ytm-player"
+        assert _norm(table, "linux")["CACHE_DIR"] == "/xdg/cache/ytm-player/audio"
+        assert _norm(table, "linux")["CACHE_DB"] == "/xdg/cache/ytm-player/cache.db"
+        assert _norm(table, "linux")["SOCKET_PATH"] == "/run/user/1000/ytm-player.sock"
 
     def test_posix_empty_xdg_reads_as_unset(self):
         empty = _engine("linux", "/home/u", {"XDG_CONFIG_HOME": "", "XDG_CACHE_HOME": ""})
         default = _engine("linux", "/home/u", {})
-        assert _norm(empty) == _norm(default)
+        assert _norm(empty, "linux") == _norm(default, "linux")
 
     def test_posix_empty_runtime_falls_back_to_config_dir(self):
         table = _engine("linux", "/home/u", {"XDG_RUNTIME_DIR": ""})
-        assert _norm(table)["SOCKET_PATH"] == "/home/u/.config/ytm-player/ytm.sock"
+        assert _norm(table, "linux")["SOCKET_PATH"] == "/home/u/.config/ytm-player/ytm.sock"
 
     def test_posix_trailing_slash_bases_normalise(self):
         slashed = _engine(
@@ -167,39 +180,53 @@ class TestEngineContract:
             "/home/u",
             {"XDG_CONFIG_HOME": "/xdg/c", "XDG_CACHE_HOME": "/xdg/cache"},
         )
-        assert _norm(slashed) == _norm(clean)
+        assert _norm(slashed, "linux") == _norm(clean, "linux")
 
     def test_win32_bases(self):
         table = _engine(
             "win32", "C:\\Users\\u", {"APPDATA": _WIN_APPDATA, "LOCALAPPDATA": _WIN_LOCAL}
         )
-        assert _norm(table)["CONFIG_DIR"] == str(Path(_WIN_APPDATA) / "ytm-player")
-        assert _norm(table)["CACHE_DIR"] == str(Path(_WIN_LOCAL) / "ytm-player" / "audio")
-        assert _norm(table)["CACHE_DB"] == str(Path(_WIN_LOCAL) / "ytm-player" / "cache.db")
-        assert _norm(table)["IPC_PORT_FILE"] == str(Path(_WIN_APPDATA) / "ytm-player" / "ipc_port")
+        assert _norm(table, "win32")["CONFIG_DIR"] == str(
+            PureWindowsPath(_WIN_APPDATA) / "ytm-player"
+        )
+        assert _norm(table, "win32")["CACHE_DIR"] == str(
+            PureWindowsPath(_WIN_LOCAL) / "ytm-player" / "audio"
+        )
+        assert _norm(table, "win32")["CACHE_DB"] == str(
+            PureWindowsPath(_WIN_LOCAL) / "ytm-player" / "cache.db"
+        )
+        assert _norm(table, "win32")["IPC_PORT_FILE"] == str(
+            PureWindowsPath(_WIN_APPDATA) / "ytm-player" / "ipc_port"
+        )
         assert "SOCKET_PATH" not in table
 
     def test_win32_home_tree_defaults(self):
         table = _engine("win32", "C:\\Users\\u", {})
-        assert _norm(table)["CONFIG_DIR"] == str(
-            Path("C:\\Users\\u") / "AppData" / "Roaming" / "ytm-player"
+        assert _norm(table, "win32")["CONFIG_DIR"] == str(
+            PureWindowsPath("C:\\Users\\u") / "AppData" / "Roaming" / "ytm-player"
         )
-        assert _norm(table)["CACHE_DIR"] == str(
-            Path("C:\\Users\\u") / "AppData" / "Local" / "ytm-player" / "audio"
+        assert _norm(table, "win32")["CACHE_DIR"] == str(
+            PureWindowsPath("C:\\Users\\u") / "AppData" / "Local" / "ytm-player" / "audio"
         )
 
     def test_win32_empty_appdata_stays_empty(self):
         # get-with-default, not a truthiness gate: an empty APPDATA is
         # kept, and Path("") / "ytm-player" is the *relative* table.
         table = _engine("win32", "C:\\Users\\u", {"APPDATA": "", "LOCALAPPDATA": _WIN_LOCAL})
-        assert _norm(table)["CONFIG_DIR"] == "ytm-player"
-        assert _norm(table)["CONFIG_FILE"] == str(Path("ytm-player") / "config.toml")
-        assert _norm(table)["CACHE_DIR"] == str(Path(_WIN_LOCAL) / "ytm-player" / "audio")
-        assert _norm(table)["IPC_PORT_FILE"] == str(Path("ytm-player") / "ipc_port")
+        assert _norm(table, "win32")["CONFIG_DIR"] == "ytm-player"
+        assert _norm(table, "win32")["CONFIG_FILE"] == str(
+            PureWindowsPath("ytm-player") / "config.toml"
+        )
+        assert _norm(table, "win32")["CACHE_DIR"] == str(
+            PureWindowsPath(_WIN_LOCAL) / "ytm-player" / "audio"
+        )
+        assert _norm(table, "win32")["IPC_PORT_FILE"] == str(
+            PureWindowsPath("ytm-player") / "ipc_port"
+        )
 
     def test_derived_files_under_config_dir(self):
         table = _engine("linux", "/home/u", {})
-        norm = _norm(table)
+        norm = _norm(table, "linux")
         config_dir = norm["CONFIG_DIR"]
         for key, leaf in (
             ("CONFIG_FILE", "config.toml"),
@@ -218,11 +245,11 @@ class TestEngineContract:
             ("UPDATE_CHECK_CACHE", "update_check.json"),
             ("HISTORY_DB", "history.db"),
         ):
-            assert norm[key] == str(Path(config_dir) / leaf)
-        assert norm["LOG_DIR"] == str(Path(config_dir) / "logs")
-        assert norm["LOG_FILE"] == str(Path(config_dir) / "logs" / "ytm.log")
-        assert norm["CRASH_DIR"] == str(Path(config_dir) / "crashes")
-        assert norm["CRASH_LOG"] == str(Path(config_dir) / "crashes" / "ytm-crash.log")
+            assert norm[key] == str(PurePosixPath(config_dir) / leaf)
+        assert norm["LOG_DIR"] == str(PurePosixPath(config_dir) / "logs")
+        assert norm["LOG_FILE"] == str(PurePosixPath(config_dir) / "logs" / "ytm.log")
+        assert norm["CRASH_DIR"] == str(PurePosixPath(config_dir) / "crashes")
+        assert norm["CRASH_LOG"] == str(PurePosixPath(config_dir) / "crashes" / "ytm-crash.log")
 
     def test_table_has_the_full_constant_surface(self):
         table = _engine("linux", "/home/u", {})
@@ -259,8 +286,9 @@ class TestEngineContract:
 class TestNativeParity:
     """When the Rust extension is built, the native table must equal the
     pure-Python reference's for every case, so the two implementations
-    cannot drift (compared at the ``str(Path(v))`` level — the module
-    re-wraps every entry in ``Path()``)."""
+    cannot drift (compared at the simulated platform's flavour lens —
+    the flavour the module re-wraps every entry in ``Path()`` with on a
+    native host)."""
 
     @pytest.mark.skipif(not _HAVE_NATIVE, reason="native extension not built")
     @pytest.mark.parametrize(("platform", "home", "env"), _CASES)
@@ -268,7 +296,7 @@ class TestNativeParity:
         native = dict(_ytm_player_native.paths_core(platform, home, env))
         fallback = _compute_paths(platform, home, env)
         assert set(native) == set(fallback)
-        assert _norm(native) == _norm(fallback)
+        assert _norm(native, platform) == _norm(fallback, platform)
 
 
 class TestModuleConstants:

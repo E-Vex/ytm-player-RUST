@@ -88,7 +88,19 @@ class _FakeClick:
 
 
 async def _settle(host: _Host, pilot) -> None:
-    await asyncio.wait_for(host.workers.wait_for_complete(), 5)
+    # Wait for every worker that isn't *already* cancelled. A fetch
+    # cancelled by design (a superseded pill/region fetch) may still be
+    # in the manager at settle time — awaiting it raises WorkerCancelled
+    # from Worker.wait (a race the slower Windows CI runners lose), and
+    # the cancellation itself is exactly what these tests assert on
+    # afterwards. Excluding it here waits for everything else properly
+    # without ever awaiting a worker whose cancellation is the point.
+    await asyncio.wait_for(
+        host.workers.wait_for_complete(
+            [worker for worker in host.workers if worker.state is not WorkerState.CANCELLED]
+        ),
+        5,
+    )
     await pilot.pause()
     await pilot.pause()
 

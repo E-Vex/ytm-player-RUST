@@ -1,11 +1,24 @@
 """Shared test fixtures for ytm-player."""
 
 import asyncio
+import os
 import threading
 import weakref
 from unittest.mock import MagicMock
 
 import pytest
+
+# The parity tests spawn child interpreters (`sys.executable -c ...`)
+# that print and read non-ASCII payloads (CJK titles, emoji, Unicode
+# edge cases) over stdio. On a Windows runner under Python < 3.15 the
+# child's stdio encoding defaults to the legacy code page (cp1252), so
+# every such child dies with "UnicodeEncodeError: 'charmap' codec
+# can't encode" before the comparison even runs. PYTHONIOENCODING is
+# read at interpreter start, so setting it here (the parent is already
+# running — its own streams are unaffected) makes every spawned child
+# speak UTF-8 on every platform. Python 3.15+ defaults to UTF-8 stdio
+# (PEP 686), where this is inert.
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
 def make_ytmusic_service(**overrides):
