@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import locale
 import logging
 import os
@@ -659,7 +660,11 @@ class Player:
                 # The reference reads the dispatch context only on the
                 # live-loop arm — the conditional keeps the read there.
                 ctx = self._dispatch_context if loop_live else None
-                arm = _dispatch_arm(loop_live, asyncio.iscoroutinefunction(cb), ctx is not None)
+                # inspect.iscoroutinefunction, not asyncio's deprecated
+                # spelling (removed in Python 3.16): identical verdicts for
+                # every callable the dispatcher sees, and unlike the asyncio
+                # one it also unwraps functools.partial on 3.10/3.11.
+                arm = _dispatch_arm(loop_live, inspect.iscoroutinefunction(cb), ctx is not None)
                 if arm == "drop":
                     # No loop: async callbacks cannot run — dropped with
                     # a warning, never silently.
