@@ -10,14 +10,23 @@ import pytest
 
 # The parity tests spawn child interpreters (`sys.executable -c ...`)
 # that print and read non-ASCII payloads (CJK titles, emoji, Unicode
-# edge cases) over stdio. On a Windows runner under Python < 3.15 the
-# child's stdio encoding defaults to the legacy code page (cp1252), so
-# every such child dies with "UnicodeEncodeError: 'charmap' codec
-# can't encode" before the comparison even runs. PYTHONIOENCODING is
-# read at interpreter start, so setting it here (the parent is already
-# running — its own streams are unaffected) makes every spawned child
-# speak UTF-8 on every platform. Python 3.15+ defaults to UTF-8 stdio
-# (PEP 686), where this is inert.
+# edge cases) over stdio, in BOTH directions:
+#
+# - Child side: on a Windows runner under Python < 3.15 the child's
+#   stdio encoding defaults to the legacy code page (cp1252), so every
+#   such child dies with "UnicodeEncodeError: 'charmap' codec can't
+#   encode" before the comparison even runs. PYTHONIOENCODING is read
+#   at interpreter start, so setting it here (the parent is already
+#   running — its own streams are unaffected) makes every spawned child
+#   speak UTF-8 on every platform. Python 3.15+ defaults to UTF-8 stdio
+#   (PEP 686), where this is inert.
+# - Parent side: `subprocess` text mode would still encode `input=` and
+#   decode captured output with the same legacy code page (it consults
+#   the locale, not PYTHONIOENCODING) — mojibake on decode, or worse:
+#   CPython's Windows reader thread swallows the decode error and
+#   `CompletedProcess.stdout` comes back None. Every text-mode call
+#   therefore also passes `encoding="utf-8"` explicitly, matching the
+#   child side on every platform and Python version.
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 

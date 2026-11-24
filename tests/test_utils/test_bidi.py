@@ -620,6 +620,7 @@ def _run_cases(cases: list, in_child: bool) -> list:
             input=json.dumps(cases),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         return json.loads(out.stdout)

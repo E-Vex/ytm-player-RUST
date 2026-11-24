@@ -821,7 +821,9 @@ def _fallback_eval(expr: str) -> str:
         "from ytm_player.utils.formatting import *; "
         f"print(repr({expr}))"
     )
-    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [sys.executable, "-c", prog], capture_output=True, text=True, encoding="utf-8", check=True
+    )
     return out.stdout.strip()
 
 

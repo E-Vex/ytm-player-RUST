@@ -246,7 +246,9 @@ def _eval_in_child(expr: str) -> str:
         "except BaseException as e:\n"
         "    print('ERR', type(e).__name__, repr(str(e)))\n"
     )
-    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [sys.executable, "-c", prog], capture_output=True, text=True, encoding="utf-8", check=True
+    )
     return out.stdout.strip()
 
 

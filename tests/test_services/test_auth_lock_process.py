@@ -112,6 +112,7 @@ def _child_holding(lock_path: Path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
         env=env,
     )
     assert child.stdin is not None and child.stdout is not None

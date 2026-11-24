@@ -280,6 +280,7 @@ class TestNativeParity:
             input=json.dumps(_EDITOR_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

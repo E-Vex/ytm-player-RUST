@@ -532,6 +532,7 @@ class TestNativeParity:
             input=json.dumps(_CACHE_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -563,6 +564,7 @@ class TestNativeParity:
             input=json.dumps(_CACHE_WALK_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

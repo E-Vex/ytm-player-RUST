@@ -624,6 +624,7 @@ def _fallback_outcomes() -> list[str]:
         input=json.dumps(_PARITY_CASES),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)
@@ -767,6 +768,7 @@ def _feed_fallback_outcomes() -> list[dict]:
         input=json.dumps(_FEED_PARITY_CASES),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)
@@ -1746,6 +1748,7 @@ def _run_child_engines() -> dict:
         input=json.dumps(payload),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

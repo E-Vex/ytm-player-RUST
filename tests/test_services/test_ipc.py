@@ -347,7 +347,11 @@ class TestLooksLikeYtmNativeParity:
             "print(_looks_like_ytm(argv))"
         )
         out = subprocess.run(
-            [sys.executable, "-c", prog], capture_output=True, text=True, check=True
+            [sys.executable, "-c", prog],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
         )
         fallback = out.stdout.strip()
         native = repr(ipc_mod._looks_like_ytm(argv))
@@ -1025,6 +1029,7 @@ class TestIpcRequestGateNativeParity:
             input=json.dumps(_GATE_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

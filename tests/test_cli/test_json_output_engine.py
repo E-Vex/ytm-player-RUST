@@ -370,6 +370,7 @@ class TestNativeParity:
             input=json.dumps(cases),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -417,7 +418,11 @@ outcomes.append(outcome(lambda: _json_dumps(cyc_dict)))
 json.dump(outcomes, sys.stdout)
 """
         result = subprocess.run(
-            [sys.executable, "-c", prog], capture_output=True, text=True, check=True
+            [sys.executable, "-c", prog],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
         )
         fallback = json.loads(result.stdout)
 

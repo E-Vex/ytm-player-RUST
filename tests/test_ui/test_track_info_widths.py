@@ -243,6 +243,7 @@ def _fallback_results(cases: list) -> list:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return [tuple(result) for result in json.loads(out.stdout)]

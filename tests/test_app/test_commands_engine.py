@@ -179,6 +179,7 @@ class TestNativeParity:
             [sys.executable, "-c", _CHILD_PROG],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

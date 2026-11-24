@@ -339,6 +339,7 @@ def _fallback_results(cases: list) -> list:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)
@@ -453,6 +454,7 @@ class TestTitleNativeParity:
             input=payload,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

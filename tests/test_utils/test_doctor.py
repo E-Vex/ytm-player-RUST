@@ -1098,6 +1098,7 @@ class TestDoctorReportNativeParity:
             input=json.dumps(_DOCTOR_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -1161,6 +1162,7 @@ class TestRecentMpvLinesNativeParity:
             input=json.dumps(_MPV_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -1238,6 +1240,7 @@ class TestFaulthandlerTailNativeParity:
             input=json.dumps(_FAULTHANDLER_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -1380,6 +1383,7 @@ class TestCrashStalenessNativeParity:
             input=json.dumps(_CRASH_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -2587,6 +2591,7 @@ class TestRunningStatusNativeParity:
             input=json.dumps(_RUNNING_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -2722,6 +2727,7 @@ class TestMpvVersionNativeParity:
             input=json.dumps(_MPV_VERSION_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -2873,6 +2879,7 @@ class TestLibmpvStatusNativeParity:
             input=json.dumps(_LIBMPV_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -3084,6 +3091,7 @@ class TestMprisStatusNativeParity:
             input=json.dumps(_MPRIS_PARITY_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

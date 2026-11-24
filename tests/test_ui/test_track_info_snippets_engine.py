@@ -317,6 +317,7 @@ class TestNativeParity:
             input=json.dumps(payload),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

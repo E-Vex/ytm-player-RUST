@@ -328,6 +328,7 @@ def _fallback_labels() -> list[str]:
         input=json.dumps(_LABEL_CASES, ensure_ascii=False),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

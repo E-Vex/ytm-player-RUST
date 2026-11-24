@@ -163,6 +163,7 @@ def _fallback_match(path: str | None, seq: list[str]) -> str:
         [sys.executable, "-c", _CHILD_MATCH_PROG, json.dumps([path, seq])],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return out.stdout.strip()
@@ -482,6 +483,7 @@ class TestKeyMapLoadPlanEngine:
                 [sys.executable, "-c", _PLAN_CHILD_PROG, json.dumps({"path": str(path)})],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True,
             )
             fallback = json.loads(result.stdout)
@@ -509,6 +511,7 @@ class TestKeyMapLoadPlanEngine:
             [sys.executable, "-c", _WARNINGS_CHILD_PROG, json.dumps({"path": str(path)})],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback_warnings = [w for w in result.stdout.splitlines() if w]

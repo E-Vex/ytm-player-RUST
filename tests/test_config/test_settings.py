@@ -358,6 +358,7 @@ class TestFormatTomlValueEngine:
             input=payload,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json_mod.loads(result.stdout)
@@ -413,6 +414,7 @@ class TestFormatTomlValueEngine:
             [sys.executable, "-c", child],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         assert native_text == result.stdout

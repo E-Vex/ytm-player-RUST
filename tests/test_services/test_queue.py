@@ -972,7 +972,9 @@ def _fallback_run(seed: int, script: str) -> str:
         f"{script}\n"
         f"print(repr({_DUMP}))\n"
     )
-    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [sys.executable, "-c", prog], capture_output=True, text=True, encoding="utf-8", check=True
+    )
     return out.stdout.strip()
 
 

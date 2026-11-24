@@ -189,7 +189,11 @@ class TestNativeParity:
             "import json; print(json.dumps(CHART_REGIONS))"
         )
         out = subprocess.run(
-            [sys.executable, "-c", prog], capture_output=True, text=True, check=True
+            [sys.executable, "-c", prog],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
         )
         fallback = [tuple(pair) for pair in json.loads(out.stdout)]
         native = list(_ytm_player_native.chart_regions())

@@ -861,6 +861,7 @@ def _fallback_results(cases: dict) -> dict:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)

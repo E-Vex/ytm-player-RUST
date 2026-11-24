@@ -301,6 +301,7 @@ def _fallback_results(payload: dict) -> dict:
         input=json.dumps(payload, ensure_ascii=False),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)

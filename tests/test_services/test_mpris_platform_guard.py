@@ -46,6 +46,7 @@ def _run_import_under_platform(platform: str) -> str:
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
     )
     assert result.returncode == 0, (
@@ -129,6 +130,7 @@ def test_mpris_import_degrades_on_broken_dbus_fast_build():
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
     )
     assert result.returncode == 0, f"child failed:\n{result.stdout}\n{result.stderr}"

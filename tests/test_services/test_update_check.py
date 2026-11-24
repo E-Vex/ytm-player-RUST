@@ -395,6 +395,7 @@ class TestIsNewerNativeParity:
                 input=json.dumps(_IS_NEWER_PARITY_CASES),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=True,
             ).stdout
         )

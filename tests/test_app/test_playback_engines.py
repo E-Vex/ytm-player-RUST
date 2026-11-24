@@ -4761,6 +4761,7 @@ def _assert_family_parity(family):
         input=json.dumps({family: cases}),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     fallback = json.loads(result.stdout)[family]
@@ -4788,6 +4789,7 @@ class TestNativeParity:
             input=json.dumps({"failure": _FAILURE_PARITY_CASES, "step": _STEP_PARITY_CASES}),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -4806,6 +4808,7 @@ class TestNativeParity:
             input=json.dumps({"failure": _FAILURE_PARITY_CASES, "step": _STEP_PARITY_CASES}),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

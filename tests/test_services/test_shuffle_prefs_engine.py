@@ -452,6 +452,7 @@ def _fallback_results(cases: list) -> list:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)
@@ -810,6 +811,17 @@ sys.modules["ytm_player.utils._ytm_player_native"] = None
 from ytm_player.services.shuffle_prefs import _read_prefs_file, _write_prefs_file
 
 root = pathlib.Path(sys.argv[1])
+
+
+def _scrub(text):
+    # str(OSError) embeds the filename through repr(), which doubles
+    # every backslash on Windows; scrub both spellings of the root (the
+    # escaped and the plain one — identical on POSIX) so the child's
+    # error messages compare against the parent's scrubbed the same way.
+    raw = str(root)
+    return text.replace(raw.replace("\\\\", "\\\\\\\\"), "<root>").replace(raw, "<root>")
+
+
 out = []
 for op in json.load(sys.stdin):
     kind = op[0]
@@ -828,13 +840,13 @@ for op in json.load(sys.stdin):
         try:
             out.append(["ok", repr(_read_prefs_file(root / op[1]))])
         except BaseException as exc:
-            out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+            out.append(["err", type(exc).__name__, _scrub(str(exc))])
     elif kind == "write":
         try:
             _write_prefs_file(root / op[1], op[2])
             out.append(["ok"])
         except BaseException as exc:
-            out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+            out.append(["err", type(exc).__name__, _scrub(str(exc))])
     elif kind == "tree":
         entries = []
         for path in sorted(root.rglob("*")):
@@ -852,6 +864,23 @@ for op in json.load(sys.stdin):
         raise AssertionError(kind)
 json.dump(out, sys.stdout)
 """
+
+
+def _scrub_root(text: str, root) -> str:
+    """Replace every spelling of *root* in *text* with ``<root>``.
+
+    ``str(OSError)`` embeds the filename through ``repr()``, so on
+    Windows — where the root is backslash-separated — the message
+    carries the root with every backslash doubled, and the plain
+    ``str(root)`` form never matches; on POSIX the two spellings
+    coincide. Both are replaced so the native and the fallback error
+    messages compare equal on every platform (the child program runs
+    the identical scrub for its half).
+    """
+
+    raw = str(root)
+    escaped = raw.replace("\\", "\\\\")
+    return text.replace(escaped, "<root>").replace(raw, "<root>")
 
 
 def _run_file_cases_native(cases: list, root) -> list:
@@ -880,13 +909,13 @@ def _run_file_cases_native(cases: list, root) -> list:
             try:
                 out.append(["ok", repr(_ytm_player_native.shuffle_prefs_read_file(root / op[1]))])
             except BaseException as exc:
-                out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+                out.append(["err", type(exc).__name__, _scrub_root(str(exc), root)])
         elif kind == "write":
             try:
                 _ytm_player_native.shuffle_prefs_write_file(root / op[1], op[2])
                 out.append(["ok"])
             except BaseException as exc:
-                out.append(["err", type(exc).__name__, str(exc).replace(str(root), "<root>")])
+                out.append(["err", type(exc).__name__, _scrub_root(str(exc), root)])
         elif kind == "tree":
             entries = []
             for path in sorted((root).rglob("*")):
@@ -913,6 +942,7 @@ def _run_file_cases_fallback(cases: list, root) -> list:
         input=json.dumps(cases),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

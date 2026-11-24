@@ -489,6 +489,7 @@ class TestThemeEngineNativeParity:
             ),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -543,6 +544,7 @@ json.dump(out, sys.stdout)
             input=json.dumps({"css": _CSS_ZOO}),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

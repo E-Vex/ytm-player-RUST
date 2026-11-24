@@ -449,6 +449,7 @@ def _fallback_outcomes() -> list:
         input=json.dumps(_PARITY_CASES),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

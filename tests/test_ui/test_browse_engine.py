@@ -532,6 +532,7 @@ def _fallback_outcomes() -> dict:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(result.stdout)

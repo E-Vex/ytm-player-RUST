@@ -623,6 +623,7 @@ def _fallback_results() -> dict:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)
@@ -680,6 +681,7 @@ class TestNativeParity:
             input=payload,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(out.stdout)["states"][0]["volume"]

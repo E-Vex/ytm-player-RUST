@@ -352,6 +352,7 @@ def _fallback_orders(cases: list) -> list:
         input=payload,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=True,
     )
     return json.loads(out.stdout)
@@ -612,6 +613,7 @@ class TestRowAssemblyNativeParity:
             input=json.dumps(payload),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)

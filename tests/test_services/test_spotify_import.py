@@ -983,6 +983,7 @@ class TestMatchingCoresNativeParity:
             input=json.dumps([_URL_ZOO, _ITEM_ZOO]),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
@@ -1529,6 +1530,7 @@ class TestMatchingPipelineNativeParity:
             input=json.dumps(_PIPELINE_CASES),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         fallback = json.loads(result.stdout)
