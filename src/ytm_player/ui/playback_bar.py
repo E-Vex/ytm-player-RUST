@@ -1,4 +1,22 @@
-"""Always-visible playback status bar and interactive footer."""
+"""Always-visible playback status bar and interactive footer.
+
+The module's chrome engines — the volume display's content
+(``_volume_display_text``, the speaker glyph, the volume
+right-aligned into three columns and the percent sign), the repeat
+button's mode pair (``_repeat_button_pair``), the shuffle button's
+on/off pair (``_shuffle_button_pair``), the heart button's like
+verdict (``_heart_button_pair``), the footer button's style kind
+(``_footer_button_style_kind``) and action routing
+(``_footer_button_action_route``), the footer's active-page verdict
+(``_footer_button_active_verdict``), the bar's right-click track pick
+(``_playback_bar_click_track``) and the track-info width/snippet
+engines — are dual-implemented: the Rust extension
+(``_ytm_player_native``) implements them when it is built, and the
+pure-Python transcriptions below run otherwise; the bottom-of-module
+seam rebinds the engines to the native functions when the extension
+is importable. The widgets below only do styling, DOM and event
+plumbing on the engines' answers.
+"""
 
 from __future__ import annotations
 
@@ -174,6 +192,78 @@ class _TrackInfo(Widget):
 # ── Interactive control widgets ───────────────────────────────────
 
 
+def _volume_display_text(volume: Any) -> str:
+    """The volume display's content — the ``volume`` engine.
+
+    The pure core of ``_VolumeDisplay.render``: the speaker glyph, the
+    volume right-aligned into three columns, and the percent sign —
+    ``{volume:>3}`` is CPython's own ``format(volume, ">3")``, the
+    very builtin call the f-string field compiles down to, so every
+    formattable shape answers the interpreter's own rendering. The
+    widget keeps only the secondary colour.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.volume_display_text``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    return f" {_ICON_VOLUME} {volume:>3}%"
+
+
+def _repeat_button_pair(mode: Any) -> tuple[str, str]:
+    """The repeat button's content pair — the ``repeat`` engine.
+
+    The pure core of ``_RepeatButton.render``: which of the three mode
+    pairs the indicator shows — ``mode == RepeatMode.ALL`` then ``mode
+    == RepeatMode.ONE``, CPython's own ``==`` against the very enum
+    members the module exports — answering ``(kind, text)`` with the
+    kind carrying the style the widget applies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.repeat_button_pair``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if mode == RepeatMode.ALL:
+        return ("all", f"{_ICON_REPEAT_ALL} all")
+    if mode == RepeatMode.ONE:
+        return ("one", f"{_ICON_REPEAT_ONE} one")
+    return ("off", f"{_ICON_REPEAT_OFF} off")
+
+
+def _shuffle_button_pair(shuffle_on: Any) -> tuple[str, str]:
+    """The shuffle button's content pair — the ``shuffle`` engine.
+
+    The pure core of ``_ShuffleButton.render``: the on pair (trailing
+    space and all) or the off pair, picked by the flag's own
+    truthiness. The kind carries the style the widget applies.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.shuffle_button_pair``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if shuffle_on:
+        return ("on", f"{_ICON_SHUFFLE_ON} on ")
+    return ("off", f"{_ICON_SHUFFLE_OFF} off")
+
+
+def _heart_button_pair(like_status: Any) -> tuple[str, str]:
+    """The heart button's content pair — the ``heart`` engine.
+
+    The pure core of ``_HeartButton.render``: the like verdict —
+    ``like_status == "LIKE"``, CPython's own ``==`` on the string
+    literal, so a non-str status answers the unliked pair exactly like
+    the reference — answering ``(kind, text)`` with the kind carrying
+    the bold accent vs muted colour; the glyph text is the same on
+    both arms.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.heart_button_pair``) when it is built; this
+    pure-Python transcription is the fallback otherwise.
+    """
+    if like_status == "LIKE":
+        return ("liked", f" {_ICON_HEART} ")
+    return ("unliked", f" {_ICON_HEART} ")
+
+
 class _VolumeDisplay(Widget):
     """Volume display — scroll to change volume."""
 
@@ -188,7 +278,11 @@ class _VolumeDisplay(Widget):
     volume: reactive[int] = reactive(80)
 
     def render(self) -> Text:
-        return Text(f" {_ICON_VOLUME} {self.volume:>3}%", style=get_theme().secondary)
+        # The content — the speaker glyph, the volume right-aligned into
+        # three columns, the percent sign — is resolved by the
+        # ``_volume_display_text`` engine (native when the Rust extension
+        # is built); the widget keeps only the secondary colour.
+        return Text(_volume_display_text(self.volume), style=get_theme().secondary)
 
     async def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
         event.stop()
@@ -222,11 +316,15 @@ class _RepeatButton(Widget):
 
     def render(self) -> Text:
         theme = get_theme()
-        if self.repeat_mode == RepeatMode.ALL:
-            return Text(f"{_ICON_REPEAT_ALL} all", style=f"bold {theme.primary}")
-        elif self.repeat_mode == RepeatMode.ONE:
-            return Text(f"{_ICON_REPEAT_ONE} one", style=f"bold {theme.warning}")
-        return Text(f"{_ICON_REPEAT_OFF} off", style=theme.muted_text)
+        # The mode pair — which icon and label the indicator shows — is
+        # resolved by the ``_repeat_button_pair`` engine (native when the
+        # Rust extension is built); the widget keeps only the colours.
+        kind, text = _repeat_button_pair(self.repeat_mode)
+        if kind == "all":
+            return Text(text, style=f"bold {theme.primary}")
+        if kind == "one":
+            return Text(text, style=f"bold {theme.warning}")
+        return Text(text, style=theme.muted_text)
 
     async def on_click(self, event: Click) -> None:
         event.stop()
@@ -271,9 +369,13 @@ class _ShuffleButton(Widget):
 
     def render(self) -> Text:
         theme = get_theme()
-        if self.shuffle_on:
-            return Text(f"{_ICON_SHUFFLE_ON} on ", style=f"bold {theme.primary}")
-        return Text(f"{_ICON_SHUFFLE_OFF} off", style=theme.muted_text)
+        # The on/off pair — which icon and label the indicator shows — is
+        # resolved by the ``_shuffle_button_pair`` engine (native when the
+        # Rust extension is built); the widget keeps only the colours.
+        kind, text = _shuffle_button_pair(self.shuffle_on)
+        if kind == "on":
+            return Text(text, style=f"bold {theme.primary}")
+        return Text(text, style=theme.muted_text)
 
     def watch_locked(self, locked: bool) -> None:
         """Apply / remove the .locked class so CSS can dim the widget."""
@@ -334,9 +436,13 @@ class _HeartButton(Widget):
 
     def render(self) -> Text:
         theme = get_theme()
-        if self.like_status == "LIKE":
-            return Text(f" {_ICON_HEART} ", style=f"bold {theme.accent}")
-        return Text(f" {_ICON_HEART} ", style=theme.muted_text)
+        # The like verdict — which colour the heart carries — is resolved
+        # by the ``_heart_button_pair`` engine (native when the Rust
+        # extension is built); the widget keeps only the colours.
+        kind, text = _heart_button_pair(self.like_status)
+        if kind == "liked":
+            return Text(text, style=f"bold {theme.accent}")
+        return Text(text, style=theme.muted_text)
 
     def on_click(self, event: Click) -> None:
         """Click toggles like via the app's _toggle_like_current."""
@@ -349,6 +455,31 @@ class _HeartButton(Widget):
 
 
 # ── Main playback bar ─────────────────────────────────────────────
+
+
+def _playback_bar_click_track(button: Any, player_track: Any, queue_track: Any) -> Any:
+    """The playback bar's right-click track pick — the ``pick`` engine.
+
+    The pure core of ``PlaybackBar.on_click``: the track whose actions
+    a right-click on the bar opens — the right-button gate first
+    (``button != 3``, CPython's own ``!=``), then the player-then-queue
+    fallback chain (a truthy player track answered first, only then a
+    truthy queue track, every falsy shape answering ``None`` — the
+    no-message arm the reference's ``if track:`` gate leaves). The
+    player/queue attribute reads and the message construction stay
+    with the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.playback_bar_click_track``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if button != 3:
+        return None
+    if player_track:
+        return player_track
+    if queue_track:
+        return queue_track
+    return None
 
 
 class PlaybackBar(Widget):
@@ -423,15 +554,20 @@ class PlaybackBar(Widget):
 
     def on_click(self, event: Click) -> None:
         """Right-click on the playback bar opens track actions."""
-        if event.button != 3:
-            return
+        # The pick — the button-3 gate and the player-then-queue
+        # fallback chain — is resolved by the ``_playback_bar_click_track``
+        # engine (native when the Rust extension is built); the message
+        # construction stays here. The queue read follows the
+        # library-page precedent's defensive shape so a partial host
+        # (a player with no queue) never raises where the reference's
+        # own short-circuit would not.
         app = cast("YTMHostBase", self.app)
-        track = None
-        if app.player is not None and app.player.current_track:
-            track = app.player.current_track
-        elif app.queue.current_track:
-            track = app.queue.current_track
-        if track:
+        player = app.player
+        player_track = player.current_track if player is not None else None
+        queue = getattr(app, "queue", None)
+        queue_track = queue.current_track if queue else None
+        track = _playback_bar_click_track(event.button, player_track, queue_track)
+        if track is not None:
             self.post_message(self.TrackRightClicked(track))
 
     # ── Public update methods ────────────────────────────────────────
@@ -511,6 +647,85 @@ class PlaybackBar(Widget):
 # ── Interactive footer bar ────────────────────────────────────────
 
 
+# The seven page actions the footer routes to the caller's page
+# navigation (the match statement's first case, its own order).
+_PAGE_ACTIONS_FOOTER = (
+    "help",
+    "library",
+    "search",
+    "queue",
+    "browse",
+    "liked_songs",
+    "recently_played",
+)
+
+
+def _footer_button_action_route(action: Any) -> str:
+    """The footer button's action routing — the ``route`` engine.
+
+    The pure core of ``_FooterButton.on_click``: the match statement's
+    verdict — the seven page actions (``help`` / ``library`` /
+    ``search`` / ``queue`` / ``browse`` / ``liked_songs`` /
+    ``recently_played``) route to the caller's page navigation (the
+    caller passes its own action on as the page name), ``play_pause`` /
+    ``prev`` / ``next`` route to the transport handlers,
+    ``spotify_import`` to the import popup, and any other action routes
+    ``none`` — the match falls through and nothing runs. Every
+    comparison is CPython's own ``==`` on the string literal, the
+    protocol a match statement's literal patterns evaluate through.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.footer_button_action_route``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    if action in _PAGE_ACTIONS_FOOTER:
+        return "page"
+    if action == "play_pause":
+        return "play_pause"
+    if action == "prev":
+        return "prev"
+    if action == "next":
+        return "next"
+    if action == "spotify_import":
+        return "spotify_import"
+    return "none"
+
+
+def _footer_button_style_kind(is_active: Any, is_dimmed: Any) -> str:
+    """The footer button's style choice — the ``style`` engine.
+
+    The pure core of ``_FooterButton.render``: the three-way style
+    choice over the two flags, the reference's own order — an active
+    button renders bold primary however dimmed, a dimmed one renders
+    dim, anything else muted — every gate the flag's own truthiness.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.footer_button_style_kind``) when it is built;
+    this pure-Python transcription is the fallback otherwise.
+    """
+    if is_active:
+        return "active"
+    if is_dimmed:
+        return "dimmed"
+    return "muted"
+
+
+def _footer_button_active_verdict(action: Any, page_name: Any) -> bool:
+    """The footer's active-page verdict — the ``active`` engine.
+
+    The pure core of ``FooterBar.set_active_page``: whether the button
+    the loop is visiting names the page that just became active —
+    ``action == page_name``, CPython's own ``==`` on the two names. The
+    ``query_one`` walk and the per-button ``is_active`` write stay with
+    the caller.
+
+    Implemented by the Rust extension
+    (``_ytm_player_native.footer_button_active_verdict``) when it is
+    built; this pure-Python transcription is the fallback otherwise.
+    """
+    return action == page_name
+
+
 class _FooterButton(Widget):
     """A clickable footer button."""
 
@@ -535,36 +750,37 @@ class _FooterButton(Widget):
 
     def render(self) -> Text:
         theme = get_theme()
-        if self.is_active:
+        # The style kind — active over dimmed over muted, the reference's
+        # own order — is resolved by the ``_footer_button_style_kind``
+        # engine (native when the Rust extension is built); the widget
+        # keeps only the label and the colours.
+        kind = _footer_button_style_kind(self.is_active, self.is_dimmed)
+        if kind == "active":
             return Text(self._label, style=f"bold {theme.primary}")
-        if self.is_dimmed:
+        if kind == "dimmed":
             return Text(self._label, style="dim")
         return Text(self._label, style=theme.muted_text)
 
     async def on_click(self, event: Click) -> None:
         event.stop()
         app = cast("YTMHostBase", self.app)
-        match self._action:
-            case (
-                "help"
-                | "library"
-                | "search"
-                | "queue"
-                | "browse"
-                | "liked_songs"
-                | "recently_played"
-            ):
-                await app.navigate_to(self._action)
-            case "play_pause":
-                await app._toggle_play_pause()
-            case "prev":
-                await app._play_previous()
-            case "next":
-                await app._play_next()
-            case "spotify_import":
-                from ytm_player.ui.popups.spotify_import import SpotifyImportPopup
+        # The routing verdict — the match statement's own cases — is
+        # resolved by the ``_footer_button_action_route`` engine (native
+        # when the Rust extension is built); the awaited handlers, the
+        # screen push and the event stopping stay here.
+        route = _footer_button_action_route(self._action)
+        if route == "page":
+            await app.navigate_to(self._action)
+        elif route == "play_pause":
+            await app._toggle_play_pause()
+        elif route == "prev":
+            await app._play_previous()
+        elif route == "next":
+            await app._play_next()
+        elif route == "spotify_import":
+            from ytm_player.ui.popups.spotify_import import SpotifyImportPopup
 
-                app.push_screen(SpotifyImportPopup())
+            app.push_screen(SpotifyImportPopup())
 
 
 class FooterBar(Widget):
@@ -615,7 +831,11 @@ class FooterBar(Widget):
         for action in self._PAGE_ACTIONS:
             try:
                 btn = self.query_one(f"#footer-{action}", _FooterButton)
-                btn.is_active = action == page_name
+                # The active verdict — ``action == page_name`` — is
+                # resolved by the ``_footer_button_active_verdict`` engine
+                # (native when the Rust extension is built); the query
+                # walk and the ``is_active`` write stay here.
+                btn.is_active = _footer_button_active_verdict(action, page_name)
             except Exception:
                 logger.debug(
                     "Failed to update footer button for action '%s'", action, exc_info=True
@@ -623,11 +843,11 @@ class FooterBar(Widget):
 
 
 # ── Native (Rust/PyO3) overrides, if available ──────────────────────────
-# The Rust extension implements the same width-splitting and snippet
-# engines; these bindings override the pure-Python definitions above
-# when the extension is importable.  The rebinding must happen AFTER
-# the definitions above — assigning the native functions any earlier
-# would be clobbered by the ``def`` statements (the lesson that
+# The Rust extension implements the same width-splitting, snippet and
+# chrome engines; these bindings override the pure-Python definitions
+# above when the extension is importable.  The rebinding must happen
+# AFTER the definitions above — assigning the native functions any
+# earlier would be clobbered by the ``def`` statements (the lesson that
 # produced formatting.py's dead native bindings).
 
 try:
@@ -674,3 +894,109 @@ else:
         return _native_track_info_snippets(
             bar_width, title, artist, album, is_playing, is_paused, _get_reorder_enabled()
         )
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        volume_display_text as _native_volume_display_text,
+    )
+except ImportError:
+    pass
+else:
+
+    def _volume_display_text(volume: Any) -> str:  # noqa: F811
+        """The volume display's content (native Rust engine)."""
+        return _native_volume_display_text(volume)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        repeat_button_pair as _native_repeat_button_pair,
+    )
+except ImportError:
+    pass
+else:
+
+    def _repeat_button_pair(mode: Any) -> tuple[str, str]:  # noqa: F811
+        """The repeat button's content pair (native Rust engine)."""
+        return _native_repeat_button_pair(mode)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        shuffle_button_pair as _native_shuffle_button_pair,
+    )
+except ImportError:
+    pass
+else:
+
+    def _shuffle_button_pair(shuffle_on: Any) -> tuple[str, str]:  # noqa: F811
+        """The shuffle button's content pair (native Rust engine)."""
+        return _native_shuffle_button_pair(shuffle_on)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        heart_button_pair as _native_heart_button_pair,
+    )
+except ImportError:
+    pass
+else:
+
+    def _heart_button_pair(like_status: Any) -> tuple[str, str]:  # noqa: F811
+        """The heart button's content pair (native Rust engine)."""
+        return _native_heart_button_pair(like_status)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        footer_button_style_kind as _native_footer_button_style_kind,
+    )
+except ImportError:
+    pass
+else:
+
+    def _footer_button_style_kind(is_active: Any, is_dimmed: Any) -> str:  # noqa: F811
+        """The footer button's style kind (native Rust engine)."""
+        return _native_footer_button_style_kind(is_active, is_dimmed)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        footer_button_action_route as _native_footer_button_action_route,
+    )
+except ImportError:
+    pass
+else:
+
+    def _footer_button_action_route(action: Any) -> str:  # noqa: F811
+        """The footer button's action routing (native Rust engine)."""
+        return _native_footer_button_action_route(action)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        footer_button_active_verdict as _native_footer_button_active_verdict,
+    )
+except ImportError:
+    pass
+else:
+
+    def _footer_button_active_verdict(action: Any, page_name: Any) -> bool:  # noqa: F811
+        """The footer's active-page verdict (native Rust engine)."""
+        return _native_footer_button_active_verdict(action, page_name)
+
+
+try:
+    from ytm_player.utils._ytm_player_native import (  # type: ignore[import-not-found]
+        playback_bar_click_track as _native_playback_bar_click_track,
+    )
+except ImportError:
+    pass
+else:
+
+    def _playback_bar_click_track(  # noqa: F811
+        button: Any, player_track: Any, queue_track: Any
+    ) -> Any:
+        """The playback bar's right-click track pick (native Rust engine)."""
+        return _native_playback_bar_click_track(button, player_track, queue_track)

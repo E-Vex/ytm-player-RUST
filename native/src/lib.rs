@@ -1416,6 +1416,53 @@ fn _ytm_player_native(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()>
         module
     )?)?;
 
+    // Playback-bar chrome engines (ui/playback_bar.py equivalents):
+    // the volume display's content (the speaker glyph, the volume
+    // right-aligned into three columns and the percent sign —
+    // CPython's own format(volume, ">3") behind the f-string's {x:>3}
+    // field), the repeat button's mode pair and the shuffle button's
+    // on/off pair (the kind the widget styles plus the glyph text),
+    // the heart button's like verdict, the footer button's three-way
+    // style kind, the footer action routing (the match statement's
+    // verdict over the seven page actions, the transport trio and the
+    // import popup), the footer's active-page verdict and the bar's
+    // own right-click track pick (the button-3 gate and the
+    // player-then-queue fallback chain) — with the Rich Text assembly,
+    // the theme styling and the DOM/event plumbing staying Python-side
+    // in the widgets.
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::volume_display_text,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::repeat_button_pair,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::shuffle_button_pair,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::heart_button_pair,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::footer_button_style_kind,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::footer_button_action_route,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::footer_button_active_verdict,
+        module
+    )?)?;
+    module.add_function(pyo3::wrap_pyfunction!(
+        ui::playback_bar::playback_bar_click_track,
+        module
+    )?)?;
+
     // Audio-cache LRU eviction engine (services/cache.py equivalent):
     // the eviction walk behind CacheManager.evict — which entries fall
     // out of an over-budget cache, LRU-first, the budget re-checked

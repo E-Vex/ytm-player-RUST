@@ -57,7 +57,7 @@ src/ytm_player/
 
 ```text
 native/src/
-├── lib.rs          # the #[pymodule]: registers all 377 pyfunctions + 4 pyclasses (qualified paths)
+├── lib.rs          # the #[pymodule]: registers all 385 pyfunctions + 4 pyclasses (qualified paths)
 ├── cli.rs          # `ytm` subcommand cores (stats, cache status, config editor plan)
 ├── ipc.rs          # the Unix-socket request gate
 ├── json.rs         # the JSON codec behind `ytm --json` and the auth records
